@@ -1,0 +1,8 @@
+[deps]
+AlgebraicMultigrid = "2169fc97-5a83-5252-b627-83903c6c433c"
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+Grico = "1ea28d43-a4e3-46f0-9b23-78fc8e1c719b"
+HYPRE = "b5ffcf37-a2bd-41ab-a3da-4bd9bc8ad771"
+IncompleteLU = "40713840-3770-5561-ab4c-a76e7d0d7895"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+MUMPS = "55d2b088-9f4e-11e9-26c0-150b02ea6a46"

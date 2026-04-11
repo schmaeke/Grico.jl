@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use Grico.jl in research, please cite it using the metadata below."
+title: "Grico.jl"
+type: software
+authors:
+  - family-names: "Schmäke"
+    given-names: "Jan Niklas"
+    email: "jan@schmaeke.dev"
+repository-code: "https://github.com/schmaeke/Grico.jl"
+url: "https://github.com/schmaeke/Grico.jl"
+license: "MIT"
+version: "0.1.0"
+abstract: "High-order finite elements on adaptive Cartesian grids."
+keywords:
+  - "julia"
+  - "finite elements"
+  - "hp-fem"
+  - "adaptivity"
+  - "cartesian grids"

@@ -1,0 +1,615 @@
+# This file defines the high-level problem containers that users populate before
+# compilation. It keeps operator callbacks, quadrature overrides, embedded
+# surfaces, and global constraints together in one mutable description that can
+# later be compiled into an `AssemblyPlan`.
+#
+# The compiled `HpSpace` and `FieldLayout` layers fix where degrees of freedom
+# live and how global coefficient vectors are partitioned. The job of this file
+# is different: it describes which weak forms, boundary data, interface terms,
+# embedded-surface terms, and global constraints should act on those unknowns.
+#
+# The file is organized in the same order in which a reader usually encounters
+# the problem description.
+#
+# First come small selectors and constraint objects such as `BoundaryFace`,
+# `Dirichlet`, and `MeanValue`.
+#
+# Next comes the shared mutable storage used by the public `AffineProblem` and
+# `ResidualProblem` wrappers. These wrappers keep the public API simple while
+# letting later compilation stages work with one normalized internal
+# representation.
+#
+# After that, the file provides the incremental mutation API used to build
+# problems operator by operator and constraint by constraint.
+#
+# Finally, the file ends with the no-op callback definitions that constitute the
+# operator extension surface of the package. User-defined operator types gain
+# meaning by specializing these methods.
+
+# Boundary selectors and global constraint types.
+
+"""
+    BoundaryFace(axis, side)
+
+Identify one Cartesian domain face by axis and `LOWER`/`UPPER` side.
+
+`axis` is numbered from `1` to the problem dimension `D`, and `side` selects
+the lower or upper face orthogonal to that axis. `BoundaryFace` is used to
+attach physical boundary operators and strong Dirichlet constraints to the
+boundary of a Cartesian domain.
+
+On a periodic axis, the same geometric face identifiers still exist, but they
+do not represent physical boundaries. Accordingly, problem validation rejects
+boundary operators and Dirichlet constraints placed on periodic faces.
+"""
+struct BoundaryFace
+  axis::Int
+  side::Int
+
+  BoundaryFace(axis::Int, side::Int) = new(_checked_positive(axis, "axis"), _checked_side(side))
+end
+
+BoundaryFace(axis::Integer, side::Integer) = BoundaryFace(Int(axis), Int(side))
+
+"""
+    Dirichlet(field, boundary, data)
+
+Strong Dirichlet data for `field` on `boundary`. `data` may be a constant or a
+callable of the physical point.
+
+This constraint prescribes the trace of `field` on the selected physical
+boundary face. During compilation, the library projects the prescribed boundary
+data onto the active trace degrees of freedom and then eliminates those dofs
+from the assembled linear system or residual problem.
+
+If `field` has multiple components, `data` may describe all components at once.
+As in the rest of the boundary machinery, Dirichlet constraints are only valid
+on non-periodic boundary faces whose normal axis uses `:cg` continuity in the
+owning `HpSpace`. For DG boundary treatment, use boundary/interface operators
+instead of strong Dirichlet elimination.
+
+The value stored in `data` is intentionally flexible. It may be a scalar,
+vector, or callable object, depending on the field and on the intended boundary
+data. Later compilation stages interpret it through quadrature and trace-basis
+evaluation rather than by assuming one particular concrete representation here.
+"""
+struct Dirichlet
+  field::AbstractField
+  boundary::BoundaryFace
+  data
+end
+
+"""
+    MeanValue(field, target)
+
+Constrain the domain average of `field` to `target`.
+
+For a scalar field `u_h`, this enforces
+
+  (1 / |Ω|) ∫_Ω u_h dΩ = target.
+
+For vector-valued fields, the constraint is applied componentwise. Mean-value
+constraints are useful for removing null spaces, for example the additive
+pressure constant in incompressible flow problems.
+
+Unlike Dirichlet data, a mean-value constraint is global: it does not refer to
+one boundary face or one geometric sub-entity, but to the domain integral of
+the selected field over the whole physical domain.
+"""
+struct MeanValue
+  field::AbstractField
+  target
+end
+
+# Internal wrapper pairing one boundary operator with the boundary face on which
+# it acts. Boundary operators are stored separately from cell/interface/surface
+# operators because they carry this extra geometric selector.
+struct _BoundaryContribution
+  boundary::BoundaryFace
+  operator
+end
+
+# Internal storage for user-supplied per-cell quadrature overrides. The public
+# constructor lives in `embedded.jl`, but the problem object keeps the validated
+# attachments in this compact form.
+struct _CellQuadratureAttachment
+  leaf::Int
+  quadrature::AbstractQuadrature
+end
+
+# Internal storage used by both affine and residual problem wrappers.
+
+# Shared mutable storage behind the public affine and residual problem wrappers.
+# The two problem kinds expose the same editable collections and differ only in
+# which operator callbacks later assembly/evaluation routines use.
+mutable struct _ProblemData
+  fields::Vector{AbstractField}
+  cell_operators::Vector{Any}
+  boundary_operators::Vector{_BoundaryContribution}
+  interface_operators::Vector{Any}
+  surface_operators::Vector{Any}
+  cell_quadratures::Vector{_CellQuadratureAttachment}
+  embedded_surfaces::Vector{Any}
+  dirichlet_constraints::Vector{Dirichlet}
+  mean_constraints::Vector{MeanValue}
+
+  function _ProblemData(fields::Vector{AbstractField}, cell_operators::Vector{Any},
+                        boundary_operators::Vector{_BoundaryContribution},
+                        interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                        cell_quadratures::Vector{_CellQuadratureAttachment},
+                        embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                        mean_constraints::Vector{MeanValue})
+    return new(_checked_problem_fields(fields), cell_operators, boundary_operators,
+               interface_operators, surface_operators, cell_quadratures, embedded_surfaces,
+               dirichlet_constraints, mean_constraints)
+  end
+end
+
+abstract type _AbstractProblem end
+
+function _empty_problem_data(fields::AbstractField...)
+  length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
+  return _ProblemData(AbstractField[fields...], Any[], _BoundaryContribution[], Any[], Any[],
+                      _CellQuadratureAttachment[], Any[], Dirichlet[], MeanValue[])
+end
+
+_problem_data(problem::_AbstractProblem) = getfield(problem, :data)
+
+# Forward property access from the public wrapper to the shared `_ProblemData`
+# storage. This lets `problem.cell_operators` and similar expressions behave as
+# if the collections were stored directly on the wrapper type, while still
+# centralizing the actual mutable state in one internal container.
+function Base.getproperty(problem::_AbstractProblem, name::Symbol)
+  name === :data && return getfield(problem, :data)
+  hasfield(_ProblemData, name) && return getfield(_problem_data(problem), name)
+  return getfield(problem, name)
+end
+
+function Base.setproperty!(problem::_AbstractProblem, name::Symbol, value)
+  name === :data && return setfield!(problem, :data, value)
+  hasfield(_ProblemData, name) && return setfield!(_problem_data(problem), name, value)
+  return setfield!(problem, name, value)
+end
+
+function Base.propertynames(::_AbstractProblem, private::Bool=false)
+  public_names = fieldnames(_ProblemData)
+  return private ? (:data, public_names...) : public_names
+end
+
+# Public problem wrapper types.
+
+"""
+    AffineProblem(fields...)
+
+Container for linear operators, quadrature overrides, embedded surfaces, and
+constraints that can be compiled into an `AssemblyPlan`.
+
+`AffineProblem` is the main high-level description of a linear variational
+problem in this library. It stores
+
+- cell operators acting on volume integrals,
+- boundary operators on physical boundary faces,
+- interface operators on interior or periodic interfaces,
+- embedded-surface operators,
+- optional cell quadrature overrides and embedded surfaces,
+- and global constraints such as Dirichlet and mean-value conditions.
+
+The operators themselves are plain Julia objects. Their meaning is determined by
+the callback methods they implement, such as [`cell_matrix!`](@ref),
+[`cell_rhs!`](@ref), [`face_matrix!`](@ref), or [`interface_matrix!`](@ref).
+
+The problem object itself does not assemble anything yet. It is purely a
+mutable declaration of what should later be compiled and traversed by assembly
+plans.
+"""
+mutable struct AffineProblem <: _AbstractProblem
+  data::_ProblemData
+end
+
+@inline _problem_wrapper(::Type{P}, data::_ProblemData) where {P<:_AbstractProblem} = P(data)
+
+function _problem_wrapper(::Type{P}, fields::Vector{AbstractField}, cell_operators::Vector{Any},
+                          boundary_operators::Vector{_BoundaryContribution},
+                          interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                          cell_quadratures::Vector{_CellQuadratureAttachment},
+                          embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                          mean_constraints::Vector{MeanValue}) where {P<:_AbstractProblem}
+  return _problem_wrapper(P,
+                          _ProblemData(fields, cell_operators, boundary_operators,
+                                       interface_operators, surface_operators, cell_quadratures,
+                                       embedded_surfaces, dirichlet_constraints, mean_constraints))
+end
+
+function AffineProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
+                       boundary_operators::Vector{_BoundaryContribution},
+                       interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                       cell_quadratures::Vector{_CellQuadratureAttachment},
+                       embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                       mean_constraints::Vector{MeanValue})
+  return _problem_wrapper(AffineProblem, fields, cell_operators, boundary_operators,
+                          interface_operators, surface_operators, cell_quadratures,
+                          embedded_surfaces, dirichlet_constraints, mean_constraints)
+end
+
+function AffineProblem(fields::AbstractField...)
+  return _problem_wrapper(AffineProblem, _empty_problem_data(fields...))
+end
+
+"""
+    ResidualProblem(fields...)
+
+Container for nonlinear residual/tangent operators and constraints.
+
+`ResidualProblem` plays the same organizational role as [`AffineProblem`](@ref),
+but for nonlinear problems. Its operators contribute through residual and
+tangent callbacks such as [`cell_residual!`](@ref) and
+[`cell_tangent!`](@ref), and the assembled system is interpreted as a nonlinear
+residual equation together with its local linearizations.
+
+The internal storage layout is intentionally the same as for
+[`AffineProblem`](@ref). The distinction between the two problem types only
+appears later when assembly/evaluation dispatches to affine versus nonlinear
+operator callbacks.
+"""
+mutable struct ResidualProblem <: _AbstractProblem
+  data::_ProblemData
+end
+
+function ResidualProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
+                         boundary_operators::Vector{_BoundaryContribution},
+                         interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                         cell_quadratures::Vector{_CellQuadratureAttachment},
+                         embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                         mean_constraints::Vector{MeanValue})
+  return _problem_wrapper(ResidualProblem, fields, cell_operators, boundary_operators,
+                          interface_operators, surface_operators, cell_quadratures,
+                          embedded_surfaces, dirichlet_constraints, mean_constraints)
+end
+
+function ResidualProblem(fields::AbstractField...)
+  return _problem_wrapper(ResidualProblem, _empty_problem_data(fields...))
+end
+
+"""
+    fields(problem)
+
+Return the fields that define the unknown blocks of `problem`.
+
+The returned tuple is ordered exactly as the fields were passed to the problem
+constructor.
+"""
+fields(problem::_AbstractProblem) = Tuple(_problem_data(problem).fields)
+
+"""
+    field_count(problem)
+
+Return the number of fields stored in `problem`.
+"""
+field_count(problem::_AbstractProblem) = length(_problem_data(problem).fields)
+
+# Validation helpers for problem containers.
+
+# Validate that a problem is defined on at least one field and that no field
+# descriptor appears more than once. Field identity is tracked by the internal
+# field id rather than by field name.
+function _checked_problem_fields(fields::Vector{AbstractField})
+  length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
+  seen_ids = Set{UInt64}()
+
+  for field in fields
+    !(_field_id(field) in seen_ids) ||
+      throw(ArgumentError("fields must be unique problem descriptors"))
+    push!(seen_ids, _field_id(field))
+  end
+
+  return fields
+end
+
+_problem_dimension(fields::AbstractVector{<:AbstractField}) = dimension(field_space(fields[1]))
+_problem_reference_space(fields::AbstractVector{<:AbstractField}) = field_space(fields[1])
+
+# Check that a referenced field belongs to the problem's declared field list.
+function _check_problem_field(fields::AbstractVector{<:AbstractField}, field::AbstractField,
+                              context::AbstractString)
+  any(existing -> _field_id(existing) == _field_id(field), fields) ||
+    throw(ArgumentError("$context field does not belong to this problem"))
+  return field
+end
+
+# Check that a boundary selector is dimensionally valid for the problem.
+function _check_problem_boundary(fields::AbstractVector{<:AbstractField}, boundary::BoundaryFace)
+  dimension_count = _problem_dimension(fields)
+  boundary.axis <= dimension_count ||
+    throw(ArgumentError("boundary axis must lie in 1:$dimension_count for this problem"))
+  return boundary
+end
+
+# Strengthen the boundary check to exclude periodic axes whenever a physical
+# boundary object is required.
+function _check_problem_physical_boundary(fields::AbstractVector{<:AbstractField},
+                                          boundary::BoundaryFace, context::AbstractString)
+  _check_problem_boundary(fields, boundary)
+  is_periodic_axis(_problem_reference_space(fields), boundary.axis) &&
+    throw(ArgumentError("$context boundary lies on a periodic axis"))
+  return boundary
+end
+
+function _check_strong_dirichlet_space(field::AbstractField, boundary::BoundaryFace)
+  space = field_space(field)
+  is_continuous_axis(space, boundary.axis) && return boundary
+  field_name_value = field_name(field)
+  throw(ArgumentError("Dirichlet constraint on field $field_name_value requires :cg continuity on boundary axis $(boundary.axis); use boundary operators for DG boundaries"))
+end
+
+function _check_problem_constraint(fields::AbstractVector{<:AbstractField}, constraint::Dirichlet)
+  _check_problem_field(fields, constraint.field, "Dirichlet constraint")
+  _check_problem_physical_boundary(fields, constraint.boundary, "Dirichlet constraint")
+  _check_strong_dirichlet_space(constraint.field, constraint.boundary)
+  return constraint
+end
+
+function _check_problem_constraint(fields::AbstractVector{<:AbstractField}, constraint::MeanValue)
+  _check_problem_field(fields, constraint.field, "mean-value constraint")
+  return constraint
+end
+
+@inline _problem_constraints(problem::_AbstractProblem, ::Dirichlet) = problem.dirichlet_constraints
+@inline _problem_constraints(problem::_AbstractProblem, ::MeanValue) = problem.mean_constraints
+
+# Revalidate the stored problem data. This is mainly used by later compilation
+# stages to assert that no invalid boundary or constraint data slipped into the
+# problem container.
+function _validate_problem_data(problem::_AbstractProblem)
+  data = _problem_data(problem)
+  _checked_problem_fields(data.fields)
+
+  for wrapped in data.boundary_operators
+    _check_problem_physical_boundary(data.fields, wrapped.boundary, "boundary operator")
+  end
+
+  for constraint in data.dirichlet_constraints
+    _check_problem_constraint(data.fields, constraint)
+  end
+
+  for constraint in data.mean_constraints
+    _check_problem_constraint(data.fields, constraint)
+  end
+
+  return problem
+end
+
+# Mutation API for building problems incrementally.
+
+"""
+    add_cell!(problem, operator)
+
+Add a cell operator to `problem`.
+
+For an [`AffineProblem`](@ref), cell operators contribute through callbacks such
+as [`cell_matrix!`](@ref) and [`cell_rhs!`](@ref). For a
+[`ResidualProblem`](@ref), they contribute through [`cell_residual!`](@ref) and
+[`cell_tangent!`](@ref). The function returns `problem`, so calls can be
+chained.
+"""
+function add_cell!(problem::_AbstractProblem, operator)
+  push!(problem.cell_operators, operator)
+  return problem
+end
+
+"""
+    add_boundary!(problem, boundary, operator)
+
+Add a boundary operator on the physical boundary face `boundary`.
+
+Boundary operators act on [`FaceValues`](@ref) items and are validated
+immediately against the problem dimension and periodic topology. In particular,
+this function rejects boundaries that lie on periodic axes. The boundary
+selector is stored alongside the operator so later compilation/assembly stages
+can route the operator only to matching physical faces.
+"""
+function add_boundary!(problem::_AbstractProblem, boundary::BoundaryFace, operator)
+  _check_problem_physical_boundary(problem.fields, boundary, "boundary operator")
+  push!(problem.boundary_operators, _BoundaryContribution(boundary, operator))
+  return problem
+end
+
+"""
+    add_surface!(problem, operator)
+
+Add an embedded-surface operator to `problem`.
+
+Surface operators act on [`SurfaceValues`](@ref) items generated from embedded
+surface quadratures.
+"""
+function add_surface!(problem::_AbstractProblem, operator)
+  push!(problem.surface_operators, operator)
+  return problem
+end
+
+"""
+    add_interface!(problem, operator)
+
+Add an interior/interface operator to `problem`.
+
+Interface operators act on [`InterfaceValues`](@ref) items and therefore see
+both sides of an interior or periodic interface.
+"""
+function add_interface!(problem::_AbstractProblem, operator)
+  push!(problem.interface_operators, operator)
+  return problem
+end
+
+"""
+    add_constraint!(problem, constraint)
+
+Add a global constraint to `problem`.
+
+Supported constraint types are [`Dirichlet`](@ref) and [`MeanValue`](@ref). The
+function validates that the referenced field belongs to the problem and, for
+Dirichlet constraints, that the selected boundary is a non-periodic physical
+boundary. Constraints are stored separately from local operators because later
+compilation treats them as global algebraic conditions rather than as ordinary
+cell or face contributions.
+"""
+function add_constraint!(problem::_AbstractProblem, constraint::Union{Dirichlet,MeanValue})
+  _check_problem_constraint(problem.fields, constraint)
+  push!(_problem_constraints(problem, constraint), constraint)
+  return problem
+end
+
+"""
+    constrain!(problem, constraint)
+
+Alias for [`add_constraint!`](@ref).
+"""
+function constrain!(problem::_AbstractProblem, constraint::Union{Dirichlet,MeanValue})
+  add_constraint!(problem, constraint)
+end
+
+# Operator extension surface.
+
+# These no-op methods define the operator extension surface of the library.
+# User-defined operator types implement whichever callbacks are relevant for the
+# geometric entities and problem class they participate in. Assembly then calls
+# these methods polymorphically while traversing cells, faces, interfaces, and
+# embedded surfaces.
+
+"""
+    cell_matrix!(local_matrix, operator, values)
+
+Accumulate the affine cell-matrix contribution of `operator` on one
+[`CellValues`](@ref) item into `local_matrix`.
+
+The default method does nothing. Custom affine cell operators should overload
+this function when they contribute a bilinear volume term.
+"""
+cell_matrix!(local_matrix, operator, values) = nothing
+
+"""
+    cell_rhs!(local_rhs, operator, values)
+
+Accumulate the affine cell right-hand-side contribution of `operator` on one
+[`CellValues`](@ref) item into `local_rhs`.
+
+The default method does nothing. Custom affine cell operators should overload
+this function when they contribute a linear volume term.
+"""
+cell_rhs!(local_rhs, operator, values) = nothing
+
+"""
+    face_matrix!(local_matrix, operator, values)
+
+Accumulate the affine boundary-face matrix contribution of `operator` on one
+[`FaceValues`](@ref) item into `local_matrix`.
+"""
+face_matrix!(local_matrix, operator, values) = nothing
+
+"""
+    face_rhs!(local_rhs, operator, values)
+
+Accumulate the affine boundary-face right-hand-side contribution of `operator`
+on one [`FaceValues`](@ref) item into `local_rhs`.
+"""
+face_rhs!(local_rhs, operator, values) = nothing
+
+"""
+    surface_matrix!(local_matrix, operator, values)
+
+Accumulate the affine embedded-surface matrix contribution of `operator` on one
+[`SurfaceValues`](@ref) item into `local_matrix`.
+"""
+surface_matrix!(local_matrix, operator, values) = nothing
+
+"""
+    surface_rhs!(local_rhs, operator, values)
+
+Accumulate the affine embedded-surface right-hand-side contribution of
+`operator` on one [`SurfaceValues`](@ref) item into `local_rhs`.
+"""
+surface_rhs!(local_rhs, operator, values) = nothing
+
+"""
+    interface_matrix!(local_matrix, operator, values)
+
+Accumulate the affine interface matrix contribution of `operator` on one
+[`InterfaceValues`](@ref) item into `local_matrix`.
+"""
+interface_matrix!(local_matrix, operator, values) = nothing
+
+"""
+    interface_rhs!(local_rhs, operator, values)
+
+Accumulate the affine interface right-hand-side contribution of `operator` on
+one [`InterfaceValues`](@ref) item into `local_rhs`.
+"""
+interface_rhs!(local_rhs, operator, values) = nothing
+
+"""
+    cell_residual!(local_residual, operator, values, state)
+
+Accumulate the nonlinear cell residual contribution of `operator` on one
+[`CellValues`](@ref) item into `local_residual`.
+
+The current discrete state is provided in `state`. The default method does
+nothing.
+"""
+cell_residual!(local_residual, operator, values, state) = nothing
+
+"""
+    cell_tangent!(local_tangent, operator, values, state)
+
+Accumulate the cell tangent contribution of `operator` on one [`CellValues`](@ref)
+item into `local_tangent`.
+
+This is the local linearization of the residual contribution with respect to the
+current `state`. The default method does nothing.
+"""
+cell_tangent!(local_tangent, operator, values, state) = nothing
+
+"""
+    face_residual!(local_residual, operator, values, state)
+
+Accumulate the nonlinear boundary-face residual contribution of `operator` on
+one [`FaceValues`](@ref) item into `local_residual`.
+"""
+face_residual!(local_residual, operator, values, state) = nothing
+
+"""
+    face_tangent!(local_tangent, operator, values, state)
+
+Accumulate the boundary-face tangent contribution of `operator` on one
+[`FaceValues`](@ref) item into `local_tangent`.
+"""
+face_tangent!(local_tangent, operator, values, state) = nothing
+
+"""
+    surface_residual!(local_residual, operator, values, state)
+
+Accumulate the nonlinear embedded-surface residual contribution of `operator`
+on one [`SurfaceValues`](@ref) item into `local_residual`.
+"""
+surface_residual!(local_residual, operator, values, state) = nothing
+
+"""
+    surface_tangent!(local_tangent, operator, values, state)
+
+Accumulate the embedded-surface tangent contribution of `operator` on one
+[`SurfaceValues`](@ref) item into `local_tangent`.
+"""
+surface_tangent!(local_tangent, operator, values, state) = nothing
+
+"""
+    interface_residual!(local_residual, operator, values, state)
+
+Accumulate the nonlinear interface residual contribution of `operator` on one
+[`InterfaceValues`](@ref) item into `local_residual`.
+"""
+interface_residual!(local_residual, operator, values, state) = nothing
+
+"""
+    interface_tangent!(local_tangent, operator, values, state)
+
+Accumulate the interface tangent contribution of `operator` on one
+[`InterfaceValues`](@ref) item into `local_tangent`.
+"""
+interface_tangent!(local_tangent, operator, values, state) = nothing
