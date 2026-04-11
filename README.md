@@ -18,7 +18,8 @@ framework. Its core model is affine Cartesian geometry with anisotropic dyadic
 - Local anisotropic `h`, `p`, and mixed `hp` refinement and derefinement.
 - High-order tensor-product spaces via `HpSpace`, with `FullTensorBasis` and
   `TrunkBasis`.
-- Fully continuous (`:cg`) and fully discontinuous (`:dg`) coupling.
+- Per-axis continuous/discontinuous coupling, including full `:cg`, full `:dg`,
+  and mixed axiswise policies.
 - Scalar and vector fields, multi-field layouts, Dirichlet constraints, and
   mean-value constraints.
 - Operator-based assembly for cell, boundary, interface, and embedded-surface

@@ -1512,6 +1512,23 @@ end
                                                                    Grico.BoundaryFace(1,
                                                                                       Grico.LOWER),
                                                                    0.0))
+  mixed_domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+  mixed_space = Grico.HpSpace(mixed_domain,
+                              Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                 degree=Grico.AxisDegrees((1, 0)),
+                                                 continuity=(:cg, :dg)))
+  m = Grico.ScalarField(mixed_space; name=:m)
+  mixed_problem = Grico.AffineProblem(m)
+  @test Grico.add_constraint!(mixed_problem,
+                              Grico.Dirichlet(m, Grico.BoundaryFace(1, Grico.LOWER), 0.0)) ===
+        mixed_problem
+  Grico.add_boundary!(mixed_problem, Grico.BoundaryFace(2, Grico.LOWER), BoundaryLoad(m, 1.0))
+  @test Grico.compile(mixed_problem) isa Grico.AssemblyPlan
+  @test_throws ArgumentError Grico.add_constraint!(Grico.AffineProblem(m),
+                                                   Grico.Dirichlet(m,
+                                                                   Grico.BoundaryFace(2,
+                                                                                      Grico.LOWER),
+                                                                   0.0))
   @test_throws ArgumentError Grico.add_constraint!(problem, Grico.MeanValue(v, 0.0))
   @test Grico.constrain!(problem, Grico.MeanValue(u, 0.0)) === problem
   @test only(problem.mean_constraints).target == 0.0

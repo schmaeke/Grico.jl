@@ -5,10 +5,9 @@ High-order finite elements on adaptive Cartesian grids.
 
 `Grico.jl` implements dimension-independent high-order finite elements on
 axis-aligned Cartesian meshes with local anisotropic `h`, `p`, and mixed `hp`
-refinement. The compiled `HpSpace` currently supports fully continuous (`:cg`)
-and fully discontinuous (`:dg`) inter-element coupling, and the public
-continuity API is already shaped so future mixed per-axis policies fit into the
-same model. The package is deliberately organized as a small stack of layers:
+refinement. The compiled `HpSpace` supports fully continuous (`:cg`), fully
+discontinuous (`:dg`), and mixed per-axis inter-element coupling. The package
+is deliberately organized as a small stack of layers:
 
 1. one-dimensional polynomial and quadrature tools,
 2. Cartesian refinement topology and affine geometry,

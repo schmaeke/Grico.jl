@@ -4,7 +4,7 @@
 # 3. compilation of Dirichlet and mean-value constraints.
 #
 # The preceding files establish the ingredients of a discretization:
-# - `space.jl` compiles one globally continuous hp space,
+# - `space.jl` compiles one hp space with the requested per-axis continuity,
 # - `fields.jl` groups that space into named unknown blocks,
 # - `problem.jl` stores operators and constraints in an editable problem
 #   description,

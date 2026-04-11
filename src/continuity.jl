@@ -23,7 +23,7 @@
 # moves between local tensor-product modes, face-local trace modes, and sparse
 # algebraic constraint rows.
 #
-# For fully continuous spaces, the compiler runs in six phases:
+# For spaces with at least one continuous axis, the compiler runs in six phases:
 # 1. freeze the active leaves, lift them to a common finest logical lattice, and
 #    cache their local admissible mode patterns;
 # 2. decide, from the requested continuity policy, which local traces should
@@ -39,16 +39,16 @@
 #
 # For fully discontinuous spaces, the same leaf-pattern infrastructure is still
 # used, but the face-coupling phases are skipped and every active local mode
-# receives an independent global scalar dof. Mixed per-axis CG/DG policies are
-# threaded through the API already, but the actual mixed compilation path is not
-# implemented yet.
+# receives an independent global scalar dof. For mixed per-axis CG/DG spaces,
+# only traces on CG axes enter the global coupling algebra; DG-axis traces
+# remain leaf-local.
 #
 # Core data structures shared across the compilation phases.
 
 # Internal continuity-policy abstraction used by space compilation. The public
-# API already exposes `:cg` and `:dg`, and the compiler threads the resulting
-# per-axis policy explicitly so later mixed CG/DG support can reuse the same
-# stages.
+# API exposes per-axis `:cg`/`:dg` choices, and the compiler threads the
+# resulting normalized policy explicitly so the same stages handle full and
+# mixed spaces.
 abstract type _AbstractContinuityPolicy end
 
 struct _AxisContinuity{D} <: _AbstractContinuityPolicy
@@ -61,9 +61,7 @@ struct _AxisContinuity{D} <: _AbstractContinuityPolicy
   end
 end
 
-_cg_continuity_policy(::Val{D}) where {D} = _AxisContinuity{D}(ntuple(_ -> :cg, D))
 @inline _is_cg_axis(policy::_AxisContinuity, axis::Int) = policy.kinds[axis] === :cg
-@inline _is_fully_cg(policy::_AxisContinuity) = all(kind -> kind === :cg, policy.kinds)
 @inline _is_fully_dg(policy::_AxisContinuity) = all(kind -> kind === :dg, policy.kinds)
 
 # A face overlap patch represented on the common finest logical lattice used by
@@ -138,7 +136,6 @@ mutable struct _SpaceBuildState{D,T<:AbstractFloat,B}
   leaf_upper::Vector{NTuple{D,Int}}
   finest_levels::NTuple{D,Int}
   boundary_lookup::Vector{Dict{NTuple{D,Int},Int}}
-  boundary_modes::Vector{Vector{NTuple{D,Int}}}
   face_boundary_modes::Vector{Vector{_BoundaryVariable{D}}}
   boundary_terms::Vector{Vector{Pair{Int,T}}}
   boundary_var_count::Int
@@ -183,10 +180,9 @@ function _build_space_state(domain::Domain{D,T}, basis::B,
   end
 
   boundary_lookup = [Dict{NTuple{D,Int},Int}() for _ in eachindex(active)]
-  boundary_modes = [NTuple{D,Int}[] for _ in eachindex(active)]
   face_boundary_modes = [Vector{_BoundaryVariable{D}}() for _ in 1:(length(active)*D*2)]
   return _SpaceBuildState(grid_data, basis, active, leaf_to_index, leaf_degrees, leaf_patterns,
-                          leaf_lower, leaf_upper, finest_levels, boundary_lookup, boundary_modes,
+                          leaf_lower, leaf_upper, finest_levels, boundary_lookup,
                           face_boundary_modes, Vector{Vector{Pair{Int,T}}}(), 0, 1)
 end
 
@@ -194,9 +190,9 @@ end
 #
 # The cached leaf patterns from `_build_space_state` are continuity-agnostic.
 # This stage decides whether any of those local traces should enter a global
-# face algebra at all. Fully CG spaces introduce provisional boundary variables,
-# fully DG spaces deliberately skip that work, and mixed policies are reserved
-# for a later implementation.
+# face algebra at all. Fully DG spaces deliberately skip that work, while any
+# policy with at least one CG axis introduces provisional variables only for the
+# local modes that actually participate in CG trace coupling.
 function _enumerate_space_modes(domain::Domain{D,T}, basis::B, leaf_degrees::Vector{NTuple{D,Int}},
                                 continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat,B}
   state = _build_space_state(domain, basis, leaf_degrees)
@@ -206,39 +202,36 @@ end
 
 function _enumerate_trace_modes!(state::_SpaceBuildState{D,T},
                                  continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
-  if _is_fully_cg(continuity_policy)
-    _build_boundary_variables!(state)
-  elseif _is_fully_dg(continuity_policy)
+  if _is_fully_dg(continuity_policy)
     nothing
   else
-    throw(ArgumentError("mixed CG/DG continuity policies are not implemented yet"))
+    _build_boundary_variables!(state, continuity_policy)
   end
   return state
 end
 
 # Phase 3. Introduce provisional variables for all local boundary traces.
 
-# Introduce one provisional variable for every local mode whose integrated
-# Legendre factors do not vanish on at least one boundary face. These variables
-# are only temporary: later phases merge, constrain, or eliminate them until
-# only globally independent trace unknowns remain.
-function _build_boundary_variables!(state::_SpaceBuildState{D,T}) where {D,T<:AbstractFloat}
+# Introduce one provisional variable for every local mode that really enters the
+# CG trace algebra. Modes that only touch DG axes keep their own independent
+# cell-local dof and therefore never need a provisional boundary representative.
+function _build_boundary_variables!(state::_SpaceBuildState{D,T},
+                                    continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
   next_variable = 1
 
   for leaf_index in eachindex(state.active_leaves)
     lookup = state.boundary_lookup[leaf_index]
-    modes = state.boundary_modes[leaf_index]
 
     for mode in state.leaf_patterns[leaf_index].boundary_modes
+      _mode_requires_trace_coupling(continuity_policy, mode) || continue
       variable = next_variable
       lookup[mode] = variable
-      push!(modes, mode)
       for axis in 1:D
         # In the integrated Legendre basis, index 0 is the lower endpoint mode
         # and index 1 is the upper endpoint mode. Modes with index ≥ 2 vanish at
         # both endpoints and therefore do not contribute to that face trace.
         side_mode = mode[axis]
-        side_mode <= 1 || continue
+        _is_cg_axis(continuity_policy, axis) && side_mode <= 1 || continue
         push!(_face_boundary_modes(state, leaf_index, axis, side_mode + LOWER),
               _BoundaryVariable(variable, mode))
       end
@@ -347,17 +340,14 @@ end
 # graph. The conceptual outcome is a basis change from provisional face-local
 # trace variables to a smaller set of genuine global boundary dofs.
 
-# Compile the complete trace continuity system. This routine is the heart of the
-# file:
-# - matching face traces are merged by union-find,
-# - incompatible excess trace modes are marked as zero,
-# - hanging-face continuity rows are assembled,
-# - the resulting constraint graph is eliminated component-wise,
-# - and the surviving free trace variables receive global scalar dofs.
-function _compile_boundary_terms!(state::_SpaceBuildState{D,T}) where {D,T<:AbstractFloat}
+# Compile the complete trace continuity system on the CG axes of the requested
+# policy. DG-axis interfaces are intentionally skipped here because their traces
+# remain independent leaf-local unknowns.
+function _compile_boundary_terms!(state::_SpaceBuildState{D,T},
+                                  continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
   parent = collect(1:state.boundary_var_count)
   zeroed = falses(state.boundary_var_count)
-  face_pairs = _internal_face_pairs(state)
+  face_pairs = _internal_face_pairs(state, continuity_policy)
 
   # First collapse all matching-face identities and detect trace variables that
   # cannot survive because their tangential content is not representable on the
@@ -390,26 +380,27 @@ function _compile_boundary_terms!(state::_SpaceBuildState{D,T}) where {D,T<:Abst
 end
 
 # Dispatch the face-coupling phase according to the requested continuity policy.
-# Fully CG spaces run the full boundary-trace algebra, fully DG spaces skip it,
-# and mixed policies are rejected until their coupling rules are implemented.
+# Fully DG spaces skip the boundary-trace algebra, while all other policies run
+# it only on interfaces normal to CG axes.
 function _compile_face_coupling!(state::_SpaceBuildState{D,T},
                                  continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
-  if _is_fully_cg(continuity_policy)
-    _compile_boundary_terms!(state)
-  elseif _is_fully_dg(continuity_policy)
+  if _is_fully_dg(continuity_policy)
     nothing
   else
-    throw(ArgumentError("mixed CG/DG continuity policies are not implemented yet"))
+    _compile_boundary_terms!(state, continuity_policy)
   end
   return state
 end
 
 # Enumerate every active interface patch exactly once, using active-leaf indices
-# rather than raw cell ids so later arrays can be addressed directly.
-function _internal_face_pairs(state::_SpaceBuildState{D}) where {D}
+# rather than raw cell ids so later arrays can be addressed directly. Only
+# interfaces normal to CG axes participate in the continuity algebra.
+function _internal_face_pairs(state::_SpaceBuildState{D},
+                              continuity_policy::_AxisContinuity{D}) where {D}
   pairs = Tuple{Int,Int,Int,Int}[]
 
   for (leaf, axis, other) in _upper_face_neighbor_specs(state.grid)
+    _is_cg_axis(continuity_policy, axis) || continue
     push!(pairs,
           (@inbounds(state.leaf_to_index[leaf]), @inbounds(state.leaf_to_index[other]), axis,
            UPPER))

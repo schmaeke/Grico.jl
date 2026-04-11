@@ -431,6 +431,24 @@ end
   @test p_degree_change(default_hp, 2) == (0,)
 end
 
+@testset "Mixed Continuity Adaptivity Defaults" begin
+  domain = Domain((0.0, 0.0), (2.0, 2.0), (2, 2))
+  space = HpSpace(domain,
+                  SpaceOptions(basis=FullTensorBasis(), degree=AxisDegrees((1, 0)),
+                               continuity=(:cg, :dg)))
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((u,)), [1.0, 1.0, 1.0, 3.0, 3.0, 3.0])
+
+  @test AdaptivityLimits(space).min_p == (1, 0)
+  @test coefficient_indicators(state, u) == [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+  @test interface_jump_indicators(state, u) == [(0.0, 2.0), (0.0, 2.0), (0.0, 2.0), (0.0, 2.0)]
+
+  plan = h_adaptivity_plan(state, u; threshold=1.0)
+  for leaf in active_leaves(space)
+    @test h_adaptation_axes(plan, leaf) == (false, true)
+  end
+end
+
 @testset "Dorfler Bulk Marking" begin
   domain = Domain((0.0,), (1.0,), (2,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))

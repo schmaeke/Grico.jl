@@ -63,18 +63,26 @@ end
                                                  continuity=(:cg, :cg)))
   dg_space = Grico.HpSpace(domain_2d,
                            Grico.SpaceOptions(degree=Grico.UniformDegree(2), continuity=:dg))
+  mixed_space = Grico.HpSpace(domain_2d,
+                              Grico.SpaceOptions(degree=Grico.AxisDegrees((1, 0)),
+                                                 continuity=(:cg, :dg)))
 
   @test Grico.continuity_policy(default_space) == (:cg, :cg)
   @test Grico.continuity_policy(tuple_space) == (:cg, :cg)
   @test Grico.continuity_policy(dg_space) == (:dg, :dg)
+  @test Grico.continuity_policy(mixed_space) == (:cg, :dg)
   @test Grico.continuity_kind(default_space, 1) == :cg
   @test Grico.continuity_kind(default_space, 2) == :cg
   @test Grico.continuity_kind(dg_space, 1) == :dg
   @test Grico.continuity_kind(dg_space, 2) == :dg
+  @test Grico.continuity_kind(mixed_space, 1) == :cg
+  @test Grico.continuity_kind(mixed_space, 2) == :dg
   @test Grico.is_continuous_axis(default_space, 1)
   @test Grico.is_continuous_axis(default_space, 2)
   @test !Grico.is_continuous_axis(dg_space, 1)
   @test !Grico.is_continuous_axis(dg_space, 2)
+  @test Grico.is_continuous_axis(mixed_space, 1)
+  @test !Grico.is_continuous_axis(mixed_space, 2)
   @test_throws ArgumentError Grico.continuity_kind(default_space, 3)
   @test_throws ArgumentError Grico.HpSpace(domain_2d,
                                            Grico.SpaceOptions(degree=Grico.UniformDegree(0),
@@ -84,7 +92,7 @@ end
         Grico.HpSpace
 
   @test_throws ArgumentError Grico.HpSpace(domain_2d,
-                                           Grico.SpaceOptions(degree=Grico.UniformDegree(2),
+                                           Grico.SpaceOptions(degree=Grico.AxisDegrees((0, 1)),
                                                               continuity=(:cg, :dg)))
 
   domain_1d = Grico.Domain((0.0,), (1.0,), (1,))
@@ -227,6 +235,50 @@ end
   @test Grico.check_space(hanging_space) === nothing
 end
 
+@testset "Mixed Space Compilation" begin
+  domain = Grico.Domain((0.0, 0.0), (2.0, 2.0), (2, 2))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.AxisDegrees((1, 0)),
+                                           continuity=(:cg, :dg)))
+
+  @test Grico.scalar_dof_count(space) == 6
+  _test_term_vector(Grico.mode_terms(space, 1, (0, 0)), [1 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 2, (0, 0)), [2 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 1, (1, 0)), [2 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 2, (1, 0)), [3 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 3, (0, 0)), [4 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 4, (0, 0)), [5 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 3, (1, 0)), [5 => 1.0])
+  _test_term_vector(Grico.mode_terms(space, 4, (1, 0)), [6 => 1.0])
+  @test Grico.check_space(space) === nothing
+
+  coefficients = collect(1.0:Grico.scalar_dof_count(space))
+
+  for y in (-1.0, -0.25, 0.5, 1.0)
+    @test _space_value(space, 1, (1.0, y), coefficients) ≈
+          _space_value(space, 2, (-1.0, y), coefficients) atol = SPACE_TOL
+    @test _space_value(space, 3, (1.0, y), coefficients) ≈
+          _space_value(space, 4, (-1.0, y), coefficients) atol = SPACE_TOL
+  end
+
+  discontinuous = zeros(Grico.scalar_dof_count(space))
+  discontinuous[1] = 1.0
+  @test abs(_space_value(space, 1, (-1.0, 1.0), discontinuous) -
+            _space_value(space, 3, (-1.0, -1.0), discontinuous)) > SPACE_TOL
+
+  flipped = Grico.HpSpace(domain,
+                          Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                             degree=Grico.AxisDegrees((0, 1)),
+                                             continuity=(:dg, :cg)))
+  @test Grico.scalar_dof_count(flipped) == 6
+  _test_term_vector(Grico.mode_terms(flipped, 1, (0, 0)), [1 => 1.0])
+  _test_term_vector(Grico.mode_terms(flipped, 3, (0, 0)), [2 => 1.0])
+  _test_term_vector(Grico.mode_terms(flipped, 1, (0, 1)), [2 => 1.0])
+  _test_term_vector(Grico.mode_terms(flipped, 3, (0, 1)), [5 => 1.0])
+  @test Grico.check_space(flipped) === nothing
+end
+
 @testset "Same-Level P Mismatch" begin
   domain = Grico.Domain((0.0, 0.0), (2.0, 1.0), (2, 1))
   space = Grico.HpSpace(domain,
@@ -262,6 +314,28 @@ end
     y, z = yz
     @test _space_value(space_3d, 1, (1.0, y, z), coefficients_3d) ≈
           _space_value(space_3d, 2, (-1.0, y, z), coefficients_3d) atol = SPACE_TOL
+  end
+end
+
+@testset "Mixed Hanging Continuity" begin
+  domain = Grico.Domain((0.0, 0.0), (2.0, 1.0), (2, 1))
+  grid = Grico.grid(domain)
+  first_child = Grico.refine!(grid, 2, 2)
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(degree=Grico.UniformDegree(2),
+                                           continuity=(:cg, :dg)))
+  @test Grico.check_space(space) === nothing
+
+  function wrapped_value(y, coefficients)
+    return y < 0 ? _space_value(space, first_child, (-1.0, 2 * y + 1), coefficients) :
+           _space_value(space, first_child + 1, (-1.0, 2 * y - 1), coefficients)
+  end
+
+  coefficients = collect(1.0:Grico.scalar_dof_count(space))
+
+  for y in (-0.75, -0.25, 0.25, 0.75)
+    @test _space_value(space, 1, (1.0, y), coefficients) ≈
+          wrapped_value(y, coefficients) atol = SPACE_TOL
   end
 end
 

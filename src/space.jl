@@ -249,11 +249,9 @@ freedom. The actual continuity algebra that produces these expansions is
 implemented in `continuity.jl`; this type exposes the compiled result in a form
 used by fields, integration, assembly, and adaptivity.
 
-At present, full `:cg` and full `:dg` continuity policies are implemented.
-Mixed per-axis tuples are already accepted by the public API so the interface
-does not need to change when those policies are implemented, but mixed CG/DG
-spaces currently raise a clear `ArgumentError` during compilation. Degree zero
-is allowed only on DG axes.
+The continuity policy is axiswise: full `:cg`, full `:dg`, and mixed per-axis
+tuples are all compiled through the same representation. Degree zero is allowed
+only on DG axes.
 
 Two viewpoints are useful when reading the rest of this file:
 
@@ -262,11 +260,12 @@ Two viewpoints are useful when reading the rest of this file:
 - Globally, `HpSpace` is just the collection of those leaf-local expansions plus
   the total scalar dof count and quadrature metadata derived from them.
 
-In the fully CG case, boundary-carrying local modes on neighboring leaves are
-identified or constrained so that traces agree across matching and hanging
-interfaces. In the fully DG case, no such coupling is imposed and every active
-local mode keeps its own independent scalar dof. The public query interface in
-this file intentionally hides that distinction behind one compiled representation.
+On axes with `:cg` continuity, boundary-carrying local modes on neighboring
+leaves are identified or constrained so that traces agree across matching and
+hanging interfaces. On axes with `:dg` continuity, no such coupling is imposed
+and the corresponding trace content stays leaf-local. The public query
+interface in this file intentionally hides those implementation details behind
+one compiled representation.
 """
 struct HpSpace{D,T<:AbstractFloat,B<:AbstractBasisFamily,DG<:AbstractDegreePolicy,
                Q<:AbstractQuadraturePolicy,C<:_AbstractContinuityPolicy}
@@ -510,9 +509,9 @@ global scalar degrees of freedom.
 The result is a vector of `global_dof => coefficient` pairs. For purely
 interior modes this is typically a single coefficient `1`, while boundary and
 hanging-interface modes may expand into several global dofs due to continuity
-constraints. In a fully DG space, most active local modes simply map to one
-independent scalar dof. In a fully CG space, trace-carrying modes may instead
-inherit nontrivial sparse expansions from the continuity compiler.
+constraints. On DG-only trace content, most active local modes simply map to
+one independent scalar dof. Modes that participate in CG trace coupling may
+instead inherit nontrivial sparse expansions from the continuity compiler.
 
 This is the most direct public view of the continuity compilation performed in
 `continuity.jl`.
@@ -537,8 +536,8 @@ are positive, and that every global scalar dof is referenced by at least one
 local mode expansion. The function throws an `ArgumentError` if an inconsistency
 is detected and otherwise returns `nothing`.
 
-The same checks apply to both CG and DG spaces: only the structure of the
-stored local mode expansions differs.
+The same checks apply to continuous, discontinuous, and mixed spaces: only the
+structure of the stored local mode expansions differs.
 """
 function check_space(space::HpSpace)
   length(space.active_leaves) == length(space.compiled_leaves) ||
