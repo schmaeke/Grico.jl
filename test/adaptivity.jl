@@ -235,6 +235,63 @@ end
   end
 end
 
+@testset "Derived Adaptivity Plans" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  velocity_space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  pressure_space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  pressure = ScalarField(pressure_space; name=:p)
+  driver_plan = AdaptivityPlan(velocity_space)
+
+  request_p_refinement!(driver_plan, 1, 1)
+  request_h_refinement!(driver_plan, 1, 1)
+
+  inherited_plan = derived_adaptivity_plan(driver_plan, pressure)
+  offset_plan = derived_adaptivity_plan(driver_plan, pressure_space; degree_offset=-1)
+
+  @test active_leaves(inherited_plan) == active_leaves(driver_plan)
+  @test all(cell_degrees(inherited_plan, leaf) == (1,) for leaf in active_leaves(inherited_plan))
+  @test all(cell_degrees(offset_plan, leaf) == (2,) for leaf in active_leaves(offset_plan))
+  @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
+                                                     degree_offset=(0, 0))
+end
+
+@testset "Mixed-Space State Transfer" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  velocity_space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  pressure_space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  velocity = ScalarField(velocity_space; name=:u)
+  pressure = ScalarField(pressure_space; name=:p)
+  state = State(FieldLayout((velocity, pressure)), [0.3, -0.8, 0.45, 1.1, -0.35])
+
+  velocity_plan = AdaptivityPlan(velocity_space)
+  request_p_refinement!(velocity_plan, 1, 1)
+  request_h_refinement!(velocity_plan, 1, 1)
+  pressure_plan = derived_adaptivity_plan(velocity_plan, pressure; degree_offset=-1)
+  velocity_transition = transition(velocity_plan)
+  pressure_transition = transition(pressure_plan)
+  new_fields, transferred = transfer_state((pressure_plan, velocity_plan), state)
+  new_velocity, new_pressure = new_fields
+
+  @test active_leaves(field_space(new_velocity)) == active_leaves(target_space(velocity_transition))
+  @test active_leaves(field_space(new_pressure)) == active_leaves(target_space(pressure_transition))
+  @test all(cell_degrees(field_space(new_velocity), leaf) ==
+            cell_degrees(target_space(velocity_transition), leaf)
+            for leaf in active_leaves(field_space(new_velocity)))
+  @test all(cell_degrees(field_space(new_pressure), leaf) ==
+            cell_degrees(target_space(pressure_transition), leaf)
+            for leaf in active_leaves(field_space(new_pressure)))
+
+  for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
+    @test _field_value_at_point(velocity, state, x) ≈
+          _field_value_at_point(new_velocity, transferred, x) atol = ADAPTIVITY_TOL
+    @test _field_value_at_point(pressure, state, x) ≈
+          _field_value_at_point(new_pressure, transferred, x) atol = ADAPTIVITY_TOL
+  end
+
+  @test_throws ArgumentError transfer_state((velocity_plan,), state)
+  @test_throws ArgumentError transfer_state((velocity_plan, pressure_plan, pressure_plan), state)
+end
+
 @testset "Mixed Hp Transfer" begin
   domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))

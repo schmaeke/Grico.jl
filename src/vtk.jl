@@ -166,6 +166,19 @@ end
 
 # Field selection and direct sampling of hp state data on VTK points.
 
+# VTK export only needs one common geometric/topological domain description. The
+# participating fields may therefore come from compatible spaces built on equal
+# but not identical `Domain` objects, for example after independently compiled
+# adaptive transfers on several spaces.
+function _vtk_matching_domain(space::HpSpace, domain_data::Domain)
+  root_cell_counts(grid(space.domain)) == root_cell_counts(grid(domain_data)) || return false
+  space.active_leaves == active_leaves(grid(domain_data)) || return false
+  origin(space.domain) == origin(domain_data) || return false
+  extent(space.domain) == extent(domain_data) || return false
+  periodic_axes(space.domain) == periodic_axes(domain_data) || return false
+  return true
+end
+
 # Resolve which state fields should be exported and validate that they all belong
 # to the provided domain/state combination. The exported point-data names are
 # derived from `field_name(field)` and must therefore be unique.
@@ -191,7 +204,7 @@ function _vtk_fields(domain_data::Domain, state::Union{Nothing,State}, selected_
 
   for field in field_list
     field in available || throw(ArgumentError("field does not belong to the provided state"))
-    field_space(field).domain === domain_data ||
+    _vtk_matching_domain(field_space(field), domain_data) ||
       throw(ArgumentError("VTK field export requires fields defined on the provided Domain"))
     name = string(field_name(field))
     name in names && throw(ArgumentError("duplicate VTK point-data name $name"))

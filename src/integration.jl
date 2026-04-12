@@ -930,12 +930,11 @@ end
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{D},
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat}
   grid_data = grid(layout.slots[1].space)
-  return [_compile_surface_quadrature(layout,
-                                      _checked_surface_quadrature(grid_data, surface, D), tag)]
+  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(grid_data, surface, D),
+                                      tag)]
 end
 
-function _compile_embedded_surface_items(layout::FieldLayout{D,T},
-                                         surface::SurfaceQuadrature{SD},
+function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{SD},
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat,SD}
   throw(ArgumentError("surface quadrature dimension $SD does not match the problem dimension $D"))
 end
@@ -950,8 +949,7 @@ end
 # Compile one embedded-surface quadrature item. Here both the integration
 # weights and the normals require geometric transformation from the reference
 # surface data supplied by the embedded-surface machinery.
-function _compile_surface_quadrature(layout::FieldLayout{D,T},
-                                     surface::SurfaceQuadrature{D},
+function _compile_surface_quadrature(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{D},
                                      tag::_SurfaceTag=nothing) where {D,T<:AbstractFloat}
   domain_data = layout.slots[1].space.domain
   quadrature = surface.quadrature
@@ -975,10 +973,9 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T},
   field_data, _ = _compile_item_fields(layout, surface.leaf, points, reference_points,
                                        inverse_jacobian)
   terms = _compiled_item_terms(field_data)
-  return SurfaceValues(surface.leaf, tag, points, weights, normals, field_data,
-                       terms.term_offsets, terms.term_indices, terms.term_coefficients,
-                       terms.single_term_indices, terms.single_term_coefficients,
-                       terms.local_dof_count)
+  return SurfaceValues(surface.leaf, tag, points, weights, normals, field_data, terms.term_offsets,
+                       terms.term_indices, terms.term_coefficients, terms.single_term_indices,
+                       terms.single_term_coefficients, terms.local_dof_count)
 end
 
 # Build leaf-local index ranges into the global face and surface arrays. The

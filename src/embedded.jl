@@ -194,8 +194,7 @@ function add_surface_quadrature!(problem::_AbstractProblem, surface::SurfaceQuad
   return problem
 end
 
-function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol,
-                                 surface::SurfaceQuadrature)
+function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol, surface::SurfaceQuadrature)
   push!(problem.embedded_surfaces, _SurfaceAttachment(tag, surface))
   return problem
 end

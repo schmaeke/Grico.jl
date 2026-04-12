@@ -13,7 +13,8 @@ using IncompleteLU
 using Krylov
 import AlgebraicMultigrid: ruge_stuben, smoothed_aggregation, aspreconditioner, operator_complexity
 
-const SAMPLE_STEPS = (1, 2, 3)
+const SAMPLE_ITERS = (1, 2, 3)
+const FLOW_ROOT_COUNTS = (16, 16)
 const ILU_TAUS = (1e-2, 1e-3, 1e-4)
 
 struct SampledFlowSystem{P}
@@ -34,14 +35,16 @@ struct SolverMeasurement
   complexity::Float64
 end
 
-let previous = get(ENV, "GRICO_KH_AUTORUN", nothing)
-  ENV["GRICO_KH_AUTORUN"] = "0"
-  include(joinpath(REPO_ROOT, "examples", "kelvin_helmholtz.jl"))
+# Load the cavity example as a provider of reusable setup helpers while keeping
+# its normal top-level run path disabled inside this benchmark harness.
+let previous = get(ENV, "GRICO_LDC_AUTORUN", nothing)
+  ENV["GRICO_LDC_AUTORUN"] = "0"
+  include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity.jl"))
 
   if previous === nothing
-    delete!(ENV, "GRICO_KH_AUTORUN")
+    delete!(ENV, "GRICO_LDC_AUTORUN")
   else
-    ENV["GRICO_KH_AUTORUN"] = previous
+    ENV["GRICO_LDC_AUTORUN"] = previous
   end
 end
 
@@ -131,52 +134,13 @@ function sample_flow_systems(sample_steps::Tuple{Vararg{Int}})
   issorted(collect(sample_steps)) || throw(ArgumentError("sample_steps must be sorted"))
   first(sample_steps) >= 1 || throw(ArgumentError("sample_steps must be positive"))
 
-  context = (; velocity, pressure, concentration, flow_state, concentration_state, step_operator,
-             step_plan, transport_operator, transport_plan)
+  context = build_lid_driven_cavity_context(root_counts=FLOW_ROOT_COUNTS)
   samples = SampledFlowSystem[]
 
   for step in 1:last(sample_steps)
-    if step > 1 && (step - 1) % ADAPTIVITY_INTERVAL == 0
-      current_space = field_space(context.velocity)
-      limits = AdaptivityLimits(current_space; max_h_level=MAX_H_LEVEL)
-      adaptivity_plan = h_adaptivity_plan(context.concentration_state, context.concentration;
-                                          threshold=H_REFINEMENT_THRESHOLD,
-                                          h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                          limits=limits)
-
-      if !isempty(adaptivity_plan)
-        space_transition = transition(adaptivity_plan)
-        new_velocity, new_pressure, new_concentration = adapted_fields(space_transition,
-                                                                       context.velocity,
-                                                                       context.pressure,
-                                                                       context.concentration)
-        new_flow_state = transfer_state(space_transition, context.flow_state,
-                                        (context.velocity, context.pressure),
-                                        (new_velocity, new_pressure))
-        new_concentration_state = transfer_state(space_transition, context.concentration_state,
-                                                 context.concentration, new_concentration)
-        new_step_operator, new_step_plan = build_flow_step_plan(new_velocity, new_pressure,
-                                                                new_flow_state)
-        new_transport_operator, new_transport_plan = build_transport_plan(new_concentration,
-                                                                          new_velocity,
-                                                                          new_concentration_state,
-                                                                          new_flow_state)
-        context = (; velocity=new_velocity, pressure=new_pressure, concentration=new_concentration,
-                   flow_state=new_flow_state, concentration_state=new_concentration_state,
-                   step_operator=new_step_operator, step_plan=new_step_plan,
-                   transport_operator=new_transport_operator, transport_plan=new_transport_plan)
-      end
-    end
-
     flow_preconditioner = FieldSplitSchurPreconditioner((context.velocity,), (context.pressure,))
-    context.step_operator.old_state = context.flow_state
-    system = assemble(context.step_plan)
+    context, system, _, _, _ = advance_picard_step(context)
     step in sample_steps && push!(samples, SampledFlowSystem(step, system, flow_preconditioner))
-    new_flow_state = State(context.step_plan, solve(system; preconditioner=flow_preconditioner))
-    context.transport_operator.velocity_state = new_flow_state
-    context.transport_operator.concentration_state = context.concentration_state
-    new_concentration_state = State(context.transport_plan, solve(assemble(context.transport_plan)))
-    context = (; context..., flow_state=new_flow_state, concentration_state=new_concentration_state)
   end
 
   return samples
@@ -204,12 +168,12 @@ function _print_measurement(step::Int, system::Grico.AffineSystem, measurement::
 end
 
 function main()
-  samples = sample_flow_systems(SAMPLE_STEPS)
+  samples = sample_flow_systems(SAMPLE_ITERS)
   isempty(samples) && error("no sample systems collected")
   _warmup_measurements(first(samples))
 
-  println("kelvin_helmholtz preconditioner comparison")
-  @printf("  sample steps : %s\n", SAMPLE_STEPS)
+  println("lid_driven_cavity preconditioner comparison")
+  @printf("  sample Picard iterations : %s\n", SAMPLE_ITERS)
   @printf("  ilu taus     : %s\n", ILU_TAUS)
   println("  solver                    dofs     setup s   solve s   total s   iter   residual converged     fill   opcmp")
 
@@ -223,4 +187,6 @@ function main()
   end
 end
 
-main()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+  main()
+end

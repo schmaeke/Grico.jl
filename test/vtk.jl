@@ -29,6 +29,11 @@ end
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
   u = ScalarField(space; name=:u)
   state = State(FieldLayout((u,)), [2.0, 2.0])
+  copied_domain = copy(domain)
+  copied_space = HpSpace(copied_domain,
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  v = ScalarField(copied_space; name=:v)
+  mixed_state = State(FieldLayout((u, v)), [2.0, 2.0, 3.0, 3.0])
 
   mktempdir() do directory
     path = write_vtk(joinpath(directory, "grid"), domain; point_data=(marker=x -> x[1],),
@@ -98,6 +103,15 @@ end
     @test vtk_data_array(xml, "time", Float64) == [1.5]
   end
 
+  mktempdir() do directory
+    path = write_vtk(joinpath(directory, "mixed"), mixed_state; append=false, ascii=true)
+    xml = read(path, String)
+
+    @test isfile(path)
+    @test occursin("Name=\"u\"", xml)
+    @test occursin("Name=\"v\"", xml)
+  end
+
   hex_domain = Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1, 1, 1))
   mktempdir() do directory
     path = write_vtk(joinpath(directory, "hex"), hex_domain; subdivisions=1, export_degree=2,
@@ -145,12 +159,15 @@ end
     @test_throws ArgumentError write_pvd(joinpath(directory, "bad.pvd"), paths; timesteps=[0.0])
   end
 
-  wrong_domain = copy(domain)
+  refined_domain = copy(domain)
+  refine!(grid(refined_domain), 1, 1)
 
   mktempdir() do directory
     @test_throws ArgumentError write_vtk(joinpath(directory, "bad"), domain; fields=(u,),
                                          append=false, ascii=true)
-    @test_throws ArgumentError write_vtk(joinpath(directory, "wrongdomain"), wrong_domain;
+    @test isfile(write_vtk(joinpath(directory, "samegeometry"), copied_domain; state=state,
+                           append=false, ascii=true))
+    @test_throws ArgumentError write_vtk(joinpath(directory, "wrongdomain"), refined_domain;
                                          state=state, append=false, ascii=true)
     @test_throws ArgumentError write_vtk(joinpath(directory, "dup_point"), domain;
                                          point_data=["marker" => [1.0, 2.0],

@@ -171,8 +171,8 @@ abstract type _AbstractProblem end
 function _empty_problem_data(fields::AbstractField...)
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
   return _ProblemData(AbstractField[fields...], Any[], _BoundaryContribution[], Any[],
-                      _SurfaceContribution[], _CellQuadratureAttachment[],
-                      _SurfaceAttachment[], Dirichlet[], MeanValue[])
+                      _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
+                      Dirichlet[], MeanValue[])
 end
 
 _problem_data(problem::_AbstractProblem) = getfield(problem, :data)

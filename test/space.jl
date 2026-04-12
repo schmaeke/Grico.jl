@@ -239,8 +239,7 @@ end
   domain = Grico.Domain((0.0, 0.0), (2.0, 2.0), (2, 2))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
-                                           degree=Grico.AxisDegrees((1, 0)),
-                                           continuity=(:cg, :dg)))
+                                           degree=Grico.AxisDegrees((1, 0)), continuity=(:cg, :dg)))
 
   @test Grico.scalar_dof_count(space) == 6
   _test_term_vector(Grico.mode_terms(space, 1, (0, 0)), [1 => 1.0])
@@ -322,8 +321,7 @@ end
   grid = Grico.grid(domain)
   first_child = Grico.refine!(grid, 2, 2)
   space = Grico.HpSpace(domain,
-                        Grico.SpaceOptions(degree=Grico.UniformDegree(2),
-                                           continuity=(:cg, :dg)))
+                        Grico.SpaceOptions(degree=Grico.UniformDegree(2), continuity=(:cg, :dg)))
   @test Grico.check_space(space) === nothing
 
   function wrapped_value(y, coefficients)
@@ -334,8 +332,7 @@ end
   coefficients = collect(1.0:Grico.scalar_dof_count(space))
 
   for y in (-0.75, -0.25, 0.25, 0.75)
-    @test _space_value(space, 1, (1.0, y), coefficients) ≈
-          wrapped_value(y, coefficients) atol = SPACE_TOL
+    @test _space_value(space, 1, (1.0, y), coefficients) ≈ wrapped_value(y, coefficients) atol = SPACE_TOL
   end
 end
 

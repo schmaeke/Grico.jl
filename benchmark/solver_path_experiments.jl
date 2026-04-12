@@ -21,11 +21,11 @@ import MUMPS
 import AlgebraicMultigrid: ruge_stuben, smoothed_aggregation, aspreconditioner, operator_complexity
 import Grico: cell_matrix!, cell_rhs!
 
-const KH_SAMPLE_STEPS = (1, 2, 3)
+const FLOW_SAMPLE_ITERS = (1, 2, 3)
+const FLOW_ROOT_COUNTS = (16, 16)
 const SPD_ROOT_COUNTS = (48, 48)
 const SPD_DEGREE = 2
 const WHOLE_ILU_TAUS = (1e-3, 1e-4)
-const SCHUR_ILU_TAUS = (1e-3, 1e-4)
 const SCHWARZ_ALWAYS = Grico.AdditiveSchwarzPreconditioner(min_dofs=0)
 const HYPRE_AMG_OPTIONS = (; CoarsenType=6, OldDefault=true, RelaxType=6, NumSweeps=1, PrintLevel=0)
 
@@ -45,11 +45,10 @@ struct Measurement
   complexity::Float64
 end
 
-struct KHSample{SF<:Grico.AffineSystem,ST<:Grico.AffineSystem}
+struct FlowSample{SF<:Grico.AffineSystem}
   step::Int
   flow_system::SF
   flow_preconditioner::Grico.FieldSplitSchurPreconditioner
-  transport_system::ST
 end
 
 mutable struct OrderedFactorOperator{T<:AbstractFloat,F}
@@ -91,14 +90,16 @@ function build_ordered_ilu_operator(matrix_data::SparseMatrixCSC{T,Int};
   return operator, nnz(factor.L) + nnz(factor.U)
 end
 
-let previous = get(ENV, "GRICO_KH_AUTORUN", nothing)
-  ENV["GRICO_KH_AUTORUN"] = "0"
-  include(joinpath(REPO_ROOT, "examples", "kelvin_helmholtz.jl"))
+# Load the cavity example as a reusable setup library without running its
+# top-level example driver inside this benchmark harness.
+let previous = get(ENV, "GRICO_LDC_AUTORUN", nothing)
+  ENV["GRICO_LDC_AUTORUN"] = "0"
+  include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity.jl"))
 
   if previous === nothing
-    delete!(ENV, "GRICO_KH_AUTORUN")
+    delete!(ENV, "GRICO_LDC_AUTORUN")
   else
-    ENV["GRICO_KH_AUTORUN"] = previous
+    ENV["GRICO_LDC_AUTORUN"] = previous
   end
 end
 
@@ -156,7 +157,6 @@ function cell_rhs!(local_rhs, operator::Source, values::CellValues)
   return nothing
 end
 
-radius(x) = sqrt(sum(abs2, x))
 poisson_exact_solution(x) = sinpi(x[1]) * sinpi(x[2])
 poisson_source_term(x) = 2 * pi^2 * poisson_exact_solution(x)
 
@@ -433,63 +433,21 @@ function block_builder(preconditioner::Grico.FieldSplitSchurPreconditioner; prim
                                             schur_kind=schur_kind)
 end
 
-function sample_kelvin_helmholtz(sample_steps::Tuple{Vararg{Int}})
+function sample_lid_driven_cavity(sample_steps::Tuple{Vararg{Int}})
   isempty(sample_steps) && throw(ArgumentError("sample_steps must not be empty"))
   issorted(collect(sample_steps)) || throw(ArgumentError("sample_steps must be sorted"))
   first(sample_steps) >= 1 || throw(ArgumentError("sample_steps must be positive"))
 
-  context = (; velocity, pressure, concentration, flow_state, concentration_state, step_operator,
-             step_plan, transport_operator, transport_plan)
-  samples = KHSample[]
+  context = build_lid_driven_cavity_context(root_counts=FLOW_ROOT_COUNTS)
+  samples = FlowSample[]
 
   for step in 1:last(sample_steps)
-    if step > 1 && (step - 1) % ADAPTIVITY_INTERVAL == 0
-      current_space = field_space(context.velocity)
-      limits = AdaptivityLimits(current_space; max_h_level=MAX_H_LEVEL)
-      adaptivity_plan = h_adaptivity_plan(context.concentration_state, context.concentration;
-                                          threshold=H_REFINEMENT_THRESHOLD,
-                                          h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                          limits=limits)
-
-      if !isempty(adaptivity_plan)
-        space_transition = transition(adaptivity_plan)
-        new_velocity, new_pressure, new_concentration = adapted_fields(space_transition,
-                                                                       context.velocity,
-                                                                       context.pressure,
-                                                                       context.concentration)
-        new_flow_state = transfer_state(space_transition, context.flow_state,
-                                        (context.velocity, context.pressure),
-                                        (new_velocity, new_pressure))
-        new_concentration_state = transfer_state(space_transition, context.concentration_state,
-                                                 context.concentration, new_concentration)
-        new_step_operator, new_step_plan = build_flow_step_plan(new_velocity, new_pressure,
-                                                                new_flow_state)
-        new_transport_operator, new_transport_plan = build_transport_plan(new_concentration,
-                                                                          new_velocity,
-                                                                          new_concentration_state,
-                                                                          new_flow_state)
-        context = (; velocity=new_velocity, pressure=new_pressure, concentration=new_concentration,
-                   flow_state=new_flow_state, concentration_state=new_concentration_state,
-                   step_operator=new_step_operator, step_plan=new_step_plan,
-                   transport_operator=new_transport_operator, transport_plan=new_transport_plan)
-      end
-    end
-
     flow_preconditioner = FieldSplitSchurPreconditioner((context.velocity,), (context.pressure,))
-    context.step_operator.old_state = context.flow_state
-    flow_system = assemble(context.step_plan)
-    new_flow_state = State(context.step_plan,
-                           solve(flow_system; preconditioner=flow_preconditioner))
-    context.transport_operator.velocity_state = new_flow_state
-    context.transport_operator.concentration_state = context.concentration_state
-    transport_system = assemble(context.transport_plan)
+    context, flow_system, _, _, _ = advance_picard_step(context)
 
     if step in sample_steps
-      push!(samples, KHSample(step, flow_system, flow_preconditioner, transport_system))
+      push!(samples, FlowSample(step, flow_system, flow_preconditioner))
     end
-
-    new_concentration_state = State(context.transport_plan, solve(transport_system))
-    context = (; context..., flow_state=new_flow_state, concentration_state=new_concentration_state)
   end
 
   return samples
@@ -519,26 +477,15 @@ function print_header()
   return nothing
 end
 
-function warmup!(spd_case, kh_samples)
+function warmup!(spd_case, flow_samples)
   spd_system = spd_case.system
-  first_sample = first(kh_samples)
+  first_sample = first(flow_samples)
   measure_direct(spd_system)
   measure_mumps(spd_system; label="warmup", sym=MUMPS.mumps_definite)
   measure_cg(spd_system, "warmup", build_whole_schwarz)
   measure_cg(spd_system, "warmup", build_whole_rs_amg)
   measure_cg(spd_system, "warmup", build_whole_sa_amg)
   measure_hypre(spd_system, "warmup", build_hypre_pcg_amg)
-
-  measure_direct(first_sample.transport_system)
-  measure_mumps(first_sample.transport_system; label="warmup", sym=MUMPS.mumps_unsymmetric)
-  measure_gmres(first_sample.transport_system, "warmup", build_whole_schwarz)
-  measure_gmres(first_sample.transport_system, "warmup",
-                system -> build_whole_ilu(system, WHOLE_ILU_TAUS[1]))
-  measure_gmres(first_sample.transport_system, "warmup",
-                system -> build_whole_ilu(system, WHOLE_ILU_TAUS[2]))
-  measure_gmres(first_sample.transport_system, "warmup", build_whole_sa_amg)
-  measure_hypre(first_sample.transport_system, "warmup", build_hypre_gmres_ilu)
-  measure_hypre(first_sample.transport_system, "warmup", build_hypre_flexgmres_amg)
 
   measure_direct(first_sample.flow_system)
   measure_mumps(first_sample.flow_system; label="warmup", sym=MUMPS.mumps_unsymmetric)
@@ -591,49 +538,15 @@ function run_spd_experiments(spd_case)
   return nothing
 end
 
-function run_transport_experiments(kh_samples)
+function run_flow_experiments(flow_samples)
   println()
-  println("General scalar transport")
-  @printf("  sampled KH steps      : %s\n", KH_SAMPLE_STEPS)
+  println("Mixed lid-driven cavity flow")
+  @printf("  sampled Picard iterations : %s\n", FLOW_SAMPLE_ITERS)
   print_header()
 
-  for sample in kh_samples
+  for sample in flow_samples
     println()
-    @printf("step %d\n", sample.step)
-    measurements = [measure_direct(sample.transport_system),
-                    measure_mumps(sample.transport_system; sym=MUMPS.mumps_unsymmetric),
-                    measure_gmres(sample.transport_system, "AdditiveSchwarz + GMRES",
-                                  build_whole_schwarz),
-                    measure_gmres(sample.transport_system, "SmoothedAgg AMG + GMRES",
-                                  build_whole_sa_amg),
-                    measure_gmres(sample.transport_system,
-                                  @sprintf("ILU(τ=%.0e) + GMRES", WHOLE_ILU_TAUS[1]),
-                                  system -> build_whole_ilu(system, WHOLE_ILU_TAUS[1])),
-                    measure_gmres(sample.transport_system,
-                                  @sprintf("ILU(τ=%.0e) + GMRES", WHOLE_ILU_TAUS[2]),
-                                  system -> build_whole_ilu(system, WHOLE_ILU_TAUS[2])),
-                    measure_hypre(sample.transport_system, "HYPRE GMRES + ILU",
-                                  build_hypre_gmres_ilu),
-                    measure_hypre(sample.transport_system, "HYPRE FlexGMRES + AMG",
-                                  build_hypre_flexgmres_amg)]
-
-    for measurement in measurements
-      print_measurement(measurement, sample.transport_system)
-    end
-  end
-
-  return nothing
-end
-
-function run_flow_experiments(kh_samples)
-  println()
-  println("Mixed flow system")
-  @printf("  sampled KH steps      : %s\n", KH_SAMPLE_STEPS)
-  print_header()
-
-  for sample in kh_samples
-    println()
-    @printf("step %d\n", sample.step)
+    @printf("iteration %d\n", sample.step)
     measurements = [measure_direct(sample.flow_system),
                     measure_mumps(sample.flow_system; sym=MUMPS.mumps_unsymmetric),
                     measure_gmres(sample.flow_system, "FieldSplitSchur + GMRES",
@@ -675,13 +588,14 @@ end
 
 function main()
   spd_case = build_spd_case()
-  kh_samples = sample_kelvin_helmholtz(KH_SAMPLE_STEPS)
-  warmup!(spd_case, kh_samples)
+  flow_samples = sample_lid_driven_cavity(FLOW_SAMPLE_ITERS)
+  warmup!(spd_case, flow_samples)
   println("solver path experiments")
   run_spd_experiments(spd_case)
-  run_transport_experiments(kh_samples)
-  run_flow_experiments(kh_samples)
+  run_flow_experiments(flow_samples)
   return nothing
 end
 
-main()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+  main()
+end

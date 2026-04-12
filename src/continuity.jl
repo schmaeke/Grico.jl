@@ -216,7 +216,8 @@ end
 # CG trace algebra. Modes that only touch DG axes keep their own independent
 # cell-local dof and therefore never need a provisional boundary representative.
 function _build_boundary_variables!(state::_SpaceBuildState{D,T},
-                                    continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
+                                    continuity_policy::_AxisContinuity{D}) where {D,
+                                                                                  T<:AbstractFloat}
   next_variable = 1
 
   for leaf_index in eachindex(state.active_leaves)

@@ -56,6 +56,25 @@ function _adaptivity_limit_tuple(value, D::Int, name::AbstractString, check)
                 end, D)
 end
 
+# Degree offsets for derived plans follow the same scalar-or-tuple convention as
+# adaptivity limits, but offsets may be negative because companion spaces such
+# as pressure often track a driver space with a lower polynomial order.
+function _degree_offset_tuple(value, D::Int)
+  if value isa Integer
+    return ntuple(_ -> Int(value), D)
+  end
+
+  value isa Tuple || throw(ArgumentError("degree_offset must be an integer or NTuple{$D,Int}"))
+  length(value) == D || throw(ArgumentError("degree_offset must have length $D"))
+
+  return ntuple(axis -> begin
+                  component = value[axis]
+                  component isa Integer ||
+                    throw(ArgumentError("degree_offset[$axis] must be an integer"))
+                  Int(component)
+                end, D)
+end
+
 """
     AdaptivityLimits(dimension; min_h_level=0, max_h_level=typemax(Int),
                      min_p=1, max_p=typemax(Int))
@@ -973,6 +992,87 @@ function _transition_source_leaves(source_grid::CartesianGrid, target_grid::Cart
   return leaves
 end
 
+function _checked_derived_plan_space(driver_plan::AdaptivityPlan, space::HpSpace)
+  dimension(space) == dimension(driver_plan) ||
+    throw(ArgumentError("derived space must have dimension $(dimension(driver_plan))"))
+  eltype(origin(domain(space))) == eltype(origin(domain(source_space(driver_plan)))) ||
+    throw(ArgumentError("derived space must use the same scalar type as the driver plan"))
+  _same_adaptivity_geometry(domain(source_space(driver_plan)), domain(space)) ||
+    throw(ArgumentError("derived space must share the driver-plan geometry and root cell counts"))
+  return space
+end
+
+# Lift one target topology onto a companion space by inheriting the maximal
+# degree over every overlapping source leaf. This reproduces refinement
+# inheritance and coarsening-by-maximum without assuming leaf-number identity.
+function _inherited_target_degrees(space::HpSpace{D}, target_domain::Domain{D}) where {D}
+  source_grid = grid(space)
+  target_grid = grid(target_domain)
+  active = active_leaves(target_grid)
+  degrees = Vector{NTuple{D,Int}}(undef, length(active))
+
+  for index in eachindex(active)
+    source_leaves = _transition_source_leaves(source_grid, target_grid, active[index])
+    degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis]
+                                            for leaf in source_leaves), D)
+  end
+
+  return degrees
+end
+
+function _offset_target_degrees(driver_plan::AdaptivityPlan{D},
+                                degree_offset::NTuple{D,Int}) where {D}
+  active = active_leaves(driver_plan)
+  degrees = Vector{NTuple{D,Int}}(undef, length(active))
+
+  for index in eachindex(active)
+    driver_degrees = cell_degrees(driver_plan, active[index])
+    degrees[index] = ntuple(axis -> driver_degrees[axis] + degree_offset[axis], D)
+  end
+
+  return degrees
+end
+
+"""
+    derived_adaptivity_plan(driver_plan, space; degree_offset=nothing,
+                            limits=AdaptivityLimits(space))
+    derived_adaptivity_plan(driver_plan, field; degree_offset=nothing,
+                            limits=AdaptivityLimits(field_space(field)))
+
+Build a companion [`AdaptivityPlan`](@ref) for another space on the target mesh
+topology of `driver_plan`.
+
+This is the mixed-space adaptivity bridge for coupled problems whose fields live
+on different `HpSpace`s but must still share one target active-leaf topology.
+The returned value is an ordinary single-space `AdaptivityPlan`, so all existing
+queries such as [`transition`](@ref), [`h_adaptation_axes`](@ref), and
+[`adaptivity_summary`](@ref) continue to work unchanged.
+
+If `degree_offset` is left at `nothing`, the companion plan inherits degrees
+from its own source space: every target leaf receives the componentwise maximum
+degree over the overlapping source leaves of `space`. This is the natural rule
+for synchronized pure-`h` adaptation.
+
+If `degree_offset` is provided, the companion target degrees are taken from the
+target leaves of `driver_plan` and shifted componentwise by that offset before
+the usual `AdaptivityLimits` and continuity checks are applied. This is the
+compact way to express relationships such as pressure = velocity - 1.
+"""
+function derived_adaptivity_plan(driver_plan::AdaptivityPlan{D}, space::HpSpace{D};
+                                 degree_offset=nothing, limits=AdaptivityLimits(space)) where {D}
+  checked_space = _checked_derived_plan_space(driver_plan, space)
+  target = copy(target_domain(driver_plan))
+  degrees = isnothing(degree_offset) ? _inherited_target_degrees(checked_space, target) :
+            _offset_target_degrees(driver_plan, _degree_offset_tuple(degree_offset, D))
+  return AdaptivityPlan(checked_space, target, degrees; limits=limits)
+end
+
+function derived_adaptivity_plan(driver_plan::AdaptivityPlan, field::AbstractField;
+                                 degree_offset=nothing, limits=AdaptivityLimits(field_space(field)))
+  return derived_adaptivity_plan(driver_plan, field_space(field); degree_offset=degree_offset,
+                                 limits=limits)
+end
+
 """
     transition(plan)
 
@@ -1206,6 +1306,112 @@ function transfer_state(transition::SpaceTransition, state::State;
   new_fields = adapted_fields(transition, old_fields)
   return new_fields,
          transfer_state(transition, state, old_fields, new_fields; linear_solve=linear_solve)
+end
+
+function _checked_transition_plans(plans::Tuple, state::State)
+  isempty(plans) && throw(ArgumentError("at least one adaptivity plan is required"))
+  layout = field_layout(state)
+  layout_fields = fields(layout)
+  layout_spaces = IdDict{Any,Bool}()
+
+  for field in layout_fields
+    layout_spaces[field_space(field)] = true
+  end
+
+  plan_by_space = IdDict{Any,AdaptivityPlan}()
+  reference_target = nothing
+
+  for plan in plans
+    plan isa AdaptivityPlan || throw(ArgumentError("plans must be AdaptivityPlan values"))
+    source = source_space(plan)
+    !haskey(layout_spaces, source) &&
+      throw(ArgumentError("every adaptivity plan must match a source space in the state layout"))
+    haskey(plan_by_space, source) &&
+      throw(ArgumentError("adaptivity plans must use distinct source spaces"))
+    plan_by_space[source] = plan
+
+    if isnothing(reference_target)
+      reference_target = target_domain(plan)
+      continue
+    end
+
+    _same_adaptivity_geometry(reference_target, target_domain(plan)) ||
+      throw(ArgumentError("adaptivity plan targets must share one physical domain and periodic topology"))
+    active_leaves(grid(reference_target)) == active_leaves(grid(target_domain(plan))) ||
+      throw(ArgumentError("adaptivity plan targets must share the same active-leaf topology"))
+  end
+
+  length(plan_by_space) == length(layout_spaces) ||
+    throw(ArgumentError("the state layout requires exactly one adaptivity plan per source space"))
+
+  return plan_by_space
+end
+
+"""
+    transfer_state(plans, state; linear_solve=default_linear_solve)
+
+Transfer a mixed-field [`State`](@ref) across one [`AdaptivityPlan`](@ref) per
+source space.
+
+This is the layout-level companion to the single-space
+`transfer_state(transition, state)` workflow. Each plan is compiled into its own
+[`SpaceTransition`](@ref), fields are transferred in groups that share one
+source space, and the resulting blocks are stitched back together in the
+original layout order. The plans must therefore use distinct source spaces and
+describe one common target active-leaf topology so the transferred fields can
+again be combined into one [`FieldLayout`](@ref).
+"""
+function transfer_state(plans::Tuple, state::State; linear_solve=default_linear_solve)
+  old_fields = fields(field_layout(state))
+  plan_by_space = _checked_transition_plans(plans, state)
+  space_to_group = IdDict{Any,Int}()
+  group_spaces = Any[]
+  group_indices = Vector{Vector{Int}}()
+
+  for index in eachindex(old_fields)
+    space = field_space(old_fields[index])
+
+    if haskey(space_to_group, space)
+      push!(group_indices[space_to_group[space]], index)
+    else
+      push!(group_spaces, space)
+      push!(group_indices, Int[index])
+      space_to_group[space] = length(group_spaces)
+    end
+  end
+
+  new_fields = Vector{AbstractField}(undef, length(old_fields))
+  transferred_groups = Vector{Any}(undef, length(group_spaces))
+  group_new_fields = Vector{Any}(undef, length(group_spaces))
+
+  for group_index in eachindex(group_spaces)
+    indices = group_indices[group_index]
+    old_group_fields = ntuple(local_index -> old_fields[indices[local_index]], length(indices))
+    group_transition = transition(plan_by_space[group_spaces[group_index]])
+    new_group_fields = adapted_fields(group_transition, old_group_fields)
+    group_state = transfer_state(group_transition, state, old_group_fields, new_group_fields;
+                                 linear_solve=linear_solve)
+
+    for local_index in eachindex(indices)
+      new_fields[indices[local_index]] = new_group_fields[local_index]
+    end
+
+    group_new_fields[group_index] = new_group_fields
+    transferred_groups[group_index] = group_state
+  end
+
+  new_layout = FieldLayout(new_fields)
+  new_state = State(new_layout)
+
+  for group_index in eachindex(group_spaces)
+    group_state = transferred_groups[group_index]
+
+    for field in group_new_fields[group_index]
+      field_values(new_state, field) .= field_values(group_state, field)
+    end
+  end
+
+  return Tuple(new_fields), new_state
 end
 
 # Modal coefficient indicators and smoothness heuristics.
