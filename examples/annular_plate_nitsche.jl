@@ -2,7 +2,9 @@ using Printf
 using Grico
 import Grico: cell_matrix!, surface_matrix!, surface_rhs!
 
-# This example solves the scalar Laplace problem on the annulus
+# This example is the compact "unfitted methods" tour of the package.
+#
+# We solve the scalar Laplace problem on the annulus
 #
 #   Ω = {x ∈ ℝ² : Rᵢ ≤ ‖x‖ ≤ Rₒ}
 #
@@ -23,8 +25,22 @@ import Grico: cell_matrix!, surface_matrix!, surface_rhs!
 # 2. embedded-surface assembly on an explicit segment mesh, and
 # 3. weak Dirichlet enforcement by Nitsche terms instead of boundary-fitted
 #    trace constraints.
+#
+# File roadmap:
+#
+# 1. choose the annulus geometry and discretization parameters,
+# 2. define the volume and surface weak-form contributions,
+# 3. build the background mesh and embedded boundary representation,
+# 4. attach finite-cell quadratures on all active leaves,
+# 5. solve, verify, and export.
 
-# Problem geometry and discretization parameters.
+# ---------------------------------------------------------------------------
+# 1. Problem geometry and discretization parameters
+# ---------------------------------------------------------------------------
+#
+# The physical domain is the annulus, but the finite-element space lives on the
+# enclosing square. Only the quadrature rules "know" which part of each
+# Cartesian leaf belongs to the physical domain.
 const INNER_RADIUS = 0.35
 const OUTER_RADIUS = 1.0
 const ROOT_COUNTS = (2, 2)
@@ -50,6 +66,15 @@ const NITSCHE_PENALTY = 40.0
 const WRITE_VTK = true
 const EXPORT_SUBDIVISIONS = 1
 const EXPORT_DEGREE = 4
+
+# ---------------------------------------------------------------------------
+# 2. Local weak forms
+# ---------------------------------------------------------------------------
+#
+# The interior operator is the standard Laplace bilinear form. The boundary
+# condition is not applied by a fitted boundary trace constraint because the
+# boundary is curved and cuts through Cartesian cells. Instead, we add a
+# separate surface operator later.
 
 # Standard Laplace bilinear form
 #
@@ -95,6 +120,10 @@ end
 # The consistency terms recover the weak form of the Dirichlet problem, the
 # symmetry term mirrors the first consistency term, and the penalty term restores
 # coercivity on unfitted cells.
+#
+# For a reader new to Nitsche methods, the key point is: the boundary condition
+# is enforced weakly by extra integral terms instead of by directly eliminating
+# boundary degrees of freedom.
 struct NitscheDirichlet{F,G,T}
   field::F
   data::G
@@ -108,7 +137,8 @@ function surface_matrix!(local_matrix, operator::NitscheDirichlet, values::Surfa
 
   # On the Cartesian background mesh, a simple and robust local length scale is
   # the smaller side length of the leaf that contains the current embedded
-  # segment quadrature points.
+  # segment quadrature points. This is the `h` that appears in the Nitsche
+  # penalty scaling η / h.
   h = min(cell_size(domain, values.leaf, 1), cell_size(domain, values.leaf, 2))
   penalty = operator.penalty / h
 
@@ -159,9 +189,19 @@ function surface_rhs!(local_rhs, operator::NitscheDirichlet, values::SurfaceValu
   return nothing
 end
 
+# ---------------------------------------------------------------------------
+# 3. Background mesh and embedded boundary geometry
+# ---------------------------------------------------------------------------
+#
+# The background finite-element mesh is just a square. The curved circles are
+# represented separately by a segment mesh. This split is central to unfitted
+# methods: geometry and approximation space no longer need to match exactly.
+#
 # Build a polygonal approximation of a circle as a closed segment mesh. The
 # `clockwise` option is used to reverse the inner boundary orientation so the
-# resulting two-component boundary has a consistent global orientation.
+# resulting two-component boundary has a consistent global orientation. That
+# matters because the outward normal on the inner boundary points toward the
+# hole, not toward the outer square.
 function circle_points_segments(radius, segment_count; clockwise=false)
   angles = range(0.0, 2 * pi; length=segment_count + 1)[1:(end-1)]
   points = [(radius * cos(angle), radius * sin(angle)) for angle in angles]
@@ -188,16 +228,30 @@ boundary = EmbeddedSurface(SegmentMesh(boundary_points, boundary_segments);
                            point_count=SURFACE_POINT_COUNT,)
 
 # Exact radial harmonic solution and a level-set description of the physical
-# annulus. The level set is negative inside the annulus, zero on the circles,
-# and positive outside.
+# annulus. The level set uses the standard sign convention
+#
+#   φ(x) < 0  inside Ω,
+#   φ(x) = 0  on ∂Ω,
+#   φ(x) > 0  outside Ω.
+#
+# The finite-cell quadrature builder samples this level-set function to detect
+# where a Cartesian leaf is fully inside, fully outside, or cut by the physical
+# boundary.
 exact_solution = x -> log(hypot(x[1], x[2]) / OUTER_RADIUS) / log(INNER_RADIUS / OUTER_RADIUS)
 annulus_levelset = x -> max(hypot(x[1], x[2]) - OUTER_RADIUS, INNER_RADIUS - hypot(x[1], x[2]))
 is_physical = x -> annulus_levelset(x) <= 0.0
 
+# ---------------------------------------------------------------------------
+# 4. Assembly ingredients on the unfitted geometry
+# ---------------------------------------------------------------------------
+#
 # Assemble the unfitted problem:
-# - Laplace operator in the physical domain,
-# - symmetric Nitsche Dirichlet condition on the embedded boundary,
-# - explicit embedded-surface geometry.
+# - `Diffusion(u)` acts in the physical interior,
+# - `NitscheDirichlet(...)` acts on the embedded circular boundary,
+# - `boundary` supplies the embedded-surface geometry used by the surface term.
+#
+# Nothing happens at `add_*` time yet. We are just registering what should be
+# compiled later.
 problem = AffineProblem(u)
 add_cell!(problem, Diffusion(u))
 add_surface!(problem, NitscheDirichlet(u, exact_solution, NITSCHE_PENALTY))
@@ -206,6 +260,9 @@ add_embedded_surface!(problem, boundary)
 # Finite-cell quadratures are attached leaf by leaf. The same quadratures are
 # also reused for the verification integral so the reported `L²` error is
 # measured over the physical annulus rather than over the surrounding square.
+#
+# In an unfitted method, this is essential. If one integrated over the whole
+# square, one would be solving and verifying the wrong problem.
 verification_quadratures = Pair{Int,AbstractQuadrature{2,Float64}}[]
 
 for leaf in active_leaves(space)
@@ -217,8 +274,16 @@ for leaf in active_leaves(space)
   push!(verification_quadratures, leaf => quadrature)
 end
 
-# Solve the linear system and compute the relative `L²` error against the exact
-# radial solution.
+# ---------------------------------------------------------------------------
+# 5. Solve, verify, and export
+# ---------------------------------------------------------------------------
+#
+# Once the volume operators, surface operators, embedded geometry, and custom
+# cell quadratures are registered, the normal Grico workflow applies: compile,
+# assemble, solve.
+#
+# The `relative_l2_error` call uses the same cut-cell quadratures, so the error
+# is integrated over the annulus itself.
 plan = compile(problem)
 state = State(plan, solve(assemble(plan)))
 error_value = relative_l2_error(state, u, exact_solution; plan=plan,
@@ -234,6 +299,10 @@ if WRITE_VTK
   # In the VTK output we export both the discrete solution and a few useful
   # diagnostics: a physical-domain mask on the enclosing square, the pointwise
   # absolute error inside the annulus, and per-cell level/degree metadata.
+  #
+  # The mask is helpful because the exported mesh is still the background
+  # Cartesian square. The mask tells the reader which part is the actual annulus
+  # and which part is just surrounding embedding space.
   vtk_path = write_vtk(joinpath(output_directory, "annular_plate_nitsche"), state;
                        point_data=(physical=x -> is_physical(x) ? 1.0 : 0.0,
                                    abs_error=(x, values) -> is_physical(x) ?
