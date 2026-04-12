@@ -561,9 +561,10 @@ function _assemble_leaf_affine_pass!(scratch, plan::AssemblyPlan{D,T}, condensat
       for surface_index in leaf.embedded_surfaces
         surface = @inbounds embedded_surfaces[surface_index]
 
-        for operator in plan.surface_operators
-          surface_matrix!(local_matrix, operator, surface)
-          surface_rhs!(local_rhs, operator, surface)
+        for wrapped in plan.surface_operators
+          _matches(surface, wrapped.tag) || continue
+          surface_matrix!(local_matrix, wrapped.operator, surface)
+          surface_rhs!(local_rhs, wrapped.operator, surface)
         end
       end
 
@@ -658,7 +659,8 @@ function _assemble_boundary_pass!(scratch, faces, operators, fixed, fixed_values
   return nothing
 end
 
-# Specialized embedded-surface traversal using the surface operator hooks.
+# Specialized embedded-surface traversal using the surface operator hooks and
+# optional symbolic surface-tag filtering.
 function _assemble_surface_pass!(scratch, surfaces, operators, fixed, fixed_values, pivot_rows)
   _run_chunks!(scratch, length(surfaces)) do cache, first_surface, last_surface
     for surface_index in first_surface:last_surface
@@ -669,9 +671,10 @@ function _assemble_surface_pass!(scratch, surfaces, operators, fixed, fixed_valu
       fill!(local_matrix, zero(eltype(cache.values)))
       fill!(local_rhs, zero(eltype(cache.global_rhs)))
 
-      for operator in operators
-        surface_matrix!(local_matrix, operator, surface)
-        surface_rhs!(local_rhs, operator, surface)
+      for wrapped in operators
+        _matches(surface, wrapped.tag) || continue
+        surface_matrix!(local_matrix, wrapped.operator, surface)
+        surface_rhs!(local_rhs, wrapped.operator, surface)
       end
 
       _scatter_affine!(cache, surface, local_matrix, local_rhs, fixed, fixed_values, pivot_rows)
@@ -722,7 +725,7 @@ function _boundary_residual_pass!(scratch, faces, operators, state, fixed, pivot
   return nothing
 end
 
-# Embedded-surface residual traversal.
+# Embedded-surface residual traversal with optional surface-tag filtering.
 function _surface_residual_pass!(scratch, surfaces, operators, state, fixed, pivot_rows)
   _run_chunks!(scratch, length(surfaces)) do cache, first_surface, last_surface
     for surface_index in first_surface:last_surface
@@ -731,8 +734,9 @@ function _surface_residual_pass!(scratch, surfaces, operators, state, fixed, piv
       local_rhs = view(cache.rhs, 1:surface.local_dof_count)
       fill!(local_rhs, zero(eltype(cache.global_rhs)))
 
-      for operator in operators
-        surface_residual!(local_rhs, operator, surface, state)
+      for wrapped in operators
+        _matches(surface, wrapped.tag) || continue
+        surface_residual!(local_rhs, wrapped.operator, surface, state)
       end
 
       _scatter_residual!(cache, surface, local_rhs, fixed, pivot_rows)
@@ -783,7 +787,7 @@ function _boundary_tangent_pass!(scratch, faces, operators, state, fixed, pivot_
   return nothing
 end
 
-# Embedded-surface tangent traversal.
+# Embedded-surface tangent traversal with optional surface-tag filtering.
 function _surface_tangent_pass!(scratch, surfaces, operators, state, fixed, pivot_rows)
   _run_chunks!(scratch, length(surfaces)) do cache, first_surface, last_surface
     for surface_index in first_surface:last_surface
@@ -792,8 +796,9 @@ function _surface_tangent_pass!(scratch, surfaces, operators, state, fixed, pivo
       local_matrix = view(cache.matrix, 1:surface.local_dof_count, 1:surface.local_dof_count)
       fill!(local_matrix, zero(eltype(cache.values)))
 
-      for operator in operators
-        surface_tangent!(local_matrix, operator, surface, state)
+      for wrapped in operators
+        _matches(surface, wrapped.tag) || continue
+        surface_tangent!(local_matrix, wrapped.operator, surface, state)
       end
 
       _scatter_tangent!(cache, surface, local_matrix, fixed, pivot_rows)
@@ -1661,3 +1666,7 @@ end
 function _matches(face::FaceValues, boundary::BoundaryFace)
   face.axis == boundary.axis && face.side == boundary.side
 end
+
+# Embedded-surface selector match.
+_matches(::SurfaceValues, ::Nothing) = true
+_matches(surface::SurfaceValues, tag::Symbol) = surface.tag === tag

@@ -118,10 +118,13 @@ Local evaluation data for an embedded surface quadrature item inside one cell.
 Unlike [`FaceValues`](@ref), the normal may vary from quadrature point to
 quadrature point, so `SurfaceValues` stores one normal vector per point. This
 type is used for immersed or embedded surface terms that are not tied to a
-topological cell face.
+topological cell face. The optional `tag` records the symbolic surface label
+under which the underlying geometry or quadrature was attached to the problem.
+For untagged attachments, `tag === nothing`.
 """
 struct SurfaceValues{D,T<:AbstractFloat,F<:Tuple}
   leaf::Int
+  tag::_SurfaceTag
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   normals::Vector{NTuple{D,T}}
@@ -920,29 +923,36 @@ function _compile_interface(layout::FieldLayout{D,T}, minus_leaf::Int, face_axis
 end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T},
-                                         surface::SurfaceQuadrature{D}) where {D,T<:AbstractFloat}
+                                         attachment::_SurfaceAttachment) where {D,T<:AbstractFloat}
+  return _compile_embedded_surface_items(layout, attachment.surface, attachment.tag)
+end
+
+function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{D},
+                                         tag::_SurfaceTag) where {D,T<:AbstractFloat}
   grid_data = grid(layout.slots[1].space)
-  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(grid_data, surface, D))]
+  return [_compile_surface_quadrature(layout,
+                                      _checked_surface_quadrature(grid_data, surface, D), tag)]
 end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T},
-                                         surface::SurfaceQuadrature{SD}) where {D,T<:AbstractFloat,
-                                                                                SD}
+                                         surface::SurfaceQuadrature{SD},
+                                         tag::_SurfaceTag) where {D,T<:AbstractFloat,SD}
   throw(ArgumentError("surface quadrature dimension $SD does not match the problem dimension $D"))
 end
 
-function _compile_embedded_surface_items(layout::FieldLayout{D,T},
-                                         surface::EmbeddedSurface) where {D,T<:AbstractFloat}
+function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::EmbeddedSurface,
+                                         tag::_SurfaceTag) where {D,T<:AbstractFloat}
   quadratures = surface_quadratures(surface, layout.slots[1].space.domain)
   isempty(quadratures) && return SurfaceValues[]
-  return [_compile_surface_quadrature(layout, quadrature) for quadrature in quadratures]
+  return [_compile_surface_quadrature(layout, quadrature, tag) for quadrature in quadratures]
 end
 
 # Compile one embedded-surface quadrature item. Here both the integration
 # weights and the normals require geometric transformation from the reference
 # surface data supplied by the embedded-surface machinery.
 function _compile_surface_quadrature(layout::FieldLayout{D,T},
-                                     surface::SurfaceQuadrature{D}) where {D,T<:AbstractFloat}
+                                     surface::SurfaceQuadrature{D},
+                                     tag::_SurfaceTag=nothing) where {D,T<:AbstractFloat}
   domain_data = layout.slots[1].space.domain
   quadrature = surface.quadrature
   qcount = point_count(quadrature)
@@ -965,9 +975,10 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T},
   field_data, _ = _compile_item_fields(layout, surface.leaf, points, reference_points,
                                        inverse_jacobian)
   terms = _compiled_item_terms(field_data)
-  return SurfaceValues(surface.leaf, points, weights, normals, field_data, terms.term_offsets,
-                       terms.term_indices, terms.term_coefficients, terms.single_term_indices,
-                       terms.single_term_coefficients, terms.local_dof_count)
+  return SurfaceValues(surface.leaf, tag, points, weights, normals, field_data,
+                       terms.term_offsets, terms.term_indices, terms.term_coefficients,
+                       terms.single_term_indices, terms.single_term_coefficients,
+                       terms.local_dof_count)
 end
 
 # Build leaf-local index ranges into the global face and surface arrays. The

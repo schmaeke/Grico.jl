@@ -101,12 +101,31 @@ struct MeanValue
   target
 end
 
+# Internal symbolic selector used by tagged embedded-surface attachments and
+# operators. `nothing` denotes the untagged wildcard behavior "all embedded
+# surfaces".
+const _SurfaceTag = Union{Nothing,Symbol}
+
 # Internal wrapper pairing one boundary operator with the boundary face on which
 # it acts. Boundary operators are stored separately from cell/interface/surface
 # operators because they carry this extra geometric selector.
 struct _BoundaryContribution
   boundary::BoundaryFace
   operator
+end
+
+# Internal wrapper pairing one embedded-surface operator with the optional
+# symbolic tag that selects the embedded surfaces on which it should act.
+struct _SurfaceContribution
+  tag::_SurfaceTag
+  operator
+end
+
+# Internal wrapper pairing one embedded-surface attachment with the optional
+# symbolic tag under which it is registered in one problem description.
+struct _SurfaceAttachment
+  tag::_SurfaceTag
+  surface
 end
 
 # Internal storage for user-supplied per-cell quadrature overrides. The public
@@ -127,17 +146,19 @@ mutable struct _ProblemData
   cell_operators::Vector{Any}
   boundary_operators::Vector{_BoundaryContribution}
   interface_operators::Vector{Any}
-  surface_operators::Vector{Any}
+  surface_operators::Vector{_SurfaceContribution}
   cell_quadratures::Vector{_CellQuadratureAttachment}
-  embedded_surfaces::Vector{Any}
+  embedded_surfaces::Vector{_SurfaceAttachment}
   dirichlet_constraints::Vector{Dirichlet}
   mean_constraints::Vector{MeanValue}
 
   function _ProblemData(fields::Vector{AbstractField}, cell_operators::Vector{Any},
                         boundary_operators::Vector{_BoundaryContribution},
-                        interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                        interface_operators::Vector{Any},
+                        surface_operators::Vector{_SurfaceContribution},
                         cell_quadratures::Vector{_CellQuadratureAttachment},
-                        embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                        embedded_surfaces::Vector{_SurfaceAttachment},
+                        dirichlet_constraints::Vector{Dirichlet},
                         mean_constraints::Vector{MeanValue})
     return new(_checked_problem_fields(fields), cell_operators, boundary_operators,
                interface_operators, surface_operators, cell_quadratures, embedded_surfaces,
@@ -149,8 +170,9 @@ abstract type _AbstractProblem end
 
 function _empty_problem_data(fields::AbstractField...)
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
-  return _ProblemData(AbstractField[fields...], Any[], _BoundaryContribution[], Any[], Any[],
-                      _CellQuadratureAttachment[], Any[], Dirichlet[], MeanValue[])
+  return _ProblemData(AbstractField[fields...], Any[], _BoundaryContribution[], Any[],
+                      _SurfaceContribution[], _CellQuadratureAttachment[],
+                      _SurfaceAttachment[], Dirichlet[], MeanValue[])
 end
 
 _problem_data(problem::_AbstractProblem) = getfield(problem, :data)
@@ -210,9 +232,11 @@ end
 
 function _problem_wrapper(::Type{P}, fields::Vector{AbstractField}, cell_operators::Vector{Any},
                           boundary_operators::Vector{_BoundaryContribution},
-                          interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                          interface_operators::Vector{Any},
+                          surface_operators::Vector{_SurfaceContribution},
                           cell_quadratures::Vector{_CellQuadratureAttachment},
-                          embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                          embedded_surfaces::Vector{_SurfaceAttachment},
+                          dirichlet_constraints::Vector{Dirichlet},
                           mean_constraints::Vector{MeanValue}) where {P<:_AbstractProblem}
   return _problem_wrapper(P,
                           _ProblemData(fields, cell_operators, boundary_operators,
@@ -222,9 +246,11 @@ end
 
 function AffineProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
                        boundary_operators::Vector{_BoundaryContribution},
-                       interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                       interface_operators::Vector{Any},
+                       surface_operators::Vector{_SurfaceContribution},
                        cell_quadratures::Vector{_CellQuadratureAttachment},
-                       embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                       embedded_surfaces::Vector{_SurfaceAttachment},
+                       dirichlet_constraints::Vector{Dirichlet},
                        mean_constraints::Vector{MeanValue})
   return _problem_wrapper(AffineProblem, fields, cell_operators, boundary_operators,
                           interface_operators, surface_operators, cell_quadratures,
@@ -257,9 +283,11 @@ end
 
 function ResidualProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
                          boundary_operators::Vector{_BoundaryContribution},
-                         interface_operators::Vector{Any}, surface_operators::Vector{Any},
+                         interface_operators::Vector{Any},
+                         surface_operators::Vector{_SurfaceContribution},
                          cell_quadratures::Vector{_CellQuadratureAttachment},
-                         embedded_surfaces::Vector{Any}, dirichlet_constraints::Vector{Dirichlet},
+                         embedded_surfaces::Vector{_SurfaceAttachment},
+                         dirichlet_constraints::Vector{Dirichlet},
                          mean_constraints::Vector{MeanValue})
   return _problem_wrapper(ResidualProblem, fields, cell_operators, boundary_operators,
                           interface_operators, surface_operators, cell_quadratures,
@@ -415,14 +443,22 @@ end
 
 """
     add_surface!(problem, operator)
+    add_surface!(problem, tag, operator)
 
 Add an embedded-surface operator to `problem`.
 
 Surface operators act on [`SurfaceValues`](@ref) items generated from embedded
-surface quadratures.
+surface quadratures. The untagged form applies on all embedded surfaces in the
+problem. The tagged form restricts the operator to embedded surfaces or surface
+quadratures attached with the same symbolic `tag`, for example `:outer`.
 """
 function add_surface!(problem::_AbstractProblem, operator)
-  push!(problem.surface_operators, operator)
+  push!(problem.surface_operators, _SurfaceContribution(nothing, operator))
+  return problem
+end
+
+function add_surface!(problem::_AbstractProblem, tag::Symbol, operator)
+  push!(problem.surface_operators, _SurfaceContribution(tag, operator))
   return problem
 end
 

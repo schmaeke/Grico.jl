@@ -1372,6 +1372,34 @@ end
   end
 end
 
+@testset "Tagged Surface Quadrature Assembly" begin
+  domain = Grico.Domain((0.0,), (1.0,), (2,))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(1)))
+  u = Grico.ScalarField(space; name=:u)
+  quadrature = Grico.PointQuadrature([(0.0,)], [1.0])
+  left_surface = Grico.SurfaceQuadrature(1, quadrature, [(1.0,)])
+  right_surface = Grico.SurfaceQuadrature(2, quadrature, [(1.0,)])
+
+  tagged_problem = Grico.AffineProblem(u)
+  @test Grico.add_surface!(tagged_problem, :left, EmbeddedPointLoad(u, 2.0)) === tagged_problem
+  @test Grico.add_surface!(tagged_problem, :right, EmbeddedPointLoad(u, 3.0)) === tagged_problem
+  @test Grico.add_surface_quadrature!(tagged_problem, :left, left_surface) === tagged_problem
+  @test Grico.add_surface_quadrature!(tagged_problem, :right, right_surface) === tagged_problem
+  tagged_plan = Grico.compile(tagged_problem)
+  @test [item.tag for item in tagged_plan.integration.embedded_surfaces] == [:left, :right]
+  tagged_system = Grico.assemble(tagged_plan)
+  @test Grico.rhs(tagged_system) ≈ [1.0, 2.5, 1.5] atol = ASSEMBLY_TOL
+
+  untagged_problem = Grico.AffineProblem(u)
+  Grico.add_surface!(untagged_problem, EmbeddedPointLoad(u, 1.0))
+  Grico.add_surface_quadrature!(untagged_problem, :left, left_surface)
+  Grico.add_surface_quadrature!(untagged_problem, :right, right_surface)
+  untagged_system = Grico.assemble(Grico.compile(untagged_problem))
+  @test Grico.rhs(untagged_system) ≈ [0.5, 1.0, 0.5] atol = ASSEMBLY_TOL
+end
+
 @testset "Implicit Surface Quadrature 1D" begin
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   surface = Grico.implicit_surface_quadrature(domain, 1, x -> x[1] - 0.35; subdivision_depth=3)
@@ -1425,12 +1453,13 @@ end
   mesh = Grico.SegmentMesh([(0.1, 0.2), (0.9, 0.2)], [(1, 2)])
   surface = Grico.EmbeddedSurface(mesh; point_count=2)
   problem = Grico.AffineProblem(u)
-  Grico.add_embedded_surface!(problem, surface)
+  @test Grico.add_embedded_surface!(problem, :segment, surface) === problem
   plan = Grico.compile(problem)
   items = plan.integration.embedded_surfaces
 
   @test length(items) == 1
   item = only(items)
+  @test item.tag == :segment
   @test sum(Grico.weight(item, point_index) for point_index in 1:Grico.point_count(item)) ≈ 0.8 atol = ASSEMBLY_TOL
 
   for point_index in 1:Grico.point_count(item)
@@ -1534,17 +1563,27 @@ end
   @test only(problem.mean_constraints).target == 0.0
 
   raw = Grico.AffineProblem(Grico.AbstractField[u], Any[], Grico._BoundaryContribution[], Any[],
-                            Any[], Grico._CellQuadratureAttachment[], Any[],
+                            Grico._SurfaceContribution[], Grico._CellQuadratureAttachment[],
+                            Grico._SurfaceAttachment[],
                             Grico.Dirichlet[Grico.Dirichlet(v, Grico.BoundaryFace(1, Grico.LOWER),
                                                             0.0)], Grico.MeanValue[])
   @test_throws ArgumentError Grico.compile(raw)
 
   raw_dg = Grico.AffineProblem(Grico.AbstractField[w], Any[], Grico._BoundaryContribution[], Any[],
-                               Any[], Grico._CellQuadratureAttachment[], Any[],
+                               Grico._SurfaceContribution[], Grico._CellQuadratureAttachment[],
+                               Grico._SurfaceAttachment[],
                                Grico.Dirichlet[Grico.Dirichlet(w,
                                                                Grico.BoundaryFace(1, Grico.LOWER),
                                                                0.0)], Grico.MeanValue[])
   @test_throws ArgumentError Grico.compile(raw_dg)
+
+  tagged_problem = Grico.AffineProblem(u)
+  @test Grico.add_surface!(tagged_problem, :missing, EmbeddedPointLoad(u, 1.0)) === tagged_problem
+  quadrature = Grico.PointQuadrature([(0.0,)], [1.0])
+  @test Grico.add_surface_quadrature!(tagged_problem, :other,
+                                      Grico.SurfaceQuadrature(1, quadrature, [(1.0,)])) ===
+        tagged_problem
+  @test_throws ArgumentError Grico.compile(tagged_problem)
 
   quadrature = Grico.PointQuadrature([(0.0, 0.0)], [1.0])
   @test_throws ArgumentError Grico.SurfaceQuadrature(0, quadrature, [(1.0, 0.0)])

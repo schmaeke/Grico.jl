@@ -152,31 +152,51 @@ dimension(::SegmentMesh) = 2
 
 """
     add_embedded_surface!(problem, embedded_surface)
+    add_embedded_surface!(problem, tag, embedded_surface)
 
 Attach an [`EmbeddedSurface`](@ref) geometry object to `problem`.
 
 During problem compilation, the geometry is converted to one or more
 [`SurfaceQuadrature`](@ref) items on the active cells of the problem domain.
-These quadratures are then used by embedded-surface operators.
+These quadratures are then used by embedded-surface operators. The untagged
+form registers the geometry for all surface operators; the tagged form
+registers it only for surface operators added with the same symbolic `tag`,
+for example `:outer`.
 """
 function add_embedded_surface!(problem::_AbstractProblem, embedded_surface::EmbeddedSurface)
-  push!(problem.embedded_surfaces, embedded_surface)
+  push!(problem.embedded_surfaces, _SurfaceAttachment(nothing, embedded_surface))
+  return problem
+end
+
+function add_embedded_surface!(problem::_AbstractProblem, tag::Symbol,
+                               embedded_surface::EmbeddedSurface)
+  push!(problem.embedded_surfaces, _SurfaceAttachment(tag, embedded_surface))
   return problem
 end
 
 """
     add_surface_quadrature!(problem, surface)
+    add_surface_quadrature!(problem, tag, surface)
     add_surface_quadrature!(problem, leaf, quadrature, normals)
+    add_surface_quadrature!(problem, tag, leaf, quadrature, normals)
 
 Attach an explicit embedded-surface quadrature item to `problem`.
 
 This is the low-level path for users who already know the reference-cell
 quadrature points and normals on a particular active leaf. The two-argument
 method accepts a prebuilt [`SurfaceQuadrature`](@ref); the four-argument method
-constructs one from the given reference quadrature data.
+constructs one from the given reference quadrature data. As with
+[`add_embedded_surface!`](@ref), the tagged forms restrict later surface
+operators to the same symbolic `tag`, for example `:outer`.
 """
 function add_surface_quadrature!(problem::_AbstractProblem, surface::SurfaceQuadrature)
-  push!(problem.embedded_surfaces, surface)
+  push!(problem.embedded_surfaces, _SurfaceAttachment(nothing, surface))
+  return problem
+end
+
+function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol,
+                                 surface::SurfaceQuadrature)
+  push!(problem.embedded_surfaces, _SurfaceAttachment(tag, surface))
   return problem
 end
 
@@ -201,6 +221,11 @@ end
 function add_surface_quadrature!(problem::_AbstractProblem, leaf::Integer,
                                  quadrature::PointQuadrature, normals)
   return add_surface_quadrature!(problem, SurfaceQuadrature(leaf, quadrature, normals))
+end
+
+function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol, leaf::Integer,
+                                 quadrature::PointQuadrature, normals)
+  return add_surface_quadrature!(problem, tag, SurfaceQuadrature(leaf, quadrature, normals))
 end
 
 # Public constructors for implicit finite-cell and embedded-surface quadratures.

@@ -149,6 +149,26 @@ end
 
 # Main compilation pipeline from problem description to immutable plan.
 
+# After geometric compilation, surface selectors can be validated against the
+# actual embedded-surface quadratures that will participate in assembly. This
+# catches misspelled or otherwise dead symbolic tags at `compile` time.
+function _validate_surface_operators(surface_operators, surfaces)
+  available_tags = Set{Symbol}()
+
+  for surface in surfaces
+    surface.tag === nothing && continue
+    push!(available_tags, surface.tag)
+  end
+
+  for wrapped in surface_operators
+    wrapped.tag === nothing && continue
+    wrapped.tag in available_tags && continue
+    throw(ArgumentError("surface operator targets embedded-surface tag $(repr(wrapped.tag)), but compilation produced no embedded surface quadratures with that tag"))
+  end
+
+  return nothing
+end
+
 # Shared compilation path for affine and residual problems. The resulting plan
 # is structurally the same; later assembly/evaluation decides which operator
 # callbacks are used.
@@ -158,6 +178,7 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
   layout = _field_layout(fields)
   integration = _compile_integration(layout, cell_quadratures, embedded_surfaces;
                                      include_interfaces=(!isempty(interface_operators)))
+  _validate_surface_operators(surface_operators, integration.embedded_surfaces)
   compiled_dirichlet = _compile_dirichlet(layout, integration.boundary_faces, dirichlet_constraints)
   compiled_mean_constraints = _compile_mean_constraints(layout, integration.cells,
                                                         compiled_dirichlet, mean_constraints)
