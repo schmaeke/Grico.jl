@@ -404,6 +404,62 @@ end
   return _checked_index(component, data.component_count, "field component")
 end
 
+@inline _point_normal(values::FaceValues, point_index::Int) = values.normal
+@inline _point_normal(values::_InterfaceSideValues, point_index::Int) = values.normal
+@inline _point_normal(values::SurfaceValues, point_index::Int) = @inbounds values.normals[point_index]
+
+@inline function _shape_gradient(data::_FieldValues{1,T}, mode_index::Int,
+                                 point_index::Int) where {T<:AbstractFloat}
+  gradient1 = @inbounds data.gradients[1, mode_index, point_index]
+  return (gradient1,)
+end
+
+@inline function _shape_gradient(data::_FieldValues{2,T}, mode_index::Int,
+                                 point_index::Int) where {T<:AbstractFloat}
+  gradient1 = @inbounds data.gradients[1, mode_index, point_index]
+  gradient2 = @inbounds data.gradients[2, mode_index, point_index]
+  return (gradient1, gradient2)
+end
+
+@inline function _shape_gradient(data::_FieldValues{3,T}, mode_index::Int,
+                                 point_index::Int) where {T<:AbstractFloat}
+  gradient1 = @inbounds data.gradients[1, mode_index, point_index]
+  gradient2 = @inbounds data.gradients[2, mode_index, point_index]
+  gradient3 = @inbounds data.gradients[3, mode_index, point_index]
+  return (gradient1, gradient2, gradient3)
+end
+
+@inline function _shape_gradient(data::_FieldValues{D,T}, mode_index::Int,
+                                 point_index::Int) where {D,T<:AbstractFloat}
+  return ntuple(axis -> (@inbounds data.gradients[axis, mode_index, point_index]), D)
+end
+
+@inline function _shape_normal_gradient(data::_FieldValues{1,T}, normal_value::NTuple{1,T},
+                                        mode_index::Int, point_index::Int) where {T<:AbstractFloat}
+  return @inbounds data.gradients[1, mode_index, point_index] * normal_value[1]
+end
+
+@inline function _shape_normal_gradient(data::_FieldValues{2,T}, normal_value::NTuple{2,T},
+                                        mode_index::Int, point_index::Int) where {T<:AbstractFloat}
+  g1 = @inbounds data.gradients[1, mode_index, point_index]
+  g2 = @inbounds data.gradients[2, mode_index, point_index]
+  return muladd(g1, normal_value[1], g2 * normal_value[2])
+end
+
+@inline function _shape_normal_gradient(data::_FieldValues{3,T}, normal_value::NTuple{3,T},
+                                        mode_index::Int, point_index::Int) where {T<:AbstractFloat}
+  g1 = @inbounds data.gradients[1, mode_index, point_index]
+  g2 = @inbounds data.gradients[2, mode_index, point_index]
+  g3 = @inbounds data.gradients[3, mode_index, point_index]
+  return muladd(g1, normal_value[1], muladd(g2, normal_value[2], g3 * normal_value[3]))
+end
+
+@inline function _shape_normal_gradient(data::_FieldValues{D,T}, normal_value::NTuple{D,T},
+                                        mode_index::Int, point_index::Int) where {D,T<:AbstractFloat}
+  return sum((@inbounds data.gradients[axis, mode_index, point_index]) * normal_value[axis]
+             for axis in 1:D)
+end
+
 """
     field_dof_range(values, field)
 
@@ -496,13 +552,12 @@ quadrature point.
 
 Gradients are reported in physical coordinates, not reference coordinates.
 """
-function shape_gradient(values::_FieldEvaluationValues, field::AbstractField, point_index::Integer,
-                        mode_index::Integer)
+@inline function shape_gradient(values::_FieldEvaluationValues, field::AbstractField,
+                                point_index::Integer, mode_index::Integer)
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   checked_mode = _checked_field_mode(data, mode_index)
-  return ntuple(axis -> (@inbounds data.gradients[axis, checked_mode, checked_point]),
-                size(data.gradients, 1))
+  return _shape_gradient(data, checked_mode, checked_point)
 end
 
 """
@@ -529,10 +584,13 @@ This is shorthand for the physical-space shape gradient dotted with the local
 unit normal. It is especially useful in Nitsche, flux, and interior-penalty
 terms where the weak form is written in terms of normal derivatives.
 """
-function shape_normal_gradient(values::_NormalEvaluationValues, field::AbstractField,
-                               point_index::Integer, mode_index::Integer)
-  return normal_component(shape_gradient(values, field, point_index, mode_index),
-                          normal(values, point_index))
+@inline function shape_normal_gradient(values::_NormalEvaluationValues, field::AbstractField,
+                                       point_index::Integer, mode_index::Integer)
+  data = _field_values(values, field)
+  checked_point = _checked_point_index(values, point_index)
+  checked_mode = _checked_field_mode(data, mode_index)
+  return _shape_normal_gradient(data, _point_normal(values, checked_point), checked_mode,
+                                checked_point)
 end
 
 """
@@ -628,16 +686,18 @@ computes
 
   ∇u_h(x_q) = Σᵢ ∇ϕᵢ(x_q) ûᵢ.
 """
-function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
-                  point_index::Integer) where {T<:AbstractFloat}
+@inline function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
+                          point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
-  data.component_count == 1 && return gradient(values, state, field, 1, point_index)
-  return ntuple(component -> gradient(values, state, field, component, point_index),
+  checked_point = _checked_point_index(values, point_index)
+  state_coefficients = coefficients(state)
+  data.component_count == 1 && return _field_gradient(data, state_coefficients, 1, checked_point)
+  return ntuple(component -> _field_gradient(data, state_coefficients, component, checked_point),
                 data.component_count)
 end
 
-function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
-                  component::Integer, point_index::Integer) where {T<:AbstractFloat}
+@inline function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
+                          component::Integer, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
@@ -655,29 +715,207 @@ the result is one scalar normal derivative per component. This is the operator-
 level companion of [`shape_normal_gradient`](@ref): one acts on basis functions,
 the other on the reconstructed discrete field itself.
 """
-function normal_gradient(values::_NormalEvaluationValues, state::State{T}, field::AbstractField,
-                         point_index::Integer) where {T<:AbstractFloat}
-  return normal_component(gradient(values, state, field, point_index), normal(values, point_index))
+@inline function normal_gradient(values::_NormalEvaluationValues, state::State{T},
+                                 field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_point = _checked_point_index(values, point_index)
+  normal_value = _point_normal(values, checked_point)
+  state_coefficients = coefficients(state)
+  data.component_count == 1 &&
+    return _field_normal_gradient(data, state_coefficients, 1, checked_point, normal_value)
+  return ntuple(component -> _field_normal_gradient(data, state_coefficients, component,
+                                                    checked_point, normal_value),
+                data.component_count)
 end
 
 # Low-level gradient evaluator shared by the scalar and vector-field interfaces.
 # The gradients stored in `data` are already mapped to physical coordinates, so
 # only the constrained-mode amplitudes still need to be applied here.
-function _field_gradient(data::_FieldValues{D,T}, state_coefficients::AbstractVector{T},
-                         component::Int, point_index::Int) where {D,T<:AbstractFloat}
+@inline function _field_gradient(data::_FieldValues{1,T}, state_coefficients::AbstractVector{T},
+                                 component::Int, point_index::Int) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  result1 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+  end
+
+  return (result1,)
+end
+
+@inline function _field_gradient(data::_FieldValues{2,T}, state_coefficients::AbstractVector{T},
+                                 component::Int, point_index::Int) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  result1 = zero(T)
+  result2 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+    result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
+  end
+
+  return (result1, result2)
+end
+
+@inline function _field_gradient(data::_FieldValues{3,T}, state_coefficients::AbstractVector{T},
+                                 component::Int, point_index::Int) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  result1 = zero(T)
+  result2 = zero(T)
+  result3 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+    result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
+    result3 = muladd(gradients[3, mode_index, point_index], amplitude, result3)
+  end
+
+  return (result1, result2, result3)
+end
+
+@inline function _field_gradient(data::_FieldValues{D,T}, state_coefficients::AbstractVector{T},
+                                 component::Int, point_index::Int) where {D,T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
   result = ntuple(_ -> zero(T), D)
 
-  for mode_index in 1:data.local_mode_count
+  @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(data.term_offsets, data.term_indices, data.term_coefficients,
-                                data.single_term_indices, data.single_term_coefficients,
-                                state_coefficients, local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
     amplitude == zero(T) && continue
-    result = ntuple(axis -> muladd(data.gradients[axis, mode_index, point_index], amplitude,
+    result = ntuple(axis -> muladd(gradients[axis, mode_index, point_index], amplitude,
                                    result[axis]), D)
   end
 
   return result
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{1,T},
+                                        state_coefficients::AbstractVector{T}, component::Int,
+                                        point_index::Int,
+                                        normal_value::NTuple{1,T}) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  normal1 = normal_value[1]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    directional = gradients[1, mode_index, point_index] * normal1
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{2,T},
+                                        state_coefficients::AbstractVector{T}, component::Int,
+                                        point_index::Int,
+                                        normal_value::NTuple{2,T}) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  normal1 = normal_value[1]
+  normal2 = normal_value[2]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    directional = muladd(gradients[1, mode_index, point_index], normal1,
+                         gradients[2, mode_index, point_index] * normal2)
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{3,T},
+                                        state_coefficients::AbstractVector{T}, component::Int,
+                                        point_index::Int,
+                                        normal_value::NTuple{3,T}) where {T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  gradients = data.gradients
+  normal1 = normal_value[1]
+  normal2 = normal_value[2]
+  normal3 = normal_value[3]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    local_dof = _field_local_dof(data, component, mode_index)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
+                                single_term_indices, single_term_coefficients, state_coefficients,
+                                local_dof)
+    amplitude == zero(T) && continue
+    directional = muladd(gradients[1, mode_index, point_index], normal1,
+                         muladd(gradients[2, mode_index, point_index], normal2,
+                                gradients[3, mode_index, point_index] * normal3))
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{D,T},
+                                        state_coefficients::AbstractVector{T}, component::Int,
+                                        point_index::Int,
+                                        normal_value::NTuple{D,T}) where {D,T<:AbstractFloat}
+  return normal_component(_field_gradient(data, state_coefficients, component, point_index),
+                          normal_value)
 end
 
 # Compilation of local integration caches for all entity types.

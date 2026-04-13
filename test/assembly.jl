@@ -907,6 +907,16 @@ end
     @test Grico.gradient(cell, state, pressure, point_index)[1] ≈
           expected_gradient(pressure, state, ξ, 1) atol = ASSEMBLY_TOL
   end
+
+  face = first(plan.integration.boundary_faces)
+  for point_index in 1:Grico.point_count(face)
+    actual = Grico.normal_gradient(face, state, velocity, point_index)
+    expected = Grico.normal_component(Grico.gradient(face, state, velocity, point_index),
+                                      Grico.normal(face, point_index))
+    @test length(actual) == length(expected)
+    @test all(isapprox(actual[index], expected[index]; atol=ASSEMBLY_TOL)
+              for index in eachindex(actual))
+  end
 end
 
 @testset "Mean Value Constraint" begin
@@ -1100,13 +1110,17 @@ end
   @test !system.symmetric
   @test isempty(system.preconditioner_cache)
 
-  reduced_values, converged = Grico._preconditioned_krylov_solve(system, Grico.ILUPreconditioner())
+  explicit_ilu = Grico.ILUPreconditioner(min_dofs=0)
+  reduced_values, converged = Grico._preconditioned_krylov_solve(system, explicit_ilu)
   @test converged
   @test norm(Grico.matrix(system) * reduced_values - Grico.rhs(system)) / norm(Grico.rhs(system)) <=
         1.0e-6
 
   default_state = Grico.State(system, Grico.solve(system))
-  @test haskey(system.preconditioner_cache, Grico.ILUPreconditioner())
+  @test haskey(system.preconditioner_cache, Grico._DIRECT_SOLVE_CACHE_KEY)
+  @test !haskey(system.preconditioner_cache, Grico.ILUPreconditioner())
+  direct_operator = Grico._direct_operator(system)
+  @test direct_operator === Grico._direct_operator(system)
   direct_state = Grico.State(system, Grico.solve(system; linear_solve=(A, b) -> A \ b))
   guided_state = Grico.State(system,
                              Grico.solve(system;
@@ -1607,4 +1621,13 @@ end
 
   @test_throws ArgumentError Grico.residual(plan, foreign_state)
   @test_throws ArgumentError Grico.tangent(plan, foreign_state)
+end
+
+@testset "Assembly Scheduler Helpers" begin
+  weighted = Grico._weighted_batch_work_estimate([10, 1, 1, 1])
+  @test Grico._weighted_chunk_starts(weighted, 4, 2) == [1, 2, 5]
+  @test Grico._weighted_chunk_starts(weighted, 4, 4) == [1, 2, 2, 2, 5]
+
+  matched = Grico._weighted_batch_work_estimate([2, 1, 1])
+  @test Grico._weighted_chunk_starts(matched, 3, 2) == [1, 2, 4]
 end
