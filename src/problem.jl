@@ -51,18 +51,44 @@ end
 
 BoundaryFace(axis::Integer, side::Integer) = BoundaryFace(Int(axis), Int(side))
 
+@inline _all_dirichlet_components(field::AbstractField) = ntuple(identity, component_count(field))
+
+function _checked_dirichlet_components(field::AbstractField, components::Tuple{Vararg{Int}})
+  isempty(components) && throw(ArgumentError("Dirichlet component selectors must not be empty"))
+  component_total = component_count(field)
+  previous = 0
+
+  for component in components
+    1 <= component <= component_total ||
+      throw(ArgumentError("Dirichlet component selector $component must lie in 1:$component_total"))
+    component > previous ||
+      throw(ArgumentError("Dirichlet component selectors must be strictly increasing and unique"))
+    previous = component
+  end
+
+  return components
+end
+
 """
     Dirichlet(field, boundary, data)
+    Dirichlet(field, boundary, component, data)
+    Dirichlet(field, boundary, components, data)
 
-Strong Dirichlet data for `field` on `boundary`. `data` may be a constant or a
-callable of the physical point.
+Strong Dirichlet data for selected components of `field` on `boundary`. `data`
+may be a constant or a callable of the physical point.
 
 This constraint prescribes the trace of `field` on the selected physical
 boundary face. During compilation, the library projects the prescribed boundary
 data onto the active trace degrees of freedom and then eliminates those dofs
 from the assembled linear system or residual problem.
 
-If `field` has multiple components, `data` may describe all components at once.
+When the component selector is omitted, the constraint applies to every
+component of `field`. When one component index or a tuple of indices is given,
+the data are interpreted relative to that selected subset. For convenience,
+vector-valued data that match the full field component count are also accepted,
+in which case the selected entries are extracted by their absolute component
+indices.
+
 As in the rest of the boundary machinery, Dirichlet constraints are only valid
 on non-periodic boundary faces whose normal axis uses `:cg` continuity in the
 owning `HpSpace`. For DG boundary treatment, use boundary/interface operators
@@ -76,8 +102,22 @@ evaluation rather than by assuming one particular concrete representation here.
 struct Dirichlet
   field::AbstractField
   boundary::BoundaryFace
+  components::Tuple{Vararg{Int}}
   data
+
+  function Dirichlet(field::AbstractField, boundary::BoundaryFace,
+                     components::Tuple{Vararg{Int}}, data)
+    return new(field, boundary, _checked_dirichlet_components(field, components), data)
+  end
 end
+
+Dirichlet(field::AbstractField, boundary::BoundaryFace, data) =
+  Dirichlet(field, boundary, _all_dirichlet_components(field), data)
+Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data) =
+  Dirichlet(field, boundary, (Int(component),), data)
+Dirichlet(field::AbstractField, boundary::BoundaryFace,
+          components::Tuple{Vararg{<:Integer}}, data) =
+  Dirichlet(field, boundary, Tuple(Int(component) for component in components), data)
 
 """
     MeanValue(field, target)
@@ -372,6 +412,7 @@ end
 function _check_problem_constraint(fields::AbstractVector{<:AbstractField}, constraint::Dirichlet)
   _check_problem_field(fields, constraint.field, "Dirichlet constraint")
   _check_problem_physical_boundary(fields, constraint.boundary, "Dirichlet constraint")
+  _checked_dirichlet_components(constraint.field, constraint.components)
   _check_strong_dirichlet_space(constraint.field, constraint.boundary)
   return constraint
 end
