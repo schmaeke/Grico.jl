@@ -50,19 +50,15 @@ function _case_entries(artifact)
     if "assemble" in operations
       rhs_target_dofs = get(metadata, "reduced_dofs", full_dofs)
       push!(entries,
-            Dict("case_id" => case_entry["id"],
-                 "case_label" => case_entry["label"],
-                 "operation_id" => "assemble",
-                 "rhs_target_dofs" => rhs_target_dofs,
+            Dict("case_id" => case_entry["id"], "case_label" => case_entry["label"],
+                 "operation_id" => "assemble", "rhs_target_dofs" => rhs_target_dofs,
                  "max_local_dofs" => max_local_dofs))
     end
 
     if "residual_bang" in operations
       push!(entries,
-            Dict("case_id" => case_entry["id"],
-                 "case_label" => case_entry["label"],
-                 "operation_id" => "residual_bang",
-                 "rhs_target_dofs" => full_dofs,
+            Dict("case_id" => case_entry["id"], "case_label" => case_entry["label"],
+                 "operation_id" => "residual_bang", "rhs_target_dofs" => full_dofs,
                  "max_local_dofs" => max_local_dofs))
     end
   end
@@ -77,12 +73,9 @@ function _entry_metrics(entry)
   scratch = Grico._ThreadScratch(Float64, local_dofs)
   new_scratch_bytes = Base.summarysize(scratch)
   removed_dense_rhs_bytes = sizeof(Float64) * rhs_target_dofs
-  return Dict("case_id" => entry["case_id"],
-              "case_label" => entry["case_label"],
-              "operation_id" => entry["operation_id"],
-              "rhs_target_dofs" => rhs_target_dofs,
-              "max_local_dofs" => local_dofs,
-              "new_scratch_bytes" => new_scratch_bytes,
+  return Dict("case_id" => entry["case_id"], "case_label" => entry["case_label"],
+              "operation_id" => entry["operation_id"], "rhs_target_dofs" => rhs_target_dofs,
+              "max_local_dofs" => local_dofs, "new_scratch_bytes" => new_scratch_bytes,
               "removed_dense_rhs_bytes" => removed_dense_rhs_bytes)
 end
 
@@ -124,8 +117,7 @@ function _render_markdown(results)
   push!(lines, "")
   push!(lines, "## Summary")
   push!(lines, "")
-  push!(lines,
-        "- `_ThreadScratch` no longer stores one dense global RHS vector per worker.")
+  push!(lines, "- `_ThreadScratch` no longer stores one dense global RHS vector per worker.")
   push!(lines,
         "- Persistent scratch size now depends on `max_local_dofs`, not on the global RHS target length.")
   push!(lines,
@@ -153,8 +145,8 @@ function _render_markdown(results)
   push!(lines, "## Projected Dense RHS Overhead Removed")
   push!(lines, "")
   projection_header = ["RHS target dofs"]
-  append!(projection_header, ["Removed at $(threads) thread$(threads == 1 ? "" : "s")"
-                              for threads in thread_counts])
+  append!(projection_header,
+          ["Removed at $(threads) thread$(threads == 1 ? "" : "s")" for threads in thread_counts])
   push!(lines, "| $(join(projection_header, " | ")) |")
   projection_separator = vcat(["---:"], ["---:" for _ in thread_counts])
   push!(lines, "| $(join(projection_separator, " | ")) |")
@@ -184,16 +176,15 @@ function main(args=ARGS)
   output_path = get(parsed, "output", DEFAULT_OUTPUT)
   report_path = get(parsed, "report", DEFAULT_REPORT)
   thread_counts = _parse_int_list(get(parsed, "threads", nothing), DEFAULT_THREAD_COUNTS)
-  projected_rhs_dofs = _parse_int_list(get(parsed, "rhs-dofs", nothing),
-                                       DEFAULT_PROJECTED_RHS_DOFS)
+  projected_rhs_dofs = _parse_int_list(get(parsed, "rhs-dofs", nothing), DEFAULT_PROJECTED_RHS_DOFS)
   artifact = TOML.parsefile(input_path)
   case_metrics = [_entry_metrics(entry) for entry in _case_entries(artifact)]
-  projected_metrics = [_projected_metrics(rhs_target_dofs) for rhs_target_dofs in projected_rhs_dofs]
-  results = Dict("generated_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
-                 "input_artifact" => abspath(input_path),
-                 "thread_counts" => thread_counts,
-                 "case_metrics" => case_metrics,
-                 "projected_metrics" => projected_metrics)
+  projected_metrics = [_projected_metrics(rhs_target_dofs)
+                       for rhs_target_dofs in projected_rhs_dofs]
+  results = Dict("generated_utc" => Dates.format(Dates.now(Dates.UTC),
+                                                 dateformat"yyyy-mm-ddTHH:MM:SS"),
+                 "input_artifact" => abspath(input_path), "thread_counts" => thread_counts,
+                 "case_metrics" => case_metrics, "projected_metrics" => projected_metrics)
   _write_toml(output_path, results)
 
   open(report_path, "w") do io

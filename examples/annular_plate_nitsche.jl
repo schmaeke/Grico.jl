@@ -227,19 +227,16 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
   u = ScalarField(space; name=:u)
 
   outer_points, outer_segments = circle_points_segments(outer_radius, segment_count)
-  inner_points, inner_segments = circle_points_segments(inner_radius, segment_count;
-                                                        clockwise=true)
+  inner_points, inner_segments = circle_points_segments(inner_radius, segment_count; clockwise=true)
   offset = length(outer_points)
   boundary_points = vcat(outer_points, inner_points)
   boundary_segments = vcat(outer_segments,
-                           [(first + offset, second + offset)
-                            for (first, second) in inner_segments])
+                           [(first + offset, second + offset) for (first, second) in inner_segments])
   boundary = EmbeddedSurface(SegmentMesh(boundary_points, boundary_segments);
                              point_count=surface_point_count)
 
   exact_solution = x -> log(hypot(x[1], x[2]) / outer_radius) / log(inner_radius / outer_radius)
-  annulus_levelset =
-    x -> max(hypot(x[1], x[2]) - outer_radius, inner_radius - hypot(x[1], x[2]))
+  annulus_levelset = x -> max(hypot(x[1], x[2]) - outer_radius, inner_radius - hypot(x[1], x[2]))
   is_physical = x -> annulus_levelset(x) <= 0.0
 
   problem = AffineProblem(u)
@@ -259,8 +256,8 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
   end
 
   return (; domain, space, u, boundary, exact_solution, annulus_levelset, is_physical, problem,
-          verification_quadratures, inner_radius, outer_radius, root_counts, degree,
-          segment_count, surface_point_count, fcm_subdivision_depth, penalty)
+          verification_quadratures, inner_radius, outer_radius, root_counts, degree, segment_count,
+          surface_point_count, fcm_subdivision_depth, penalty)
 end
 
 # Human-facing driver used both for direct execution and for benchmarked solves
@@ -282,14 +279,13 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
                          point_data=(physical=x -> context.is_physical(x) ? 1.0 : 0.0,
                                      abs_error=(x, values) -> context.is_physical(x) ?
                                                               abs(values.u -
-                                                                  context.exact_solution(x)) :
-                                                              0.0),
+                                                                  context.exact_solution(x)) : 0.0),
                          cell_data=(leaf=leaf -> Float64(leaf),
                                     level=leaf -> Float64.(level(current_grid, leaf)),
                                     degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
                          field_data=(relative_l2_error=error_value,),
-                         subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE,
-                         append=true, compress=true, ascii=false)
+                         subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE, append=true,
+                         compress=true, ascii=false)
     print_summary && println("  vtk  $vtk_path")
   end
 

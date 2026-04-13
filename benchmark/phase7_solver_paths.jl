@@ -61,8 +61,7 @@ function _parse_args(args)
 
   for arg in args
     if startswith(arg, "--")
-      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) :
-                    (arg[3:end], "true")
+      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) : (arg[3:end], "true")
       parsed[key] = value
     else
       throw(ArgumentError("unsupported argument `$arg`"))
@@ -89,16 +88,11 @@ end
 
 function _environment_metadata()
   cpu_info = first(Sys.cpu_info())
-  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC),
-                                              dateformat"yyyy-mm-ddTHH:MM:SS"),
-              "julia_version" => string(VERSION),
-              "os" => string(Sys.KERNEL),
-              "arch" => string(Sys.ARCH),
-              "hostname" => gethostname(),
-              "cpu_model" => cpu_info.model,
-              "logical_cpu_threads" => Sys.CPU_THREADS,
-              "julia_threads" => Threads.nthreads(),
-              "blas_threads" => BLAS.get_num_threads(),
+  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
+              "julia_version" => string(VERSION), "os" => string(Sys.KERNEL),
+              "arch" => string(Sys.ARCH), "hostname" => gethostname(),
+              "cpu_model" => cpu_info.model, "logical_cpu_threads" => Sys.CPU_THREADS,
+              "julia_threads" => Threads.nthreads(), "blas_threads" => BLAS.get_num_threads(),
               "openblas_num_threads" => get(ENV, "OPENBLAS_NUM_THREADS", ""),
               "omp_num_threads" => get(ENV, "OMP_NUM_THREADS", ""))
 end
@@ -153,27 +147,25 @@ function _build_affine_cell_case()
   u = Grico.ScalarField(space; name=:u)
   problem = Grico.AffineProblem(u)
   Grico.add_cell!(problem, SharedMemoryPhase0Cases.Diffusion(u, 1.0))
-  Grico.add_cell!(problem, SharedMemoryPhase0Cases.Source(u, SharedMemoryPhase0Cases._poisson_source_term))
+  Grico.add_cell!(problem,
+                  SharedMemoryPhase0Cases.Source(u, SharedMemoryPhase0Cases._poisson_source_term))
 
   for axis in 1:2, side in (Grico.LOWER, Grico.UPPER)
-    Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(axis, side),
-                                                   SharedMemoryPhase0Cases._poisson_exact_solution))
+    Grico.add_constraint!(problem,
+                          Grico.Dirichlet(u, Grico.BoundaryFace(axis, side),
+                                          SharedMemoryPhase0Cases._poisson_exact_solution))
   end
 
   plan = Grico.compile(problem)
   system = Grico.assemble(plan)
   metadata = _case_metadata(plan, system;
-                            extra=Dict("case_kind" => "affine",
-                                       "continuity" => "cg",
-                                       "degree" => 3,
+                            extra=Dict("case_kind" => "affine", "continuity" => "cg", "degree" => 3,
                                        "active_leaves" => length(Grico.active_leaves(space))))
-  candidates = SolverCandidate[
-    SolverCandidate("direct", "Sparse direct", () -> nothing),
-    SolverCandidate("amg", "Smoothed Aggregation AMG + CG",
-                    () -> Grico.SmoothedAggregationAMGPreconditioner(min_dofs=0)),
-    SolverCandidate("schwarz", "Additive Schwarz + CG",
-                    () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0)),
-  ]
+  candidates = SolverCandidate[SolverCandidate("direct", "Sparse direct", () -> nothing),
+                               SolverCandidate("amg", "Smoothed Aggregation AMG + CG",
+                                               () -> Grico.SmoothedAggregationAMGPreconditioner(min_dofs=0)),
+                               SolverCandidate("schwarz", "Additive Schwarz + CG",
+                                               () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0))]
   return SolverCase("affine_cell_diffusion", "Affine Cell-Dominated Diffusion",
                     "Continuous scalar Poisson problem with symmetric volume-dominated assembly.",
                     plan, system, metadata, candidates)
@@ -183,8 +175,7 @@ function _build_affine_interface_case()
   domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (40, 40))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
-                                           degree=Grico.UniformDegree(2),
-                                           continuity=:dg))
+                                           degree=Grico.UniformDegree(2), continuity=:dg))
   u = Grico.ScalarField(space; name=:u)
   problem = Grico.AffineProblem(u)
   Grico.add_cell!(problem, SharedMemoryPhase0Cases.MassCoupling(u, u, 1.0))
@@ -192,17 +183,13 @@ function _build_affine_interface_case()
   plan = Grico.compile(problem)
   system = Grico.assemble(plan)
   metadata = _case_metadata(plan, system;
-                            extra=Dict("case_kind" => "affine",
-                                       "continuity" => "dg",
-                                       "degree" => 2,
+                            extra=Dict("case_kind" => "affine", "continuity" => "dg", "degree" => 2,
                                        "active_leaves" => length(Grico.active_leaves(space))))
-  candidates = SolverCandidate[
-    SolverCandidate("direct", "Sparse direct", () -> nothing),
-    SolverCandidate("amg", "Smoothed Aggregation AMG + CG",
-                    () -> Grico.SmoothedAggregationAMGPreconditioner(min_dofs=0)),
-    SolverCandidate("schwarz", "Additive Schwarz + CG",
-                    () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0)),
-  ]
+  candidates = SolverCandidate[SolverCandidate("direct", "Sparse direct", () -> nothing),
+                               SolverCandidate("amg", "Smoothed Aggregation AMG + CG",
+                                               () -> Grico.SmoothedAggregationAMGPreconditioner(min_dofs=0)),
+                               SolverCandidate("schwarz", "Additive Schwarz + CG",
+                                               () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0))]
   return SolverCase("affine_interface_dg", "Affine Interface-Heavy DG",
                     "Discontinuous symmetric scalar problem with explicit interior interface work.",
                     plan, system, metadata, candidates)
@@ -222,31 +209,26 @@ end
 function _build_flow_case()
   context = build_lid_driven_cavity_context(root_counts=FLOW_ROOT_COUNTS)
   flow_preconditioner = Grico.FieldSplitSchurPreconditioner((context.velocity,),
-                                                            (context.pressure,);
-                                                            min_dofs=0)
+                                                            (context.pressure,); min_dofs=0)
   context, system, _, _, _ = advance_picard_step(context)
   metadata = Dict{String,Any}("reduced_dofs" => size(system.matrix, 1),
-                              "matrix_nnz" => nnz(system.matrix),
-                              "symmetric" => system.symmetric,
+                              "matrix_nnz" => nnz(system.matrix), "symmetric" => system.symmetric,
                               "fields" => Grico.field_count(system.layout),
-                              "case_kind" => "mixed_flow",
-                              "picard_step" => 1,
+                              "case_kind" => "mixed_flow", "picard_step" => 1,
                               "root_counts" => collect(FLOW_ROOT_COUNTS))
-  candidates = SolverCandidate[
-    SolverCandidate("direct", "Sparse direct", () -> nothing),
-    SolverCandidate("ilu", "ILU + GMRES", () -> Grico.ILUPreconditioner(min_dofs=0)),
-    SolverCandidate("schwarz", "Additive Schwarz + GMRES",
-                    () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0)),
-    SolverCandidate("fieldsplit", "Field-Split Schur + GMRES", () -> flow_preconditioner),
-  ]
+  candidates = SolverCandidate[SolverCandidate("direct", "Sparse direct", () -> nothing),
+                               SolverCandidate("ilu", "ILU + GMRES",
+                                               () -> Grico.ILUPreconditioner(min_dofs=0)),
+                               SolverCandidate("schwarz", "Additive Schwarz + GMRES",
+                                               () -> Grico.AdditiveSchwarzPreconditioner(min_dofs=0)),
+                               SolverCandidate("fieldsplit", "Field-Split Schur + GMRES",
+                                               () -> flow_preconditioner)]
   return SolverCase("lid_driven_cavity_step1", "Lid-Driven Cavity Picard Step 1",
                     "Mixed velocity-pressure reduced system from the DG lid-driven cavity example.",
                     nothing, system, metadata, candidates)
 end
 
-function _build_cases()
-  return [_build_affine_cell_case(), _build_affine_interface_case(), _build_flow_case()]
-end
+_build_cases() = [_build_affine_cell_case(), _build_affine_interface_case(), _build_flow_case()]
 
 function _warmup_case!(case::SolverCase)
   case.plan !== nothing && Grico.assemble(case.plan)
@@ -297,17 +279,16 @@ end
 
 function _run_krylov(system::Grico.AffineSystem{T}, operator,
                      ::Grico._SymmetricKrylovStyle) where {T<:AbstractFloat}
-  return cg(Symmetric(system.matrix), system.rhs;
-            Grico._cg_krylov_options(system, operator)...)
+  return cg(Symmetric(system.matrix), system.rhs; Grico._cg_krylov_options(system, operator)...)
 end
 
 function _run_krylov(system::Grico.AffineSystem{T}, operator,
                      ::Grico._GeneralKrylovStyle) where {T<:AbstractFloat}
-  return gmres(system.matrix, system.rhs;
-               Grico._gmres_krylov_options(system, operator)...)
+  return gmres(system.matrix, system.rhs; Grico._gmres_krylov_options(system, operator)...)
 end
 
-function _measure_default_policy(system::Grico.AffineSystem{T}, repeats::Int) where {T<:AbstractFloat}
+function _measure_default_policy(system::Grico.AffineSystem{T},
+                                 repeats::Int) where {T<:AbstractFloat}
   resolved = Grico._resolved_preconditioner(system, nothing)
   label = if Grico._preconditioner_is_applicable(system, resolved)
     string(Grico._preconditioner_label(resolved), " + ",
@@ -412,27 +393,21 @@ function _measure_case(case::SolverCase, repeats::Int)
     end
   end
 
-  return Dict{String,Any}(
-    "id" => case.id,
-    "label" => case.label,
-    "description" => case.description,
-    "metadata" => case.metadata,
-    "assemble_seconds" => assemble_seconds,
-    "default_policy" => Dict("label" => default_policy.label,
-                              "cold_seconds" => default_policy.cold_seconds,
-                              "warm_seconds" => default_policy.warm_seconds,
-                              "residual" => default_policy.residual),
-    "methods" => [Dict("id" => measurement.id,
-                        "label" => measurement.label,
-                        "setup_seconds" => measurement.setup_seconds,
-                        "solve_seconds" => measurement.solve_seconds,
-                        "warm_solve_seconds" => measurement.warm_solve_seconds,
-                        "total_seconds" => measurement.total_seconds,
-                        "iterations" => measurement.iterations,
-                        "converged" => measurement.converged,
-                        "residual" => measurement.residual)
-                  for measurement in measurements]
-  )
+  return Dict{String,Any}("id" => case.id, "label" => case.label, "description" => case.description,
+                          "metadata" => case.metadata, "assemble_seconds" => assemble_seconds,
+                          "default_policy" => Dict("label" => default_policy.label,
+                                                   "cold_seconds" => default_policy.cold_seconds,
+                                                   "warm_seconds" => default_policy.warm_seconds,
+                                                   "residual" => default_policy.residual),
+                          "methods" => [Dict("id" => measurement.id, "label" => measurement.label,
+                                             "setup_seconds" => measurement.setup_seconds,
+                                             "solve_seconds" => measurement.solve_seconds,
+                                             "warm_solve_seconds" => measurement.warm_solve_seconds,
+                                             "total_seconds" => measurement.total_seconds,
+                                             "iterations" => measurement.iterations,
+                                             "converged" => measurement.converged,
+                                             "residual" => measurement.residual)
+                                        for measurement in measurements])
 end
 
 function _render_markdown(report)
@@ -466,7 +441,8 @@ function _render_markdown(report)
     push!(lines, "- Default cold solve: `$(_format_time(case["default_policy"]["cold_seconds"]))`")
     push!(lines, "- Default warm solve: `$(_format_time(case["default_policy"]["warm_seconds"]))`")
     push!(lines, "")
-    push!(lines, "| Method | Setup | Solve | Warm Solve | Cold Total | Assemble + Cold Total | Iter | Converged | Residual |")
+    push!(lines,
+          "| Method | Setup | Solve | Warm Solve | Cold Total | Assemble + Cold Total | Iter | Converged | Residual |")
     push!(lines, "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |")
 
     for method in case["methods"]
@@ -488,8 +464,7 @@ function _write_toml(path, data)
 end
 
 function _report_path_for_output(output_path::AbstractString)
-  basename(output_path) == output_path &&
-    return replace(output_path, r"\.toml$" => ".md")
+  basename(output_path) == output_path && return replace(output_path, r"\.toml$" => ".md")
   return joinpath(dirname(output_path), replace(basename(output_path), r"\.toml$" => ".md"))
 end
 
@@ -503,12 +478,11 @@ function main(args=ARGS)
   BLAS.set_num_threads(1)
   cases = _build_cases()
   foreach(_warmup_case!, cases)
-  report = Dict{String,Any}(
-    "phase" => phase_label,
-    "generated_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
-    "environment" => _environment_metadata(),
-    "cases" => [_measure_case(case, repeats) for case in cases],
-  )
+  report = Dict{String,Any}("phase" => phase_label,
+                            "generated_utc" => Dates.format(Dates.now(Dates.UTC),
+                                                            dateformat"yyyy-mm-ddTHH:MM:SS"),
+                            "environment" => _environment_metadata(),
+                            "cases" => [_measure_case(case, repeats) for case in cases])
 
   _write_toml(output_path, report)
 

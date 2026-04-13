@@ -455,7 +455,8 @@ end
 end
 
 @inline function _shape_normal_gradient(data::_FieldValues{D,T}, normal_value::NTuple{D,T},
-                                        mode_index::Int, point_index::Int) where {D,T<:AbstractFloat}
+                                        mode_index::Int,
+                                        point_index::Int) where {D,T<:AbstractFloat}
   return sum((@inbounds data.gradients[axis, mode_index, point_index]) * normal_value[axis]
              for axis in 1:D)
 end
@@ -716,7 +717,8 @@ level companion of [`shape_normal_gradient`](@ref): one acts on basis functions,
 the other on the reconstructed discrete field itself.
 """
 @inline function normal_gradient(values::_NormalEvaluationValues, state::State{T},
-                                 field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
+                                 field::AbstractField,
+                                 point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   normal_value = _point_normal(values, checked_point)
@@ -743,9 +745,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
   end
@@ -766,9 +767,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
     result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
@@ -791,9 +791,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
     result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
@@ -815,9 +814,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     result = ntuple(axis -> muladd(gradients[axis, mode_index, point_index], amplitude,
                                    result[axis]), D)
@@ -841,9 +839,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     directional = gradients[1, mode_index, point_index] * normal1
     result = muladd(directional, amplitude, result)
@@ -868,9 +865,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     directional = muladd(gradients[1, mode_index, point_index], normal1,
                          gradients[2, mode_index, point_index] * normal2)
@@ -897,9 +893,8 @@ end
 
   @inbounds for mode_index in 1:data.local_mode_count
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients,
-                                single_term_indices, single_term_coefficients, state_coefficients,
-                                local_dof)
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
     amplitude == zero(T) && continue
     directional = muladd(gradients[1, mode_index, point_index], normal1,
                          muladd(gradients[2, mode_index, point_index], normal2,

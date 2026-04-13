@@ -98,8 +98,7 @@ function main(args=ARGS)
   operation_id = _required(parsed, "operation")
   profile_kind = get(parsed, "profile", DEFAULT_PROFILE)
   repetitions = parse(Int, get(parsed, "repetitions", string(DEFAULT_REPETITIONS)))
-  sample_rate = parse(Float64, get(parsed, "sample-rate",
-                                   string(DEFAULT_ALLOCATION_SAMPLE_RATE)))
+  sample_rate = parse(Float64, get(parsed, "sample-rate", string(DEFAULT_ALLOCATION_SAMPLE_RATE)))
   output_path = get(parsed, "output",
                     joinpath(BENCHMARK_PROJECT,
                              "profile_$(case_id)_$(operation_id)_$(profile_kind).txt"))

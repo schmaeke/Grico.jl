@@ -217,15 +217,12 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
   constraint_masks = _constraint_masks(dof_count(layout), compiled_dirichlet,
                                        compiled_mean_constraints)
   traversal_plan = _compile_traversal_plan(dimension(layout), integration, boundary_operators,
-                                           interface_operators,
-                                           surface_operators)
+                                           interface_operators, surface_operators)
   T = eltype(origin(field_space(layout.slots[1].field)))
   assembly_structure = _compile_assembly_structure(layout, cell_operators, boundary_operators,
                                                    interface_operators, surface_operators,
-                                                   integration,
-                                                   compiled_dirichlet,
-                                                   compiled_mean_constraints,
-                                                   constraint_masks)
+                                                   integration, compiled_dirichlet,
+                                                   compiled_mean_constraints, constraint_masks)
   return AssemblyPlan{dimension(layout),T,typeof(assembly_structure)}(layout, cell_operators,
                                                                       boundary_operators,
                                                                       interface_operators,
@@ -245,19 +242,18 @@ function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegrati
   surface_lookup = _surface_operator_lookup(integration.embedded_surfaces, surface_operators)
   cell_batches = _compile_kernel_batches(integration.cells, _cell_kernel_signature)
   cell_affine_work_estimates = _compile_cell_affine_work_estimates(cell_batches, integration,
-                                                                   boundary_lookup,
-                                                                   surface_lookup)
+                                                                   boundary_lookup, surface_lookup)
   interface_batches = isempty(interface_operators) ? _KernelBatch[] :
                       _compile_kernel_batches(integration.interfaces, _interface_kernel_signature)
   boundary_batches = isempty(boundary_operators) ? _FilteredKernelBatch[] :
                      _compile_filtered_batches(integration.boundary_faces, _face_kernel_signature,
-                                              face -> boundary_lookup[_boundary_lookup_slot(face.axis,
-                                                                                           face.side)])
+                                               face -> boundary_lookup[_boundary_lookup_slot(face.axis,
+                                                                                             face.side)])
   surface_batches = isempty(surface_operators) ? _FilteredKernelBatch[] :
                     _compile_filtered_batches(integration.embedded_surfaces,
-                                             _surface_kernel_signature,
-                                             surface -> _surface_operator_indices(surface_lookup,
-                                                                                 surface.tag))
+                                              _surface_kernel_signature,
+                                              surface -> _surface_operator_indices(surface_lookup,
+                                                                                   surface.tag))
   return _TraversalPlan(cell_batches, cell_affine_work_estimates, boundary_batches,
                         interface_batches, surface_batches, boundary_lookup, surface_lookup)
 end
@@ -265,7 +261,7 @@ end
 @inline _boundary_lookup_slot(axis::Int, side::Int) = 2 * (axis - 1) + side
 
 function _boundary_operator_lookup(dimension::Int, boundary_operators)
-  lookup = [Int[] for _ in 1:(2 * dimension)]
+  lookup = [Int[] for _ in 1:(2*dimension)]
 
   for operator_index in eachindex(boundary_operators)
     wrapped = boundary_operators[operator_index]
@@ -365,9 +361,8 @@ end
 @inline function _local_matrix_work_cost(local_dof_count::Int, quadrature_points::Int,
                                          operator_count::Int=1)
   operator_count = max(operator_count, 1)
-  return _positive_work_cost(operator_count *
-                             (local_dof_count * local_dof_count +
-                              quadrature_points * local_dof_count))
+  return _positive_work_cost(operator_count * (local_dof_count * local_dof_count +
+                                               quadrature_points * local_dof_count))
 end
 
 function _cell_affine_item_cost(cell::CellValues, leaf::_LeafIntegration, boundary_faces,
@@ -392,8 +387,8 @@ function _cell_affine_item_cost(cell::CellValues, leaf::_LeafIntegration, bounda
 end
 
 function _compile_cell_affine_work_estimates(cell_batches::Vector{_KernelBatch},
-                                             integration::_CompiledIntegration,
-                                             boundary_lookup, surface_lookup)
+                                             integration::_CompiledIntegration, boundary_lookup,
+                                             surface_lookup)
   estimates = Vector{_BatchWorkEstimate}(undef, length(cell_batches))
   boundary_faces = integration.boundary_faces
   embedded_surfaces = integration.embedded_surfaces
@@ -440,8 +435,7 @@ function _compile_filtered_batches(items, signature_fn, operators_fn)
   end
 
   return [_FilteredKernelBatch(batch_indices[index], batch_local_dofs[index],
-                               batch_operator_indices[index])
-          for index in eachindex(batch_indices)]
+                               batch_operator_indices[index]) for index in eachindex(batch_indices)]
 end
 
 @inline function _field_kernel_signature(data::_FieldValues)
@@ -611,7 +605,7 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
   boundary_lookup = _boundary_operator_lookup(dimension(layout), operators)
   boundary_batches = _compile_filtered_batches(selected_faces, _face_kernel_signature,
                                                face -> boundary_lookup[_boundary_lookup_slot(face.axis,
-                                                                                            face.side)])
+                                                                                             face.side)])
   row_partition = _OwnedRowPartition(ndofs, worker_count)
   matrix_template = _compile_boundary_projection_template(T, ndofs, selected_faces, operators)
   full_matrix = _instantiate_sparse(T, matrix_template)
@@ -648,8 +642,7 @@ end
 end
 
 function _dirichlet_component_value(data, x, component::Int, components::Tuple{Vararg{Int}},
-                                    component_total::Int,
-                                    ::Type{T}) where {T<:AbstractFloat}
+                                    component_total::Int, ::Type{T}) where {T<:AbstractFloat}
   value = data isa Function ? data(x) : data
   selected_total = length(components)
   selected_index = _selected_component_index(components, component)
@@ -660,7 +653,8 @@ function _dirichlet_component_value(data, x, component::Int, components::Tuple{V
     throw(ArgumentError("Dirichlet data must match the selected component count or the full field component count"))
   end
 
-  selected_total == 1 || throw(ArgumentError("Dirichlet data for multiple selected components must return a tuple or vector"))
+  selected_total == 1 ||
+    throw(ArgumentError("Dirichlet data for multiple selected components must return a tuple or vector"))
   return T(value)
 end
 
