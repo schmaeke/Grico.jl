@@ -66,6 +66,9 @@ const NITSCHE_PENALTY = 40.0
 const WRITE_VTK = true
 const EXPORT_SUBDIVISIONS = 1
 const EXPORT_DEGREE = 4
+# Benchmarks may include this file for its reusable builders without running
+# the full example. Direct execution keeps the default autorun behavior.
+const RUN_ANNULAR_PLATE_NITSCHE = get(ENV, "GRICO_ANNULAR_AUTORUN", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # 2. Local weak forms
@@ -210,114 +213,95 @@ function circle_points_segments(radius, segment_count; clockwise=false)
   return points, segments
 end
 
-# The Cartesian background domain is the square that encloses the annulus.
-domain = Domain((-OUTER_RADIUS, -OUTER_RADIUS), (2 * OUTER_RADIUS, 2 * OUTER_RADIUS), ROOT_COUNTS)
-space = HpSpace(domain, SpaceOptions(degree=UniformDegree(DEGREE)))
-u = ScalarField(space; name=:u)
+# Build the full unfitted problem description once so both the example driver
+# and the validation harness use the same quadrature, embedded geometry, and
+# weak boundary data setup.
+function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_radius=OUTER_RADIUS,
+                                             root_counts=ROOT_COUNTS, degree=DEGREE,
+                                             segment_count=SEGMENT_COUNT,
+                                             surface_point_count=SURFACE_POINT_COUNT,
+                                             fcm_subdivision_depth=FCM_SUBDIVISION_DEPTH,
+                                             penalty=NITSCHE_PENALTY)
+  domain = Domain((-outer_radius, -outer_radius), (2 * outer_radius, 2 * outer_radius), root_counts)
+  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
+  u = ScalarField(space; name=:u)
 
-# The embedded boundary is the union of the outer and inner circles. Both are
-# represented explicitly as segment meshes and concatenated into one
-# `EmbeddedSurface`.
-outer_points, outer_segments = circle_points_segments(OUTER_RADIUS, SEGMENT_COUNT)
-inner_points, inner_segments = circle_points_segments(INNER_RADIUS, SEGMENT_COUNT; clockwise=true)
-offset = length(outer_points)
-boundary_points = vcat(outer_points, inner_points)
-boundary_segments = vcat(outer_segments,
-                         [(first + offset, second + offset) for (first, second) in inner_segments])
-boundary = EmbeddedSurface(SegmentMesh(boundary_points, boundary_segments);
-                           point_count=SURFACE_POINT_COUNT,)
+  outer_points, outer_segments = circle_points_segments(outer_radius, segment_count)
+  inner_points, inner_segments = circle_points_segments(inner_radius, segment_count;
+                                                        clockwise=true)
+  offset = length(outer_points)
+  boundary_points = vcat(outer_points, inner_points)
+  boundary_segments = vcat(outer_segments,
+                           [(first + offset, second + offset)
+                            for (first, second) in inner_segments])
+  boundary = EmbeddedSurface(SegmentMesh(boundary_points, boundary_segments);
+                             point_count=surface_point_count)
 
-# Exact radial harmonic solution and a level-set description of the physical
-# annulus. The level set uses the standard sign convention
-#
-#   φ(x) < 0  inside Ω,
-#   φ(x) = 0  on ∂Ω,
-#   φ(x) > 0  outside Ω.
-#
-# The finite-cell quadrature builder samples this level-set function to detect
-# where a Cartesian leaf is fully inside, fully outside, or cut by the physical
-# boundary.
-exact_solution = x -> log(hypot(x[1], x[2]) / OUTER_RADIUS) / log(INNER_RADIUS / OUTER_RADIUS)
-annulus_levelset = x -> max(hypot(x[1], x[2]) - OUTER_RADIUS, INNER_RADIUS - hypot(x[1], x[2]))
-is_physical = x -> annulus_levelset(x) <= 0.0
+  exact_solution = x -> log(hypot(x[1], x[2]) / outer_radius) / log(inner_radius / outer_radius)
+  annulus_levelset =
+    x -> max(hypot(x[1], x[2]) - outer_radius, inner_radius - hypot(x[1], x[2]))
+  is_physical = x -> annulus_levelset(x) <= 0.0
 
-# ---------------------------------------------------------------------------
-# 4. Assembly ingredients on the unfitted geometry
-# ---------------------------------------------------------------------------
-#
-# Assemble the unfitted problem:
-# - `Diffusion(u)` acts in the physical interior,
-# - `NitscheDirichlet(...)` acts on the embedded circular boundary,
-# - `boundary` supplies the embedded-surface geometry used by the surface term.
-#
-# Nothing happens at `add_*` time yet. We are just registering what should be
-# compiled later.
-problem = AffineProblem(u)
-add_cell!(problem, Diffusion(u))
-add_surface!(problem, NitscheDirichlet(u, exact_solution, NITSCHE_PENALTY))
-add_embedded_surface!(problem, boundary)
+  problem = AffineProblem(u)
+  add_cell!(problem, Diffusion(u))
+  add_surface!(problem, NitscheDirichlet(u, exact_solution, penalty))
+  add_embedded_surface!(problem, boundary)
 
-# Finite-cell quadratures are attached leaf by leaf. The same quadratures are
-# also reused for the verification integral so the reported `L²` error is
-# measured over the physical annulus rather than over the surrounding square.
-#
-# In an unfitted method, this is essential. If one integrated over the whole
-# square, one would be solving and verifying the wrong problem.
-verification_quadratures = Pair{Int,AbstractQuadrature{2,Float64}}[]
+  verification_quadratures = Pair{Int,AbstractQuadrature{2,Float64}}[]
 
-for leaf in active_leaves(space)
-  quadrature = finite_cell_quadrature(space, leaf, annulus_levelset;
-                                      subdivision_depth=FCM_SUBDIVISION_DEPTH,)
-  quadrature === nothing &&
-    error("annulus setup expected every leaf to intersect the physical domain")
-  add_cell_quadrature!(problem, leaf, quadrature)
-  push!(verification_quadratures, leaf => quadrature)
+  for leaf in active_leaves(space)
+    quadrature = finite_cell_quadrature(space, leaf, annulus_levelset;
+                                        subdivision_depth=fcm_subdivision_depth)
+    quadrature === nothing &&
+      error("annulus setup expected every leaf to intersect the physical domain")
+    add_cell_quadrature!(problem, leaf, quadrature)
+    push!(verification_quadratures, leaf => quadrature)
+  end
+
+  return (; domain, space, u, boundary, exact_solution, annulus_levelset, is_physical, problem,
+          verification_quadratures, inner_radius, outer_radius, root_counts, degree,
+          segment_count, surface_point_count, fcm_subdivision_depth, penalty)
 end
 
-# ---------------------------------------------------------------------------
-# 5. Solve, verify, and export
-# ---------------------------------------------------------------------------
-#
-# Once the volume operators, surface operators, embedded geometry, and custom
-# cell quadratures are registered, the normal Grico workflow applies: compile,
-# assemble, solve.
-#
-# The `relative_l2_error` call uses the same cut-cell quadratures, so the error
-# is integrated over the annulus itself.
-plan = compile(problem)
-state = State(plan, solve(assemble(plan)))
-error_value = relative_l2_error(state, u, exact_solution; plan=plan,
-                                cell_quadratures=verification_quadratures,)
+# Human-facing driver used both for direct execution and for benchmarked solves
+# that want the exact same problem setup without VTK output.
+function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=true, kwargs...)
+  context = build_annular_plate_nitsche_context(; kwargs...)
+  plan = compile(context.problem)
+  state = State(plan, solve(assemble(plan)))
+  error_value = relative_l2_error(state, context.u, context.exact_solution; plan=plan,
+                                  cell_quadratures=context.verification_quadratures)
+  vtk_path = nothing
 
-output_directory = joinpath(@__DIR__, "output")
-current_space = field_space(u)
-current_grid = grid(current_space)
+  if write_vtk
+    output_directory = joinpath(@__DIR__, "output")
+    current_space = field_space(context.u)
+    current_grid = grid(current_space)
+    mkpath(output_directory)
+    vtk_path = write_vtk(joinpath(output_directory, "annular_plate_nitsche"), state;
+                         point_data=(physical=x -> context.is_physical(x) ? 1.0 : 0.0,
+                                     abs_error=(x, values) -> context.is_physical(x) ?
+                                                              abs(values.u -
+                                                                  context.exact_solution(x)) :
+                                                              0.0),
+                         cell_data=(leaf=leaf -> Float64(leaf),
+                                    level=leaf -> Float64.(level(current_grid, leaf)),
+                                    degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
+                         field_data=(relative_l2_error=error_value,),
+                         subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE,
+                         append=true, compress=true, ascii=false)
+    print_summary && println("  vtk  $vtk_path")
+  end
 
-if WRITE_VTK
-  mkpath(output_directory)
+  if print_summary
+    println("annular_plate_nitsche.jl")
+    @printf("  degree              : %d\n", context.degree)
+    @printf("  active leaves       : %d\n", active_leaf_count(context.space))
+    @printf("  scalar dofs         : %d\n", scalar_dof_count(context.space))
+    @printf("  relative l2 error   : %.6e\n", error_value)
+  end
 
-  # In the VTK output we export both the discrete solution and a few useful
-  # diagnostics: a physical-domain mask on the enclosing square, the pointwise
-  # absolute error inside the annulus, and per-cell level/degree metadata.
-  #
-  # The mask is helpful because the exported mesh is still the background
-  # Cartesian square. The mask tells the reader which part is the actual annulus
-  # and which part is just surrounding embedding space.
-  vtk_path = write_vtk(joinpath(output_directory, "annular_plate_nitsche"), state;
-                       point_data=(physical=x -> is_physical(x) ? 1.0 : 0.0,
-                                   abs_error=(x, values) -> is_physical(x) ?
-                                                            abs(values.u - exact_solution(x)) : 0.0),
-                       cell_data=(leaf=leaf -> Float64(leaf),
-                                  level=leaf -> Float64.(level(current_grid, leaf)),
-                                  degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
-                       field_data=(relative_l2_error=error_value,),
-                       subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE, append=true,
-                       compress=true, ascii=false,)
-  println("  vtk  $vtk_path")
+  return (; context..., plan, state, error_value, vtk_path)
 end
 
-println("annular_plate_nitsche.jl")
-@printf("  degree              : %d\n", DEGREE)
-@printf("  active leaves       : %d\n", active_leaf_count(space))
-@printf("  scalar dofs         : %d\n", scalar_dof_count(space))
-@printf("  relative l2 error   : %.6e\n", error_value)
+RUN_ANNULAR_PLATE_NITSCHE && run_annular_plate_nitsche_example()
