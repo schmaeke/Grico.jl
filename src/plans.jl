@@ -84,6 +84,36 @@ struct _ConstraintMasks{T<:AbstractFloat}
   blocked_rows::BitVector
 end
 
+# Batched traversal metadata used by runtime assembly and nonlinear evaluation.
+# Items that share the same local kernel signature are grouped together so the
+# runtime passes can reuse the same local buffer shape and avoid repeated
+# selector/filter work inside the hottest loops.
+struct _KernelBatch
+  item_indices::Vector{Int}
+  local_dof_count::Int
+end
+
+struct _FilteredKernelBatch
+  item_indices::Vector{Int}
+  local_dof_count::Int
+  operator_indices::Vector{Int}
+end
+
+struct _BatchWorkEstimate
+  cumulative_costs::Vector{Int}
+  total_cost::Int
+end
+
+struct _TraversalPlan
+  cell_batches::Vector{_KernelBatch}
+  cell_affine_work_estimates::Vector{_BatchWorkEstimate}
+  boundary_batches::Vector{_FilteredKernelBatch}
+  interface_batches::Vector{_KernelBatch}
+  surface_batches::Vector{_FilteredKernelBatch}
+  boundary_operator_lookup::Vector{Vector{Int}}
+  surface_operator_lookup::Dict{_SurfaceTag,Vector{Int}}
+end
+
 """
     AssemblyPlan
 
@@ -102,7 +132,7 @@ The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
 must be compiled.
 """
-struct AssemblyPlan{D,T<:AbstractFloat}
+struct AssemblyPlan{D,T<:AbstractFloat,S}
   layout::FieldLayout{D,T}
   cell_operators::Tuple
   boundary_operators::Tuple
@@ -112,6 +142,8 @@ struct AssemblyPlan{D,T<:AbstractFloat}
   dirichlet::_CompiledDirichlet{T}
   mean_constraints::Vector{_CompiledLinearConstraint{T}}
   constraint_masks::_ConstraintMasks{T}
+  traversal_plan::_TraversalPlan
+  assembly_structure::S
 end
 
 """
@@ -184,15 +216,261 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                                                         compiled_dirichlet, mean_constraints)
   constraint_masks = _constraint_masks(dof_count(layout), compiled_dirichlet,
                                        compiled_mean_constraints)
-  return AssemblyPlan{dimension(layout),eltype(origin(field_space(layout.slots[1].field)))}(layout,
-                                                                                            cell_operators,
-                                                                                            boundary_operators,
-                                                                                            interface_operators,
-                                                                                            surface_operators,
-                                                                                            integration,
-                                                                                            compiled_dirichlet,
-                                                                                            compiled_mean_constraints,
-                                                                                            constraint_masks)
+  traversal_plan = _compile_traversal_plan(dimension(layout), integration, boundary_operators,
+                                           interface_operators,
+                                           surface_operators)
+  T = eltype(origin(field_space(layout.slots[1].field)))
+  assembly_structure = _compile_assembly_structure(layout, cell_operators, boundary_operators,
+                                                   interface_operators, surface_operators,
+                                                   integration,
+                                                   compiled_dirichlet,
+                                                   compiled_mean_constraints,
+                                                   constraint_masks)
+  return AssemblyPlan{dimension(layout),T,typeof(assembly_structure)}(layout, cell_operators,
+                                                                      boundary_operators,
+                                                                      interface_operators,
+                                                                      surface_operators,
+                                                                      integration,
+                                                                      compiled_dirichlet,
+                                                                      compiled_mean_constraints,
+                                                                      constraint_masks,
+                                                                      traversal_plan,
+                                                                      assembly_structure)
+end
+
+# Compile batched traversal metadata for shared-memory assembly/evaluation.
+function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegration,
+                                 boundary_operators, interface_operators, surface_operators)
+  boundary_lookup = _boundary_operator_lookup(dimension, boundary_operators)
+  surface_lookup = _surface_operator_lookup(integration.embedded_surfaces, surface_operators)
+  cell_batches = _compile_kernel_batches(integration.cells, _cell_kernel_signature)
+  cell_affine_work_estimates = _compile_cell_affine_work_estimates(cell_batches, integration,
+                                                                   boundary_lookup,
+                                                                   surface_lookup)
+  interface_batches = isempty(interface_operators) ? _KernelBatch[] :
+                      _compile_kernel_batches(integration.interfaces, _interface_kernel_signature)
+  boundary_batches = isempty(boundary_operators) ? _FilteredKernelBatch[] :
+                     _compile_filtered_batches(integration.boundary_faces, _face_kernel_signature,
+                                              face -> boundary_lookup[_boundary_lookup_slot(face.axis,
+                                                                                           face.side)])
+  surface_batches = isempty(surface_operators) ? _FilteredKernelBatch[] :
+                    _compile_filtered_batches(integration.embedded_surfaces,
+                                             _surface_kernel_signature,
+                                             surface -> _surface_operator_indices(surface_lookup,
+                                                                                 surface.tag))
+  return _TraversalPlan(cell_batches, cell_affine_work_estimates, boundary_batches,
+                        interface_batches, surface_batches, boundary_lookup, surface_lookup)
+end
+
+@inline _boundary_lookup_slot(axis::Int, side::Int) = 2 * (axis - 1) + side
+
+function _boundary_operator_lookup(dimension::Int, boundary_operators)
+  lookup = [Int[] for _ in 1:(2 * dimension)]
+
+  for operator_index in eachindex(boundary_operators)
+    wrapped = boundary_operators[operator_index]
+    push!(lookup[_boundary_lookup_slot(wrapped.boundary.axis, wrapped.boundary.side)],
+          operator_index)
+  end
+
+  return lookup
+end
+
+function _surface_operator_lookup(surfaces, surface_operators)
+  wildcard = Int[]
+  tagged = Dict{Symbol,Vector{Int}}()
+
+  for operator_index in eachindex(surface_operators)
+    wrapped = surface_operators[operator_index]
+
+    if wrapped.tag === nothing
+      push!(wildcard, operator_index)
+    else
+      push!(get!(tagged, wrapped.tag, Int[]), operator_index)
+    end
+  end
+
+  lookup = Dict{_SurfaceTag,Vector{Int}}(nothing => copy(wildcard))
+  available_tags = Set{_SurfaceTag}()
+  push!(available_tags, nothing)
+
+  for surface in surfaces
+    push!(available_tags, surface.tag)
+  end
+
+  for tag in available_tags
+    tag === nothing && continue
+    indices = copy(wildcard)
+    append!(indices, get(tagged, tag, Int[]))
+    lookup[tag] = indices
+  end
+
+  return lookup
+end
+
+@inline function _surface_operator_indices(lookup::Dict{_SurfaceTag,Vector{Int}}, tag::_SurfaceTag)
+  return get(lookup, tag, lookup[nothing])
+end
+
+function _compile_kernel_batches(items, signature_fn)
+  batch_indices = Vector{Vector{Int}}()
+  batch_local_dofs = Int[]
+  lookup = Dict{Any,Int}()
+
+  for item_index in eachindex(items)
+    item = items[item_index]
+    signature = signature_fn(item)
+    batch_index = get!(lookup, signature) do
+      push!(batch_indices, Int[])
+      push!(batch_local_dofs, item.local_dof_count)
+      return length(batch_indices)
+    end
+
+    push!(batch_indices[batch_index], item_index)
+  end
+
+  return [_KernelBatch(batch_indices[index], batch_local_dofs[index])
+          for index in eachindex(batch_indices)]
+end
+
+@inline _positive_work_cost(cost::Int) = max(cost, 1)
+
+function _uniform_batch_work_estimate(item_count::Int, unit_cost::Int=1)
+  unit_cost = _positive_work_cost(unit_cost)
+  return _BatchWorkEstimate(Int[], item_count * unit_cost)
+end
+
+function _weighted_batch_work_estimate(item_costs::Vector{Int})
+  isempty(item_costs) && return _BatchWorkEstimate(Int[], 0)
+  sanitized_costs = map(_positive_work_cost, item_costs)
+  first_cost = first(sanitized_costs)
+
+  if all(cost -> cost == first_cost, sanitized_costs)
+    return _uniform_batch_work_estimate(length(sanitized_costs), first_cost)
+  end
+
+  cumulative_costs = Vector{Int}(undef, length(sanitized_costs) + 1)
+  cumulative_costs[1] = 0
+  total_cost = 0
+
+  for item_index in eachindex(sanitized_costs)
+    cost = sanitized_costs[item_index]
+    total_cost += cost
+    cumulative_costs[item_index+1] = total_cost
+  end
+
+  return _BatchWorkEstimate(cumulative_costs, total_cost)
+end
+
+@inline function _local_matrix_work_cost(local_dof_count::Int, quadrature_points::Int,
+                                         operator_count::Int=1)
+  operator_count = max(operator_count, 1)
+  return _positive_work_cost(operator_count *
+                             (local_dof_count * local_dof_count +
+                              quadrature_points * local_dof_count))
+end
+
+function _cell_affine_item_cost(cell::CellValues, leaf::_LeafIntegration, boundary_faces,
+                                embedded_surfaces, boundary_lookup, surface_lookup)
+  cost = _local_matrix_work_cost(cell.local_dof_count, point_count(cell))
+
+  for face_index in leaf.boundary_faces
+    face = @inbounds boundary_faces[face_index]
+    operator_count = length(boundary_lookup[_boundary_lookup_slot(face.axis, face.side)])
+    operator_count == 0 && continue
+    cost += _local_matrix_work_cost(face.local_dof_count, point_count(face), operator_count)
+  end
+
+  for surface_index in leaf.embedded_surfaces
+    surface = @inbounds embedded_surfaces[surface_index]
+    operator_count = length(_surface_operator_indices(surface_lookup, surface.tag))
+    operator_count == 0 && continue
+    cost += _local_matrix_work_cost(surface.local_dof_count, point_count(surface), operator_count)
+  end
+
+  return cost
+end
+
+function _compile_cell_affine_work_estimates(cell_batches::Vector{_KernelBatch},
+                                             integration::_CompiledIntegration,
+                                             boundary_lookup, surface_lookup)
+  estimates = Vector{_BatchWorkEstimate}(undef, length(cell_batches))
+  boundary_faces = integration.boundary_faces
+  embedded_surfaces = integration.embedded_surfaces
+  leaves = integration.leaves
+  cells = integration.cells
+
+  for batch_index in eachindex(cell_batches)
+    batch = cell_batches[batch_index]
+    item_costs = Vector{Int}(undef, length(batch.item_indices))
+
+    for local_index in eachindex(batch.item_indices)
+      cell_index = batch.item_indices[local_index]
+      item_costs[local_index] = _cell_affine_item_cost(cells[cell_index], leaves[cell_index],
+                                                       boundary_faces, embedded_surfaces,
+                                                       boundary_lookup, surface_lookup)
+    end
+
+    estimates[batch_index] = _weighted_batch_work_estimate(item_costs)
+  end
+
+  return estimates
+end
+
+function _compile_filtered_batches(items, signature_fn, operators_fn)
+  batch_indices = Vector{Vector{Int}}()
+  batch_local_dofs = Int[]
+  batch_operator_indices = Vector{Vector{Int}}()
+  lookup = Dict{Any,Int}()
+
+  for item_index in eachindex(items)
+    item = items[item_index]
+    operator_indices = operators_fn(item)
+    isempty(operator_indices) && continue
+    signature = signature_fn(item)
+    key = (signature, Tuple(operator_indices))
+    batch_index = get!(lookup, key) do
+      push!(batch_indices, Int[])
+      push!(batch_local_dofs, item.local_dof_count)
+      push!(batch_operator_indices, copy(operator_indices))
+      return length(batch_indices)
+    end
+
+    push!(batch_indices[batch_index], item_index)
+  end
+
+  return [_FilteredKernelBatch(batch_indices[index], batch_local_dofs[index],
+                               batch_operator_indices[index])
+          for index in eachindex(batch_indices)]
+end
+
+@inline function _field_kernel_signature(data::_FieldValues)
+  return (data.field_id, data.component_count, data.scalar_dof_count, data.local_mode_count,
+          length(data.term_indices), length(data.term_offsets))
+end
+
+function _field_tuple_signature(fields::Tuple)
+  return ntuple(index -> _field_kernel_signature(fields[index]), length(fields))
+end
+
+function _cell_kernel_signature(item::CellValues)
+  return (:cell, point_count(item), item.local_dof_count, Tuple(item.interior_local_dofs),
+          _field_tuple_signature(item.fields))
+end
+
+function _face_kernel_signature(item::FaceValues)
+  return (:face, item.axis, item.side, point_count(item), item.local_dof_count,
+          _field_tuple_signature(item.fields))
+end
+
+function _surface_kernel_signature(item::SurfaceValues)
+  return (:surface, item.tag, point_count(item), item.local_dof_count,
+          _field_tuple_signature(item.fields))
+end
+
+function _interface_kernel_signature(item::InterfaceValues)
+  return (:interface, item.axis, point_count(item), item.local_dof_count,
+          _field_tuple_signature(item.minus_fields), _field_tuple_signature(item.plus_fields))
 end
 
 # Build global bit masks describing which dofs are fixed, eliminated, or reserved
@@ -269,16 +547,24 @@ function _field_constraints(constraints, field::AbstractField)
   return matched
 end
 
-# Find the unique Dirichlet constraint, if any, that applies on this boundary
-# face for one already field-filtered constraint set.
-function _matching_dirichlet(constraints, face::FaceValues)
-  matched = nothing
+# Find the Dirichlet constraints that apply on one boundary face for one already
+# field-filtered constraint set. Multiple constraints are allowed on the same
+# face only when they target disjoint component subsets.
+function _matching_dirichlets(constraints, face::FaceValues, component_total::Int)
+  matched = Int[]
+  covered = falses(component_total)
 
-  for constraint in constraints
+  for index in eachindex(constraints)
+    constraint = constraints[index]
     _matches(face, constraint.boundary) || continue
-    matched === nothing ||
-      throw(ArgumentError("multiple Dirichlet constraints target the same boundary face"))
-    matched = constraint
+
+    for component in constraint.components
+      !covered[component] ||
+        throw(ArgumentError("multiple Dirichlet constraints target overlapping components on the same boundary face"))
+      covered[component] = true
+    end
+
+    push!(matched, index)
   end
 
   return matched
@@ -294,39 +580,53 @@ end
 function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{D,T},
                                      boundary_faces, constraints) where {D,T<:AbstractFloat}
   selected_faces = FaceValues[]
+  constraint_matches = falses(length(constraints))
+  component_total = component_count(slot.field)
 
   for face in boundary_faces
-    constraint = _matching_dirichlet(constraints, face)
-    constraint === nothing && continue
+    matched = _matching_dirichlets(constraints, face, component_total)
+    isempty(matched) && continue
     push!(selected_faces, face)
+
+    for index in matched
+      constraint_matches[index] = true
+    end
   end
 
+  all(constraint_matches) ||
+    throw(ArgumentError("Dirichlet constraint does not match any boundary face for field $(field_name(slot.field))"))
   isempty(selected_faces) && return Int[], spzeros(T, 0, 0), T[]
   operators = [_BoundaryContribution(constraint.boundary,
-                                     _DirichletProjection(slot.field, constraint.data))
+                                     _DirichletProjection(slot.field, constraint.components,
+                                                          constraint.data))
                for constraint in constraints]
   ndofs = dof_count(layout)
   max_local_dofs = maximum(face.local_dof_count for face in selected_faces)
-  scratch = [_ThreadScratch(T, ndofs, max_local_dofs)
-             for _ in 1:min(Threads.nthreads(), length(selected_faces))]
+  worker_count = min(Threads.nthreads(), length(selected_faces))
+  scratch = [_ThreadScratch(T, max_local_dofs, worker_count, worker_id)
+             for worker_id in 1:worker_count]
   fixed = falses(ndofs)
   fixed_values = zeros(T, ndofs)
   pivot_rows = falses(ndofs)
-  _assemble_boundary_pass!(scratch, selected_faces, operators, fixed, fixed_values, pivot_rows)
-  rows = Int[]
-  cols = Int[]
-  values = T[]
+  boundary_lookup = _boundary_operator_lookup(dimension(layout), operators)
+  boundary_batches = _compile_filtered_batches(selected_faces, _face_kernel_signature,
+                                               face -> boundary_lookup[_boundary_lookup_slot(face.axis,
+                                                                                            face.side)])
+  row_partition = _OwnedRowPartition(ndofs, worker_count)
+  matrix_template = _compile_boundary_projection_template(T, ndofs, selected_faces, operators)
+  full_matrix = _instantiate_sparse(T, matrix_template)
   rhs_data = zeros(T, ndofs)
-
-  for cache in scratch
-    append!(rows, cache.rows)
-    append!(cols, cache.cols)
-    append!(values, cache.values)
-    rhs_data .+= cache.global_rhs
-  end
+  matrix_accumulator = _OwnedSparseAccumulator(matrix_template.pattern, full_matrix.nzval,
+                                               row_partition)
+  rhs_accumulator = _OwnedVectorAccumulator{T}(rhs_data, row_partition)
+  _prepare_matrix_accumulator!(matrix_accumulator, scratch)
+  _prepare_vector_accumulator!(rhs_accumulator, scratch)
+  _assemble_boundary_pass!(scratch, matrix_accumulator, rhs_accumulator, boundary_batches,
+                           selected_faces, operators, fixed, fixed_values, pivot_rows)
+  _finalize_matrix_accumulator!(matrix_accumulator, scratch)
+  _finalize_vector_accumulator!(rhs_accumulator, scratch)
 
   slot_range = field_dof_range(layout, slot.field)
-  full_matrix = sparse(rows, cols, values, ndofs, ndofs)
   slot_matrix = full_matrix[slot_range, slot_range]
   slot_rhs = rhs_data[slot_range]
   involved = _active_projection_dofs(slot_matrix, slot_rhs)
@@ -337,24 +637,31 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
 end
 
 # Interpret user-supplied Dirichlet data as either scalar or vector-valued
-# boundary values with the correct component count.
-function _boundary_component_value(data, x, component::Int, component_total::Int,
-                                   ::Type{T}) where {T<:AbstractFloat}
-  value = data isa Function ? data(x) : data
-
-  if component_total == 1
-    value isa Tuple && return T(value[1])
-    value isa AbstractVector && return T(value[1])
-    return T(value)
+# boundary values for the selected component subset. Vector-valued data may
+# either match the selected subset or the full field component count.
+@inline function _selected_component_index(components::Tuple{Vararg{Int}}, component::Int)
+  for index in eachindex(components)
+    components[index] == component && return index
   end
+
+  throw(ArgumentError("selected component $component is not part of this Dirichlet constraint"))
+end
+
+function _dirichlet_component_value(data, x, component::Int, components::Tuple{Vararg{Int}},
+                                    component_total::Int,
+                                    ::Type{T}) where {T<:AbstractFloat}
+  value = data isa Function ? data(x) : data
+  selected_total = length(components)
+  selected_index = _selected_component_index(components, component)
 
   if value isa Tuple || value isa AbstractVector
-    length(value) == component_total ||
-      throw(ArgumentError("vector-valued boundary data must match the field component count"))
-    return T(value[component])
+    length(value) == selected_total && return T(value[selected_index])
+    length(value) == component_total && return T(value[component])
+    throw(ArgumentError("Dirichlet data must match the selected component count or the full field component count"))
   end
 
-  throw(ArgumentError("vector-valued field data must return a tuple or vector"))
+  selected_total == 1 || throw(ArgumentError("Dirichlet data for multiple selected components must return a tuple or vector"))
+  return T(value)
 end
 
 # Mean-value constraint compilation as explicit linear equations.
@@ -409,8 +716,9 @@ end
 
 # Auxiliary operator used to assemble the boundary L² projection system for
 # Dirichlet data.
-struct _DirichletProjection{F,G}
+struct _DirichletProjection{F,C,G}
   field::F
+  components::C
   data::G
 end
 
@@ -423,8 +731,8 @@ function face_matrix!(local_matrix, operator::_DirichletProjection, values::Face
   for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
-    for component in 1:data.component_count
-      offset = (component - 1) * mode_count
+    for component in operator.components
+      offset = _field_component_offset(data, component)
 
       for row_mode in 1:mode_count
         shape_row = data.values[row_mode, point_index]
@@ -443,7 +751,8 @@ end
 
 # Right-hand side of the boundary projection system against the prescribed
 # Dirichlet data.
-function face_rhs!(local_rhs, operator::_DirichletProjection{F,G}, values::FaceValues) where {F,G}
+function face_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
+                   values::FaceValues) where {F,C,G}
   block_data = block(local_rhs, values, operator.field)
   data = _field_values(values, operator.field)
   mode_count = data.local_mode_count
@@ -453,10 +762,10 @@ function face_rhs!(local_rhs, operator::_DirichletProjection{F,G}, values::FaceV
     point_data = point(values, point_index)
     weighted = weight(values, point_index)
 
-    for component in 1:data.component_count
-      target = _boundary_component_value(operator.data, point_data, component, data.component_count,
-                                         value_type)
-      offset = (component - 1) * mode_count
+    for component in operator.components
+      target = _dirichlet_component_value(operator.data, point_data, component, operator.components,
+                                          data.component_count, value_type)
+      offset = _field_component_offset(data, component)
 
       for mode_index in 1:mode_count
         block_data[offset+mode_index] += data.values[mode_index, point_index] * weighted * target

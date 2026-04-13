@@ -65,6 +65,9 @@ const SMOOTHNESS_THRESHOLD = 0.3
 # `DIMENSION` manually.
 const WRITE_VTK = DIMENSION <= 3
 const EXPORT_SUBDIVISIONS = 1
+# Benchmarks may include this file for its reusable builders without running
+# the full adaptive loop. Direct execution keeps the default autorun behavior.
+const RUN_ORIGIN_SINGULARITY_POISSON = get(ENV, "GRICO_ORIGIN_SINGULARITY_AUTORUN", "1") == "1"
 
 # Singularity strength `α` in u = r^α.
 const SINGULAR_EXPONENT = 0.5
@@ -156,132 +159,133 @@ end
 #
 #   -α (α + d - 2)
 #
-# is the Laplacian coefficient for r^α in dimension d.
-radius(x) = sqrt(sum(abs2, x))
-source_factor = -SINGULAR_EXPONENT * (SINGULAR_EXPONENT + DIMENSION - 2)
-exact_solution = x -> (r=radius(x); r == 0.0 ? 0.0 : r^SINGULAR_EXPONENT)
-source_term = x -> (r=radius(x); r == 0.0 ? 0.0 : source_factor * r^(SINGULAR_EXPONENT - 2))
+# is the Laplacian coefficient for r^α in dimension d. The example exposes this
+# manufactured data through a helper so both the direct example driver and the
+# benchmark harness use the exact same problem definition.
+function origin_solution_data(; dimension=DIMENSION, singular_exponent=SINGULAR_EXPONENT)
+  source_factor = -singular_exponent * (singular_exponent + dimension - 2)
+  exact_solution = x -> (r=sqrt(sum(abs2, x)); r == 0.0 ? 0.0 : r^singular_exponent)
+  source_term = x -> (r=sqrt(sum(abs2, x)); r == 0.0 ? 0.0 :
+                                               source_factor * r^(singular_exponent - 2))
+  return (; dimension, singular_exponent, source_factor, exact_solution, source_term)
+end
 
-# ---------------------------------------------------------------------------
-# 3. Initial hp space
-# ---------------------------------------------------------------------------
-#
-# We start from one single Cartesian root cell with a moderate polynomial
-# degree. This is deliberately very coarse. The point is to let the adaptivity
-# algorithm decide where geometric refinement and where polynomial enrichment
-# are needed.
-space = HpSpace(Domain(ntuple(_ -> 0.0, DIMENSION), ntuple(_ -> 1.0, DIMENSION),
-                       ntuple(_ -> 1, DIMENSION)),
-                SpaceOptions(degree=UniformDegree(INITIAL_DEGREE)))
+# Build the reusable field descriptor and manufactured data used by the example
+# driver and by the validation benchmarks.
+function build_origin_singularity_poisson_context(; dimension=DIMENSION,
+                                                  initial_degree=INITIAL_DEGREE,
+                                                  singular_exponent=SINGULAR_EXPONENT)
+  manufactured = origin_solution_data(; dimension, singular_exponent)
+  space = HpSpace(Domain(ntuple(_ -> 0.0, dimension), ntuple(_ -> 1.0, dimension),
+                         ntuple(_ -> 1, dimension)),
+                  SpaceOptions(degree=UniformDegree(initial_degree)))
+  u = ScalarField(space; name=:u)
+  return (; manufactured..., initial_degree, space, u)
+end
 
-println("origin_singularity_poisson.jl")
-println("  step leaves dofs rel-l2-error plan")
+function build_origin_singularity_problem(u, context)
+  problem = AffineProblem(u)
+  add_cell!(problem, Diffusion(u))
+  add_cell!(problem, Source(u, context.source_term))
 
-let u = ScalarField(space; name=:u)
-  output_directory = joinpath(@__DIR__, "output")
-  mkpath(output_directory)
+  for axis in 1:context.dimension
+    add_constraint!(problem, Dirichlet(u, BoundaryFace(axis, UPPER), context.exact_solution))
+  end
+
+  return problem
+end
+
+function origin_adaptivity_plan(state, u)
+  return hp_adaptivity_plan(state, u; threshold=MARK_THRESHOLD,
+                            smoothness_threshold=SMOOTHNESS_THRESHOLD)
+end
+
+# Human-facing adaptive driver used both when the example is run directly and
+# when benchmarks need the same solve/adapt loop without VTK output.
+function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
+                                                write_vtk=WRITE_VTK, print_summary=true)
+  context = build_origin_singularity_poisson_context()
+  u = context.u
+  history = NamedTuple[]
   vtk_files = String[]
   vtk_steps = Int[]
+  vtk_path = nothing
+  pvd_path = nothing
+  final_plan = nothing
+  final_state = nothing
+  final_error = NaN
 
-  # Each loop iteration solves the problem on the current hp space, measures
-  # the exact error, asks the built-in planner for the next target space, and
-  # then recreates the field on that target space.
-  for step in 0:ADAPTIVE_STEPS
-    # Assemble the current Poisson problem on the present hp space:
-    #
-    #   find u_h in V_h such that
-    #     ∫_Ω ∇v_h · ∇u_h dΩ = ∫_Ω v_h f dΩ
-    #
-    # for all test functions v_h, together with Dirichlet data on the upper
-    # faces.
-    problem = AffineProblem(u)
-    add_cell!(problem, Diffusion(u))
-    add_cell!(problem, Source(u, source_term))
+  if print_summary
+    println("origin_singularity_poisson.jl")
+    println("  step leaves dofs rel-l2-error plan")
+  end
 
-    # Dirichlet data are imposed only on the upper faces. The lower faces are
-    # left natural, which matches the exact radial solution as discussed above.
-    for axis in 1:DIMENSION
-      add_constraint!(problem, Dirichlet(u, BoundaryFace(axis, UPPER), exact_solution))
-    end
+  output_directory = joinpath(@__DIR__, "output")
+  write_vtk && mkpath(output_directory)
 
+  for step in 0:adaptive_steps
+    problem = build_origin_singularity_problem(u, context)
     plan = compile(problem)
-
-    # For this small scalar example the default sparse direct solve is a good
-    # fit and keeps the script short.
     state = State(plan, solve(assemble(plan)))
+    error_value = relative_l2_error(state, u, context.exact_solution; plan=plan,
+                                    extra_points=VERIFICATION_EXTRA_POINTS)
 
-    # Compare the discrete solution against the exact one in the relative
-    # `L²` norm. This is not an estimator; it is a true verification quantity
-    # available only because we chose a manufactured solution.
-    error_value = relative_l2_error(state, u, exact_solution; plan=plan,
-                                    extra_points=VERIFICATION_EXTRA_POINTS,)
-
-    if step == ADAPTIVE_STEPS
+    if step == adaptive_steps
       step_plan = "done"
       stop_now = true
+      adaptivity_plan = nothing
     else
-      # The built-in `hp` planner combines:
-      #
-      # - a refinement indicator, which says "this region looks underresolved",
-      # - and a smoothness indicator, which says whether `p` or `h` is the
-      #   better next move on the marked leaves.
-      #
-      # Very roughly:
-      #
-      # - smooth region  -> favor `p`,
-      # - singular region -> favor `h`.
-      adaptivity_plan = hp_adaptivity_plan(state, u; threshold=MARK_THRESHOLD,
-                                           smoothness_threshold=SMOOTHNESS_THRESHOLD,)
+      adaptivity_plan = origin_adaptivity_plan(state, u)
       summary = adaptivity_summary(adaptivity_plan)
       step_plan = isempty(adaptivity_plan) ? "stop" :
                   "h=$(summary.h_refinement_leaf_count), p=$(summary.p_refinement_leaf_count)"
       stop_now = isempty(adaptivity_plan)
     end
 
-    @printf("  %4d %6d %4d %.6e %s\n", step, active_leaf_count(field_space(u)),
-            scalar_dof_count(field_space(u)), error_value, step_plan,)
+    push!(history, (; step, active_leaves=active_leaf_count(field_space(u)),
+                    dofs=scalar_dof_count(field_space(u)), error_value, step_plan))
+    print_summary &&
+      @printf("  %4d %6d %4d %.6e %s\n", step, active_leaf_count(field_space(u)),
+              scalar_dof_count(field_space(u)), error_value, step_plan)
 
-    # Export every adaptive step so one can inspect how the mesh and polynomial
-    # degree evolve. The point data show both the exact solution and the
-    # pointwise absolute error. The cell data show the local refinement level
-    # and polynomial degree on each active leaf.
-    if WRITE_VTK
+    if write_vtk
       current_space = field_space(u)
       current_grid = grid(current_space)
       vtk_path = write_vtk(joinpath(output_directory,
                                     @sprintf("origin_singularity_poisson_%04d", step)),
                            current_space.domain; state=state,
-                           point_data=(exact=exact_solution,
-                                       abs_error=(x, values) -> abs(values.u - exact_solution(x))),
+                           point_data=(exact=context.exact_solution,
+                                       abs_error=(x, values) -> abs(values.u -
+                                                                    context.exact_solution(x))),
                            cell_data=(leaf=leaf -> Float64(leaf),
                                       level=leaf -> Float64.(level(current_grid, leaf)),
                                       degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
                            field_data=(step=Float64(step), relative_l2_error=error_value),
                            subdivisions=EXPORT_SUBDIVISIONS, append=true, compress=true,
-                           ascii=false,)
+                           ascii=false)
       push!(vtk_files, vtk_path)
       push!(vtk_steps, step)
     end
 
-    if stop_now
-      if WRITE_VTK
-        vtk_path = vtk_files[end]
-        pvd_path = write_pvd(joinpath(output_directory, "origin_singularity_poisson.pvd"),
-                             vtk_files; timesteps=vtk_steps,)
-        println("  vtk  $vtk_path")
-        println("  pvd  $pvd_path")
-      end
+    final_plan = plan
+    final_state = state
+    final_error = error_value
 
+    if stop_now
+      if write_vtk && !isempty(vtk_files)
+        pvd_path = write_pvd(joinpath(output_directory, "origin_singularity_poisson.pvd"),
+                             vtk_files; timesteps=vtk_steps)
+        print_summary && println("  vtk  $vtk_path")
+        print_summary && println("  pvd  $pvd_path")
+      end
       break
     end
 
-    # This example resolves each adapted problem from scratch rather than
-    # transferring the previous discrete state. The space transition is still
-    # needed, because it knows how to recreate the field descriptor on the new
-    # hp space produced by the adaptivity plan. In larger nonlinear problems one
-    # would often transfer the old state as an initial guess; here we keep the
-    # example focused on the space-adaptation mechanism itself.
     space_transition = transition(adaptivity_plan)
     u = adapted_field(space_transition, u)
   end
+
+  return (; context..., u, final_plan, final_state, final_error, history, vtk_path, pvd_path)
 end
+
+RUN_ORIGIN_SINGULARITY_POISSON && run_origin_singularity_poisson_example()

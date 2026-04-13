@@ -838,6 +838,49 @@ end
   end
 end
 
+@testset "Vector Dirichlet Component Selection" begin
+  domain = Grico.Domain((0.0,), (1.0,), (1,))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(2)))
+  u = Grico.VectorField(space, 3; name=:u)
+
+  shorthand_problem = Grico.AffineProblem(u)
+  Grico.add_constraint!(shorthand_problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER),
+                                        (1.0, 2.0, 3.0)))
+  shorthand_state = _dirichlet_state(Grico.compile(shorthand_problem))
+
+  explicit_problem = Grico.AffineProblem(u)
+  Grico.add_constraint!(explicit_problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER),
+                                        (1, 2, 3), (1.0, 2.0, 3.0)))
+  explicit_state = _dirichlet_state(Grico.compile(explicit_problem))
+
+  for component in 1:3
+    @test _field_value(u, shorthand_state, 1, (-1.0,), component) ≈
+          _field_value(u, explicit_state, 1, (-1.0,), component) atol = ASSEMBLY_TOL
+  end
+
+  problem = Grico.AffineProblem(u)
+  Grico.add_constraint!(problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 1, -2.0))
+  Grico.add_constraint!(problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 2,
+                                        (10.0, 1.5, 30.0)))
+  Grico.add_constraint!(problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.UPPER),
+                                        (1, 3), x -> (x[1], -x[1])))
+  state = _dirichlet_state(Grico.compile(problem))
+
+  @test _field_value(u, state, 1, (-1.0,), 1) ≈ -2.0 atol = ASSEMBLY_TOL
+  @test _field_value(u, state, 1, (-1.0,), 2) ≈ 1.5 atol = ASSEMBLY_TOL
+  @test _field_value(u, state, 1, (-1.0,), 3) ≈ 0.0 atol = ASSEMBLY_TOL
+  @test _field_value(u, state, 1, (1.0,), 1) ≈ 1.0 atol = ASSEMBLY_TOL
+  @test _field_value(u, state, 1, (1.0,), 2) ≈ 0.0 atol = ASSEMBLY_TOL
+  @test _field_value(u, state, 1, (1.0,), 3) ≈ -1.0 atol = ASSEMBLY_TOL
+end
+
 @testset "Multi-Field Assembly" begin
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   space = Grico.HpSpace(domain,
@@ -906,6 +949,16 @@ end
     @test velocity_gradient[2][1] ≈ expected_gradient(velocity, state, ξ, 2) atol = ASSEMBLY_TOL
     @test Grico.gradient(cell, state, pressure, point_index)[1] ≈
           expected_gradient(pressure, state, ξ, 1) atol = ASSEMBLY_TOL
+  end
+
+  face = first(plan.integration.boundary_faces)
+  for point_index in 1:Grico.point_count(face)
+    actual = Grico.normal_gradient(face, state, velocity, point_index)
+    expected = Grico.normal_component(Grico.gradient(face, state, velocity, point_index),
+                                      Grico.normal(face, point_index))
+    @test length(actual) == length(expected)
+    @test all(isapprox(actual[index], expected[index]; atol=ASSEMBLY_TOL)
+              for index in eachindex(actual))
   end
 end
 
@@ -1100,13 +1153,17 @@ end
   @test !system.symmetric
   @test isempty(system.preconditioner_cache)
 
-  reduced_values, converged = Grico._preconditioned_krylov_solve(system, Grico.ILUPreconditioner())
+  explicit_ilu = Grico.ILUPreconditioner(min_dofs=0)
+  reduced_values, converged = Grico._preconditioned_krylov_solve(system, explicit_ilu)
   @test converged
   @test norm(Grico.matrix(system) * reduced_values - Grico.rhs(system)) / norm(Grico.rhs(system)) <=
         1.0e-6
 
   default_state = Grico.State(system, Grico.solve(system))
-  @test haskey(system.preconditioner_cache, Grico.ILUPreconditioner())
+  @test haskey(system.preconditioner_cache, Grico._DIRECT_SOLVE_CACHE_KEY)
+  @test !haskey(system.preconditioner_cache, Grico.ILUPreconditioner())
+  direct_operator = Grico._direct_operator(system)
+  @test direct_operator === Grico._direct_operator(system)
   direct_state = Grico.State(system, Grico.solve(system; linear_solve=(A, b) -> A \ b))
   guided_state = Grico.State(system,
                              Grico.solve(system;
@@ -1523,6 +1580,7 @@ end
                               Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                                  degree=Grico.UniformDegree(1)))
   v = Grico.ScalarField(other_space; name=:v)
+  vec = Grico.VectorField(space, 2; name=:vec)
 
   @test_throws ArgumentError Grico.BoundaryFace(0, Grico.LOWER)
   @test_throws ArgumentError Grico.AffineProblem(u, u)
@@ -1541,6 +1599,13 @@ end
                                                                    Grico.BoundaryFace(1,
                                                                                       Grico.LOWER),
                                                                    0.0))
+  @test_throws ArgumentError Grico.Dirichlet(v, Grico.BoundaryFace(1, Grico.LOWER), 2, 0.0)
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), 0, 0.0)
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), 3, 0.0)
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (2, 1),
+                                             (0.0, 0.0))
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (1, 1),
+                                             (0.0, 0.0))
   mixed_domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   mixed_space = Grico.HpSpace(mixed_domain,
                               Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
@@ -1577,6 +1642,19 @@ end
                                                                0.0)], Grico.MeanValue[])
   @test_throws ArgumentError Grico.compile(raw_dg)
 
+  overlap_domain = Grico.Domain((0.0,), (1.0,), (1,))
+  overlap_space = Grico.HpSpace(overlap_domain,
+                                Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                   degree=Grico.UniformDegree(1)))
+  overlap = Grico.VectorField(overlap_space, 2; name=:overlap)
+  overlap_problem = Grico.AffineProblem(overlap)
+  Grico.add_constraint!(overlap_problem,
+                        Grico.Dirichlet(overlap, Grico.BoundaryFace(1, Grico.LOWER), 1, 0.0))
+  Grico.add_constraint!(overlap_problem,
+                        Grico.Dirichlet(overlap, Grico.BoundaryFace(1, Grico.LOWER), (1, 2),
+                                        (0.0, 0.0)))
+  @test_throws ArgumentError Grico.compile(overlap_problem)
+
   tagged_problem = Grico.AffineProblem(u)
   @test Grico.add_surface!(tagged_problem, :missing, EmbeddedPointLoad(u, 1.0)) === tagged_problem
   quadrature = Grico.PointQuadrature([(0.0,)], [1.0])
@@ -1607,4 +1685,13 @@ end
 
   @test_throws ArgumentError Grico.residual(plan, foreign_state)
   @test_throws ArgumentError Grico.tangent(plan, foreign_state)
+end
+
+@testset "Assembly Scheduler Helpers" begin
+  weighted = Grico._weighted_batch_work_estimate([10, 1, 1, 1])
+  @test Grico._weighted_chunk_starts(weighted, 4, 2) == [1, 2, 5]
+  @test Grico._weighted_chunk_starts(weighted, 4, 4) == [1, 2, 2, 2, 5]
+
+  matched = Grico._weighted_batch_work_estimate([2, 1, 1])
+  @test Grico._weighted_chunk_starts(matched, 3, 2) == [1, 2, 4]
 end

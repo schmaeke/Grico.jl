@@ -652,17 +652,9 @@ function build_lid_driven_cavity_context(; root_counts=ROOT_COUNTS)
   build_lid_driven_cavity_context(Domain((0.0, 0.0), (1.0, 1.0), root_counts))
 end
 
-# Advance one under-relaxed Picard step and return both the updated context and
-# the assembled Oseen system so external drivers can benchmark alternative
-# linear solver paths on the exact matrix used at that iteration.
-function advance_picard_step(context; linear_solve=direct_sparse_solve)
-  # 1. update the lagged advecting state in the reusable operator,
-  # 2. assemble and solve the linear Oseen system,
-  # 3. under-relax the new iterate for robustness,
-  # 4. report a relative update and DG diagnostics.
-  context.operator.advecting_state = context.flow_state
-  system = assemble(context.plan)
-  candidate_state = State(context.plan, solve(system; linear_solve=linear_solve))
+# Finish one Picard linear solve by applying the example's under-relaxation and
+# by evaluating the DG diagnostics reported to the user and benchmark harness.
+function finalize_picard_step(context, candidate_state)
   relaxed_coefficients = PICARD_RELAXATION == 1.0 ? coefficients(candidate_state) :
                          (1.0 - PICARD_RELAXATION) .* coefficients(context.flow_state) .+
                          PICARD_RELAXATION .* coefficients(candidate_state)
@@ -674,6 +666,21 @@ function advance_picard_step(context; linear_solve=direct_sparse_solve)
   mass_l2 = dg_mass_monitor_l2(context.plan, relaxed_state, context.velocity)
   energy = kinetic_energy(context.plan, relaxed_state, context.velocity)
   next_context = (; context..., flow_state=relaxed_state)
+  return next_context, relative_update, mass_l2, energy
+end
+
+# Advance one under-relaxed Picard step and return both the updated context and
+# the assembled Oseen system so external drivers can benchmark alternative
+# linear solver paths on the exact matrix used at that iteration.
+function advance_picard_step(context; linear_solve=direct_sparse_solve)
+  # 1. update the lagged advecting state in the reusable operator,
+  # 2. assemble and solve the linear Oseen system,
+  # 3. under-relax the new iterate for robustness,
+  # 4. report a relative update and DG diagnostics.
+  context.operator.advecting_state = context.flow_state
+  system = assemble(context.plan)
+  candidate_state = State(context.plan, solve(system; linear_solve=linear_solve))
+  next_context, relative_update, mass_l2, energy = finalize_picard_step(context, candidate_state)
   return next_context, system, relative_update, mass_l2, energy
 end
 

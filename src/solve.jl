@@ -123,7 +123,7 @@ function Base.hash(preconditioner::SmoothedAggregationAMGPreconditioner, seed::U
 end
 
 """
-    ILUPreconditioner(; tau=1e-3, min_dofs=2_000)
+    ILUPreconditioner(; tau=1e-3, min_dofs=10_000)
 
 Configuration for an incomplete-LU preconditioner.
 
@@ -133,13 +133,16 @@ package default for assembled systems that are not marked symmetric.
 
 The drop parameter `tau` belongs to the ILU construction itself, whereas
 `min_dofs` again only decides when the default solve policy attempts the
-preconditioned iterative route at all.
+preconditioned iterative route at all. The default threshold is intentionally
+higher than the symmetric AMG threshold because medium-sized unsymmetric
+systems often reach a sparse direct solve faster than they converge with a
+generic ILU-preconditioned GMRES iteration.
 """
 struct ILUPreconditioner <: _AbstractPreconditioner
   tau::Float64
   min_dofs::Int
 
-  function ILUPreconditioner(; tau::Real=1e-3, min_dofs::Integer=2_000)
+  function ILUPreconditioner(; tau::Real=1e-3, min_dofs::Integer=10_000)
     checked_tau = _checked_nonnegative_real(tau, "tau")
     checked_min_dofs = _checked_nonnegative(min_dofs, "min_dofs")
     return new(checked_tau, checked_min_dofs)
@@ -315,6 +318,9 @@ mutable struct _OrderedFactorOperator{T<:AbstractFloat,F} <: _BufferedLinearOper
   apply_rhs::Vector{T}
 end
 
+struct _DirectSolveCacheKey end
+const _DIRECT_SOLVE_CACHE_KEY = _DirectSolveCacheKey()
+
 # Prepared field-split Schur operator. The primary block uses a package-owned
 # approximate inverse, while the Schur block is handled by a cached direct solve
 # of a sparse matrix approximation.
@@ -388,9 +394,9 @@ function _default_system_linear_solve(system::AffineSystem{T},
   return _default_system_direct_solve(system)
 end
 
-# Direct reduced solve with a fill-reducing reordering. Symmetric positive
-# definite systems first try a Cholesky factorization; all others fall back to
-# the generic sparse backslash or user-provided linear solver.
+# Direct reduced solve with a cached ordered factorization. The cache lives on
+# the assembled system so repeated direct solves, or iterative fallbacks to the
+# direct path, do not refactor the same reduced matrix over and over again.
 function _ordered_system_data(system::AffineSystem{T}) where {T<:AbstractFloat}
   return _OrderedSystemData(system.matrix[system.ordering, system.ordering],
                             system.rhs[system.ordering])
@@ -400,17 +406,16 @@ function _unordered_solution(system::AffineSystem, ordered_values::AbstractVecto
   return ordered_values[system.inverse_ordering]
 end
 
-function _default_system_direct_solve(system::AffineSystem{T}) where {T<:AbstractFloat}
-  ordered = _ordered_system_data(system)
-
-  if system.symmetric
-    try
-      return _unordered_solution(system, cholesky(Symmetric(ordered.matrix)) \ ordered.rhs)
-    catch
-    end
+function _direct_operator(system::AffineSystem{T}) where {T<:AbstractFloat}
+  return get!(system.preconditioner_cache, _DIRECT_SOLVE_CACHE_KEY) do
+    _build_ordered_direct_operator(system.matrix)
   end
+end
 
-  return _unordered_solution(system, default_linear_solve(ordered.matrix, ordered.rhs))
+function _default_system_direct_solve(system::AffineSystem{T}) where {T<:AbstractFloat}
+  reduced_values = zeros(T, size(system.matrix, 1))
+  ldiv!(reduced_values, _direct_operator(system), system.rhs)
+  return reduced_values
 end
 
 # Small adapter to support user-provided solvers with or without an initial
