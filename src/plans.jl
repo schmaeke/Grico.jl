@@ -547,16 +547,24 @@ function _field_constraints(constraints, field::AbstractField)
   return matched
 end
 
-# Find the unique Dirichlet constraint, if any, that applies on this boundary
-# face for one already field-filtered constraint set.
-function _matching_dirichlet(constraints, face::FaceValues)
-  matched = nothing
+# Find the Dirichlet constraints that apply on one boundary face for one already
+# field-filtered constraint set. Multiple constraints are allowed on the same
+# face only when they target disjoint component subsets.
+function _matching_dirichlets(constraints, face::FaceValues, component_total::Int)
+  matched = Int[]
+  covered = falses(component_total)
 
-  for constraint in constraints
+  for index in eachindex(constraints)
+    constraint = constraints[index]
     _matches(face, constraint.boundary) || continue
-    matched === nothing ||
-      throw(ArgumentError("multiple Dirichlet constraints target the same boundary face"))
-    matched = constraint
+
+    for component in constraint.components
+      !covered[component] ||
+        throw(ArgumentError("multiple Dirichlet constraints target overlapping components on the same boundary face"))
+      covered[component] = true
+    end
+
+    push!(matched, index)
   end
 
   return matched
@@ -572,16 +580,25 @@ end
 function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{D,T},
                                      boundary_faces, constraints) where {D,T<:AbstractFloat}
   selected_faces = FaceValues[]
+  constraint_matches = falses(length(constraints))
+  component_total = component_count(slot.field)
 
   for face in boundary_faces
-    constraint = _matching_dirichlet(constraints, face)
-    constraint === nothing && continue
+    matched = _matching_dirichlets(constraints, face, component_total)
+    isempty(matched) && continue
     push!(selected_faces, face)
+
+    for index in matched
+      constraint_matches[index] = true
+    end
   end
 
+  all(constraint_matches) ||
+    throw(ArgumentError("Dirichlet constraint does not match any boundary face for field $(field_name(slot.field))"))
   isempty(selected_faces) && return Int[], spzeros(T, 0, 0), T[]
   operators = [_BoundaryContribution(constraint.boundary,
-                                     _DirichletProjection(slot.field, constraint.data))
+                                     _DirichletProjection(slot.field, constraint.components,
+                                                          constraint.data))
                for constraint in constraints]
   ndofs = dof_count(layout)
   max_local_dofs = maximum(face.local_dof_count for face in selected_faces)
@@ -620,24 +637,31 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
 end
 
 # Interpret user-supplied Dirichlet data as either scalar or vector-valued
-# boundary values with the correct component count.
-function _boundary_component_value(data, x, component::Int, component_total::Int,
-                                   ::Type{T}) where {T<:AbstractFloat}
-  value = data isa Function ? data(x) : data
-
-  if component_total == 1
-    value isa Tuple && return T(value[1])
-    value isa AbstractVector && return T(value[1])
-    return T(value)
+# boundary values for the selected component subset. Vector-valued data may
+# either match the selected subset or the full field component count.
+@inline function _selected_component_index(components::Tuple{Vararg{Int}}, component::Int)
+  for index in eachindex(components)
+    components[index] == component && return index
   end
+
+  throw(ArgumentError("selected component $component is not part of this Dirichlet constraint"))
+end
+
+function _dirichlet_component_value(data, x, component::Int, components::Tuple{Vararg{Int}},
+                                    component_total::Int,
+                                    ::Type{T}) where {T<:AbstractFloat}
+  value = data isa Function ? data(x) : data
+  selected_total = length(components)
+  selected_index = _selected_component_index(components, component)
 
   if value isa Tuple || value isa AbstractVector
-    length(value) == component_total ||
-      throw(ArgumentError("vector-valued boundary data must match the field component count"))
-    return T(value[component])
+    length(value) == selected_total && return T(value[selected_index])
+    length(value) == component_total && return T(value[component])
+    throw(ArgumentError("Dirichlet data must match the selected component count or the full field component count"))
   end
 
-  throw(ArgumentError("vector-valued field data must return a tuple or vector"))
+  selected_total == 1 || throw(ArgumentError("Dirichlet data for multiple selected components must return a tuple or vector"))
+  return T(value)
 end
 
 # Mean-value constraint compilation as explicit linear equations.
@@ -692,8 +716,9 @@ end
 
 # Auxiliary operator used to assemble the boundary L² projection system for
 # Dirichlet data.
-struct _DirichletProjection{F,G}
+struct _DirichletProjection{F,C,G}
   field::F
+  components::C
   data::G
 end
 
@@ -706,8 +731,8 @@ function face_matrix!(local_matrix, operator::_DirichletProjection, values::Face
   for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
-    for component in 1:data.component_count
-      offset = (component - 1) * mode_count
+    for component in operator.components
+      offset = _field_component_offset(data, component)
 
       for row_mode in 1:mode_count
         shape_row = data.values[row_mode, point_index]
@@ -726,7 +751,8 @@ end
 
 # Right-hand side of the boundary projection system against the prescribed
 # Dirichlet data.
-function face_rhs!(local_rhs, operator::_DirichletProjection{F,G}, values::FaceValues) where {F,G}
+function face_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
+                   values::FaceValues) where {F,C,G}
   block_data = block(local_rhs, values, operator.field)
   data = _field_values(values, operator.field)
   mode_count = data.local_mode_count
@@ -736,10 +762,10 @@ function face_rhs!(local_rhs, operator::_DirichletProjection{F,G}, values::FaceV
     point_data = point(values, point_index)
     weighted = weight(values, point_index)
 
-    for component in 1:data.component_count
-      target = _boundary_component_value(operator.data, point_data, component, data.component_count,
-                                         value_type)
-      offset = (component - 1) * mode_count
+    for component in operator.components
+      target = _dirichlet_component_value(operator.data, point_data, component, operator.components,
+                                          data.component_count, value_type)
+      offset = _field_component_offset(data, component)
 
       for mode_index in 1:mode_count
         block_data[offset+mode_index] += data.values[mode_index, point_index] * weighted * target
