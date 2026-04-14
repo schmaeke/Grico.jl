@@ -1263,6 +1263,77 @@ function cell_rhs!(local_rhs, operator::_TransferSource, values::CellValues)
   return nothing
 end
 
+# When the target space is fully DG, no local mode shares coefficients across
+# cells. The transfer mass matrix is therefore block diagonal with one dense
+# block per active target cell, so it is cheaper to solve those local systems
+# directly than to assemble one global sparse projection problem.
+function _is_fully_dg_space(space::HpSpace)
+  all(kind -> kind === :dg, continuity_policy(space))
+end
+
+function _checked_cellwise_single_term_mapping(cell::CellValues)
+  local_dofs = cell.local_dof_count
+  coefficient_tolerance = 1000 * eps(eltype(cell.single_term_coefficients))
+  length(cell.single_term_indices) >= local_dofs ||
+    throw(ArgumentError("cellwise DG transfer requires one single-term mapping per local dof"))
+  length(cell.single_term_coefficients) >= local_dofs ||
+    throw(ArgumentError("cellwise DG transfer requires one single-term coefficient per local dof"))
+
+  for local_dof in 1:local_dofs
+    cell.single_term_indices[local_dof] >= 1 ||
+      throw(ArgumentError("cellwise DG transfer requires each local dof to map to one global dof"))
+    abs(cell.single_term_coefficients[local_dof] - one(eltype(cell.single_term_coefficients))) <= coefficient_tolerance ||
+      throw(ArgumentError("cellwise DG transfer requires unit local-to-global coefficients"))
+  end
+
+  return nothing
+end
+
+@inline function _cellwise_transfer_linear_solve(local_matrix, local_rhs, linear_solve)
+  if linear_solve === default_linear_solve
+    return local_matrix \ local_rhs
+  end
+
+  return linear_solve(local_matrix, local_rhs)
+end
+
+function _cellwise_dg_transfer_state(plan, old_fields::Tuple, new_fields::Tuple, state::State,
+                                     transition::SpaceTransition;
+                                     linear_solve=default_linear_solve)
+  T = eltype(coefficients(state))
+  state_coefficients = zeros(T, dof_count(field_layout(plan)))
+  operators = ntuple(index -> (_TransferMass(new_fields[index]),
+                               _TransferSource(new_fields[index], old_fields[index], state,
+                                               transition)),
+                    length(old_fields))
+  max_local_dofs = isempty(plan.integration.cells) ? 0 :
+                   maximum(cell.local_dof_count for cell in plan.integration.cells)
+  local_matrix = zeros(T, max_local_dofs, max_local_dofs)
+  local_rhs = zeros(T, max_local_dofs)
+
+  for cell in plan.integration.cells
+    _checked_cellwise_single_term_mapping(cell)
+    local_dofs = cell.local_dof_count
+    matrix_view = view(local_matrix, 1:local_dofs, 1:local_dofs)
+    rhs_view = view(local_rhs, 1:local_dofs)
+    fill!(matrix_view, zero(T))
+    fill!(rhs_view, zero(T))
+
+    for (mass, source) in operators
+      cell_matrix!(matrix_view, mass, cell)
+      cell_rhs!(rhs_view, source, cell)
+    end
+
+    local_solution = _cellwise_transfer_linear_solve(matrix_view, rhs_view, linear_solve)
+
+    for local_dof in 1:local_dofs
+      state_coefficients[cell.single_term_indices[local_dof]] = local_solution[local_dof]
+    end
+  end
+
+  return State(plan, state_coefficients)
+end
+
 """
     transfer_state(transition, state, old_fields, new_fields; linear_solve=default_linear_solve)
     transfer_state(transition, state, old_field, new_field; linear_solve=default_linear_solve)
@@ -1278,7 +1349,10 @@ state.
 
 The transfer is purely geometric and variational: it depends on the old state,
 the source/target spaces, and the chosen linear solve path, but not on any
-specific PDE operator.
+specific PDE operator. On fully discontinuous target spaces, the transfer
+recognizes that the projection system is cellwise block diagonal and solves one
+local dense system per target cell instead of assembling a global sparse
+problem.
 """
 function transfer_state(transition::SpaceTransition, state::State, old_fields::Tuple,
                         new_fields::Tuple; linear_solve=default_linear_solve)
@@ -1301,6 +1375,12 @@ function transfer_state(transition::SpaceTransition, state::State, old_fields::T
   end
 
   plan = compile(problem)
+
+  if _is_fully_dg_space(target_space(transition))
+    return _cellwise_dg_transfer_state(plan, old_fields, new_fields, state, transition;
+                                       linear_solve=linear_solve)
+  end
+
   return State(plan, solve(assemble(plan); linear_solve=linear_solve))
 end
 

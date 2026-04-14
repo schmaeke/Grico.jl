@@ -474,6 +474,31 @@ end
   end
 end
 
+@testset "DG Transfer Uses Cellwise Solve Path" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  space = HpSpace(domain,
+                  SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((u,)), [2.5])
+
+  refine_plan = AdaptivityPlan(space)
+  request_h_refinement!(refine_plan, 1, 1)
+  refine_transition = transition(refine_plan)
+  refined = target_space(refine_transition)
+  refined_u = adapted_field(refine_transition, u)
+  calls = Ref(0)
+  refined_state = transfer_state(refine_transition, state, u, refined_u;
+                                 linear_solve=(A, b) -> begin
+                                   calls[] += 1
+                                   return A \ b
+                                 end)
+
+  @test calls[] == active_leaf_count(refined)
+  for x in ((0.0,), (0.2,), (0.5,), (0.8,), (1.0,))
+    @test _field_value_at_point(refined_u, refined_state, x) ≈ 2.5 atol = ADAPTIVITY_TOL
+  end
+end
+
 @testset "DG Jump Refinement Defaults" begin
   domain = Domain((0.0,), (1.0,), (2,))
   space = HpSpace(domain,
