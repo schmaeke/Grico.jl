@@ -537,6 +537,24 @@ end
   @test assembled_rhs ≈ expected_rhs atol = ASSEMBLY_TOL
 end
 
+@testset "Filtered Interface Assembly" begin
+  background = Grico.Domain((0.0,), (3.0,), (3,))
+  domain = Grico.PhysicalDomain(background,
+                                Grico.ImplicitRegion(x -> x[1] - 1.5; subdivision_depth=1))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(1), continuity=:dg))
+  u = Grico.ScalarField(space; name=:u)
+  problem = Grico.AffineProblem(u)
+  Grico.add_interface!(problem, InterfaceStamp(u))
+
+  plan = Grico.compile(problem)
+  @test length(plan.integration.interfaces) == 1
+  interface = only(plan.integration.interfaces)
+  @test interface.minus_leaf == 1
+  @test interface.plus_leaf == 2
+end
+
 @testset "DG Interface Assembly" begin
   domain = Grico.Domain((0.0,), (1.0,), (2,))
   space = Grico.HpSpace(domain,
@@ -1385,13 +1403,35 @@ end
         nothing
 end
 
+@testset "Physical Domain Compile" begin
+  background = Grico.Domain((0.0,), (3.0,), (3,))
+  domain = Grico.PhysicalDomain(background, Grico.ImplicitRegion(x -> x[1] - 1.5;
+                                                                 subdivision_depth=1))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(2)))
+  u = Grico.ScalarField(space; name=:u)
+  problem = Grico.AffineProblem(u)
+  Grico.add_cell!(problem, MassCoupling(u, u, 1.0))
+  plan = Grico.compile(problem)
+
+  @test Grico.active_leaves(space) == [1, 2]
+  @test length(plan.integration.cells) == 2
+  @test plan.integration.cells[1].leaf == 1
+  @test plan.integration.cells[2].leaf == 2
+  @test length(plan.integration.cells[1].weights) == 3
+  @test sum(plan.integration.cells[2].weights) ≈ 0.5 atol = ASSEMBLY_TOL
+end
+
 @testset "Finite Cell Default Backend Assembly" begin
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                            degree=Grico.UniformDegree(1)))
   u = Grico.ScalarField(space; name=:u)
-  quadrature = Grico.finite_cell_quadrature(space, 1, x -> x[1] - 0.5; subdivision_depth=1)
+  quadrature = Grico.finite_cell_quadrature(Grico.domain(space), 1,
+                                            Grico.cell_quadrature_shape(space, 1),
+                                            x -> x[1] - 0.5; subdivision_depth=1)
   @test quadrature !== nothing
 
   problem = Grico.AffineProblem(u)

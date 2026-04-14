@@ -60,6 +60,26 @@ end
   @test all(cell_degrees(refined, leaf) == (2, 2) for leaf in active_leaves(refined))
 end
 
+@testset "Physical Domain Adaptivity" begin
+  background = Domain((0.0,), (3.0,), (3,))
+  region = ImplicitRegion(x -> x[1] - 1.5; subdivision_depth=1)
+  domain = PhysicalDomain(background, region)
+  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
+  plan = AdaptivityPlan(space)
+
+  @test active_leaves(space) == [1, 2]
+  @test active_leaves(plan) == [1, 2]
+  @test active_leaves(target_space(transition(plan))) == [1, 2]
+
+  request_h_refinement!(plan, 2, 1)
+  summary = adaptivity_summary(plan)
+  refined = target_space(transition(plan))
+
+  @test summary.marked_leaf_count == 1
+  @test summary.h_refinement_leaf_count == 1
+  @test active_leaves(refined) == [1, 4]
+end
+
 @testset "Periodic Transition" begin
   domain = Domain((0.0,), (1.0,), (2,); periodic=true)
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))

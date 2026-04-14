@@ -31,16 +31,18 @@ import Grico: cell_matrix!, surface_matrix!, surface_rhs!
 # 1. choose the annulus geometry and discretization parameters,
 # 2. define the volume and surface weak-form contributions,
 # 3. build the background mesh and embedded boundary representation,
-# 4. attach finite-cell quadratures on all active leaves,
+# 4. wrap the background mesh in a physical domain so trimming and cut-cell
+#    quadrature become automatic,
 # 5. solve, verify, and export.
 
 # ---------------------------------------------------------------------------
 # 1. Problem geometry and discretization parameters
 # ---------------------------------------------------------------------------
 #
-# The physical domain is the annulus, but the finite-element space lives on the
-# enclosing square. Only the quadrature rules "know" which part of each
-# Cartesian leaf belongs to the physical domain.
+# The physical domain is the annulus, but the finite-element space still starts
+# from the enclosing square. `PhysicalDomain` trims leaves that are fully
+# outside the annulus and lets compilation inject finite-cell quadratures on
+# the remaining cut leaves automatically.
 const INNER_RADIUS = 0.35
 const OUTER_RADIUS = 1.0
 const ROOT_COUNTS = (2, 2)
@@ -222,10 +224,8 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
                                              surface_point_count=SURFACE_POINT_COUNT,
                                              fcm_subdivision_depth=FCM_SUBDIVISION_DEPTH,
                                              penalty=NITSCHE_PENALTY)
-  domain = Domain((-outer_radius, -outer_radius), (2 * outer_radius, 2 * outer_radius), root_counts)
-  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
-  u = ScalarField(space; name=:u)
-
+  background = Domain((-outer_radius, -outer_radius), (2 * outer_radius, 2 * outer_radius),
+                      root_counts)
   outer_points, outer_segments = circle_points_segments(outer_radius, segment_count)
   inner_points, inner_segments = circle_points_segments(inner_radius, segment_count;
                                                         clockwise=true)
@@ -241,25 +241,18 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
   annulus_levelset =
     x -> max(hypot(x[1], x[2]) - outer_radius, inner_radius - hypot(x[1], x[2]))
   is_physical = x -> annulus_levelset(x) <= 0.0
+  region = ImplicitRegion(annulus_levelset; subdivision_depth=fcm_subdivision_depth)
+  domain = PhysicalDomain(background, region)
+  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
+  u = ScalarField(space; name=:u)
 
   problem = AffineProblem(u)
   add_cell!(problem, Diffusion(u))
   add_surface!(problem, NitscheDirichlet(u, exact_solution, penalty))
   add_embedded_surface!(problem, boundary)
 
-  verification_quadratures = Pair{Int,AbstractQuadrature{2,Float64}}[]
-
-  for leaf in active_leaves(space)
-    quadrature = finite_cell_quadrature(space, leaf, annulus_levelset;
-                                        subdivision_depth=fcm_subdivision_depth)
-    quadrature === nothing &&
-      error("annulus setup expected every leaf to intersect the physical domain")
-    add_cell_quadrature!(problem, leaf, quadrature)
-    push!(verification_quadratures, leaf => quadrature)
-  end
-
   return (; domain, space, u, boundary, exact_solution, annulus_levelset, is_physical, problem,
-          verification_quadratures, inner_radius, outer_radius, root_counts, degree,
+          inner_radius, outer_radius, root_counts, degree,
           segment_count, surface_point_count, fcm_subdivision_depth, penalty)
 end
 
@@ -269,8 +262,7 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
   context = build_annular_plate_nitsche_context(; kwargs...)
   plan = compile(context.problem)
   state = State(plan, solve(assemble(plan)))
-  error_value = relative_l2_error(state, context.u, context.exact_solution; plan=plan,
-                                  cell_quadratures=context.verification_quadratures)
+  error_value = relative_l2_error(state, context.u, context.exact_solution; plan=plan)
   vtk_path = nothing
 
   if write_vtk
@@ -278,18 +270,19 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
     current_space = field_space(context.u)
     current_grid = grid(current_space)
     mkpath(output_directory)
-    vtk_path = write_vtk(joinpath(output_directory, "annular_plate_nitsche"), state;
-                         point_data=(physical=x -> context.is_physical(x) ? 1.0 : 0.0,
-                                     abs_error=(x, values) -> context.is_physical(x) ?
-                                                              abs(values.u -
-                                                                  context.exact_solution(x)) :
-                                                              0.0),
-                         cell_data=(leaf=leaf -> Float64(leaf),
-                                    level=leaf -> Float64.(level(current_grid, leaf)),
-                                    degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
-                         field_data=(relative_l2_error=error_value,),
-                         subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE,
-                         append=true, compress=true, ascii=false)
+    vtk_path = Grico.write_vtk(joinpath(output_directory, "annular_plate_nitsche"), state;
+                               point_data=(physical=x -> context.is_physical(x) ? 1.0 : 0.0,
+                                           abs_error=(x, values) -> context.is_physical(x) ?
+                                                                    abs(values.u -
+                                                                        context.exact_solution(x)) :
+                                                                    0.0),
+                               cell_data=(leaf=leaf -> Float64(leaf),
+                                          level=leaf -> Float64.(level(current_grid, leaf)),
+                                          degree=leaf -> Float64.(cell_degrees(current_space,
+                                                                               leaf))),
+                               field_data=(relative_l2_error=error_value,),
+                               subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE,
+                               append=true, compress=true, ascii=false)
     print_summary && println("  vtk  $vtk_path")
   end
 

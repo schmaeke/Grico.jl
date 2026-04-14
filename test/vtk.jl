@@ -144,6 +144,20 @@ end
     @test length(unique(vtk_data_array(xml, "connectivity", Int))) == 50
   end
 
+  filtered_space = HpSpace(PhysicalDomain(Domain((0.0,), (3.0,), (3,)),
+                                          ImplicitRegion(x -> x[1] - 1.5;
+                                                         subdivision_depth=1)),
+                           SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  filtered_field = ScalarField(filtered_space; name=:filtered)
+  filtered_state = State(FieldLayout((filtered_field,)), fill(1.0, scalar_dof_count(filtered_space)))
+
+  mktempdir() do directory
+    path = write_vtk(joinpath(directory, "filtered"), filtered_state; append=false, ascii=true)
+    xml = read(path, String)
+
+    @test vtk_xml_attribute(xml, "NumberOfCells") == "2"
+  end
+
   mktempdir() do directory
     paths = [write_vtk(joinpath(directory, "series_0000"), state; append=false, ascii=true),
              write_vtk(joinpath(directory, "series_0001"), state; append=false, ascii=true)]

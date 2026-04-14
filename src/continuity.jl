@@ -149,10 +149,9 @@ end
 # common finest logical lattice, and repeated degree patterns are cached so the
 # later compilation phases can work with integer interval arithmetic and shared
 # local mode tables.
-function _build_space_state(domain::Domain{D,T}, basis::B,
+function _build_space_state(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer}, basis::B,
                             leaf_degrees::Vector{NTuple{D,Int}}) where {D,T<:AbstractFloat,B}
   grid_data = grid(domain)
-  active = active_leaves(grid_data)
   length(leaf_degrees) == length(active) ||
     throw(ArgumentError("leaf degree data must match the active-leaf count"))
   finest_levels = ntuple(axis -> maximum(level(grid_data, leaf, axis) for leaf in active; init=0),
@@ -193,9 +192,10 @@ end
 # face algebra at all. Fully DG spaces deliberately skip that work, while any
 # policy with at least one CG axis introduces provisional variables only for the
 # local modes that actually participate in CG trace coupling.
-function _enumerate_space_modes(domain::Domain{D,T}, basis::B, leaf_degrees::Vector{NTuple{D,Int}},
+function _enumerate_space_modes(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer}, basis::B,
+                                leaf_degrees::Vector{NTuple{D,Int}},
                                 continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat,B}
-  state = _build_space_state(domain, basis, leaf_degrees)
+  state = _build_space_state(domain, active, basis, leaf_degrees)
   _enumerate_trace_modes!(state, continuity_policy)
   return state
 end
@@ -400,7 +400,8 @@ function _internal_face_pairs(state::_SpaceBuildState{D},
                               continuity_policy::_AxisContinuity{D}) where {D}
   pairs = Tuple{Int,Int,Int,Int}[]
 
-  for (leaf, axis, other) in _upper_face_neighbor_specs(state.grid)
+  for (leaf, axis, other) in _filtered_upper_face_neighbor_specs(state.grid, state.active_leaves,
+                                                                 state.leaf_to_index)
     _is_cg_axis(continuity_policy, axis) || continue
     push!(pairs,
           (@inbounds(state.leaf_to_index[leaf]), @inbounds(state.leaf_to_index[other]), axis,

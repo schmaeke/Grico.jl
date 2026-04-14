@@ -2357,7 +2357,8 @@ end
 # Build a low-order geometric coarse prolongation by interpolating each reduced
 # dof to the multilinear basis on the root-grid vertices of its field component.
 function _geometric_coarse_prolongation(::Type{T}, layout::FieldLayout{D,T},
-                                        domain_data::Domain{D,T}, grid_data::CartesianGrid{D},
+                                        domain_data::AbstractDomain{D,T},
+                                        grid_data::CartesianGrid{D},
                                         support_sums::Matrix{T}, support_counts::Vector{Int},
                                         solve_dofs::Vector{Int}) where {D,T<:AbstractFloat}
   isempty(solve_dofs) && return spzeros(T, 0, 0)
@@ -2385,7 +2386,8 @@ end
 # point.
 function _append_root_basis_weights!(rows::Vector{Int}, cols::Vector{Int}, values::Vector{T},
                                      reduced_dof::Int, component::Int, point::NTuple{D,T},
-                                     domain_data::Domain{D,T}, root_counts::NTuple{D,Int},
+                                     domain_data::AbstractDomain{D,T},
+                                     root_counts::NTuple{D,Int},
                                      vertex_counts::NTuple{D,Int},
                                      vertices_per_component::Int) where {D,T<:AbstractFloat}
   lower = Vector{Int}(undef, D)

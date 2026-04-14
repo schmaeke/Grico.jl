@@ -86,7 +86,7 @@ end
 
 Pair a Cartesian refinement tree with its physical affine geometry.
 
-`Domain` is the user-facing mesh object of the library. It combines the logical
+`Domain` is the background mesh object of the library. It combines the logical
 refinement topology stored in a `CartesianGrid` with the physical affine box
 stored in a `Geometry`, so queries such as cell bounds, volumes, face measures,
 and reference-to-physical mappings can be expressed directly on one object.
@@ -98,11 +98,14 @@ independent of physical scaling.
 
 Most user-facing geometric queries are provided on `Domain` so callers can work
 with one combined object instead of passing topology and geometry separately.
-The lower-level `Geometry` plus `CartesianGrid` methods remain available because
-the assembly and integration layers sometimes operate on those components
-directly.
+Higher layers may then wrap that background domain, for example in
+[`PhysicalDomain`](@ref), without changing these geometric queries. The
+lower-level `Geometry` plus `CartesianGrid` methods remain available because the
+assembly and integration layers sometimes operate on those components directly.
 """
-struct Domain{D,T<:AbstractFloat}
+abstract type AbstractDomain{D,T<:AbstractFloat} end
+
+struct Domain{D,T<:AbstractFloat} <: AbstractDomain{D,T}
   grid::CartesianGrid{D}
   geometry::Geometry{D,T}
 
@@ -143,7 +146,7 @@ This equals the number of coordinate axes and therefore the length of tuples
 such as origins, extents, logical coordinates, and physical points.
 """
 dimension(geometry::Geometry{D}) where {D} = D
-dimension(domain::Domain) = dimension(domain.grid)
+dimension(domain::AbstractDomain) = dimension(grid(domain))
 
 """
     grid(domain)
@@ -165,8 +168,8 @@ Use this when a routine works with physical coordinates, cell sizes, or
 reference-to-physical mappings.
 """
 geometry(domain::Domain) = domain.geometry
-periodic_axes(domain::Domain) = periodic_axes(grid(domain))
-is_periodic_axis(domain::Domain, axis::Integer) = is_periodic_axis(grid(domain), axis)
+periodic_axes(domain::AbstractDomain) = periodic_axes(grid(domain))
+is_periodic_axis(domain::AbstractDomain, axis::Integer) = is_periodic_axis(grid(domain), axis)
 
 """
     origin(geometry)
@@ -181,11 +184,11 @@ The origin is the lower corner `x₀` of the rectangular domain
 `Ω = ∏ₐ [x₀ₐ, x₀ₐ + Lₐ]`.
 """
 origin(geometry::Geometry) = geometry.origin
-origin(domain::Domain) = origin(domain.geometry)
+origin(domain::AbstractDomain) = origin(geometry(domain))
 function origin(geometry::Geometry, axis::Integer)
   geometry.origin[_checked_index(axis, dimension(geometry), "axis")]
 end
-origin(domain::Domain, axis::Integer) = origin(domain.geometry, axis)
+origin(domain::AbstractDomain, axis::Integer) = origin(geometry(domain), axis)
 
 """
     extent(geometry)
@@ -199,11 +202,11 @@ selected axis.
 The extent stores the side lengths `Lₐ` of the rectangular domain.
 """
 extent(geometry::Geometry) = geometry.extent
-extent(domain::Domain) = extent(domain.geometry)
+extent(domain::AbstractDomain) = extent(geometry(domain))
 function extent(geometry::Geometry, axis::Integer)
   geometry.extent[_checked_index(axis, dimension(geometry), "axis")]
 end
-extent(domain::Domain, axis::Integer) = extent(domain.geometry, axis)
+extent(domain::AbstractDomain, axis::Integer) = extent(geometry(domain), axis)
 
 # Copy semantics.
 
@@ -229,7 +232,7 @@ then a cell with logical level `ℓₐ` has size
 This is the basic metric quantity from which cell bounds, face measures, and
 Jacobian factors are derived.
 """
-function cell_size(domain::Domain, cell::Integer, axis::Integer)
+function cell_size(domain::AbstractDomain, cell::Integer, axis::Integer)
   cell_size(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -243,8 +246,8 @@ selected axis.
 The lower corner is obtained by combining the cell's logical coordinate with
 the affine root scaling of the domain.
 """
-cell_lower(domain::Domain, cell::Integer) = cell_lower(geometry(domain), grid(domain), cell)
-function cell_lower(domain::Domain, cell::Integer, axis::Integer)
+cell_lower(domain::AbstractDomain, cell::Integer) = cell_lower(geometry(domain), grid(domain), cell)
+function cell_lower(domain::AbstractDomain, cell::Integer, axis::Integer)
   cell_lower(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -258,8 +261,8 @@ selected axis.
 Together with [`cell_lower`](@ref), this describes the closed affine box of the
 cell in physical coordinates.
 """
-cell_upper(domain::Domain, cell::Integer) = cell_upper(geometry(domain), grid(domain), cell)
-function cell_upper(domain::Domain, cell::Integer, axis::Integer)
+cell_upper(domain::AbstractDomain, cell::Integer) = cell_upper(geometry(domain), grid(domain), cell)
+function cell_upper(domain::AbstractDomain, cell::Integer, axis::Integer)
   cell_upper(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -273,8 +276,8 @@ selected axis.
 Because the geometry is axis-aligned and affine, the center is simply the
 midpoint of the lower and upper bounds on each axis.
 """
-cell_center(domain::Domain, cell::Integer) = cell_center(geometry(domain), grid(domain), cell)
-function cell_center(domain::Domain, cell::Integer, axis::Integer)
+cell_center(domain::AbstractDomain, cell::Integer) = cell_center(geometry(domain), grid(domain), cell)
+function cell_center(domain::AbstractDomain, cell::Integer, axis::Integer)
   cell_center(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -289,7 +292,7 @@ For an axis-aligned affine cell, the measure is
 
 where `hₐ` are the per-axis cell sizes.
 """
-cell_volume(domain::Domain, cell::Integer) = cell_volume(geometry(domain), grid(domain), cell)
+cell_volume(domain::AbstractDomain, cell::Integer) = cell_volume(geometry(domain), grid(domain), cell)
 
 """
     face_measure(domain, cell, axis)
@@ -299,7 +302,7 @@ Return the physical measure of the face of `cell` normal to `axis`.
 In `D` dimensions this is a `(D-1)`-dimensional measure equal to the product of
 the cell sizes on all tangential axes.
 """
-function face_measure(domain::Domain, cell::Integer, axis::Integer)
+function face_measure(domain::AbstractDomain, cell::Integer, axis::Integer)
   face_measure(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -317,7 +320,7 @@ map is
 
 where `⊙` denotes componentwise multiplication.
 """
-function map_from_unit_cube(domain::Domain{D}, cell::Integer, ξ::NTuple{D,<:Real}) where {D}
+function map_from_unit_cube(domain::AbstractDomain{D}, cell::Integer, ξ::NTuple{D,<:Real}) where {D}
   map_from_unit_cube(geometry(domain), grid(domain), cell, ξ)
 end
 
@@ -333,7 +336,7 @@ quadrature code:
 
 where `x_c` is the cell center and `h` is the vector of cell sizes.
 """
-function map_from_biunit_cube(domain::Domain{D}, cell::Integer, ξ::NTuple{D,<:Real}) where {D}
+function map_from_biunit_cube(domain::AbstractDomain{D}, cell::Integer, ξ::NTuple{D,<:Real}) where {D}
   map_from_biunit_cube(geometry(domain), grid(domain), cell, ξ)
 end
 
@@ -346,7 +349,7 @@ Map a physical point `x` in `cell` back to biunit reference coordinates
 This is the inverse of [`map_from_biunit_cube`](@ref) for the affine geometry
 used by this library.
 """
-function map_to_biunit_cube(domain::Domain{D}, cell::Integer, x::NTuple{D,<:Real}) where {D}
+function map_to_biunit_cube(domain::AbstractDomain{D}, cell::Integer, x::NTuple{D,<:Real}) where {D}
   map_to_biunit_cube(geometry(domain), grid(domain), cell, x)
 end
 
@@ -359,7 +362,7 @@ Return the diagonal Jacobian entry `∂xₐ/∂ξₐ` of the map from `[0,1]^D` 
 Because the geometry is axis-aligned and affine, the Jacobian is diagonal and
 this entry equals the cell size on that axis.
 """
-function jacobian_diagonal_from_unit_cube(domain::Domain, cell::Integer, axis::Integer)
+function jacobian_diagonal_from_unit_cube(domain::AbstractDomain, cell::Integer, axis::Integer)
   jacobian_diagonal_from_unit_cube(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -372,7 +375,7 @@ Return the diagonal Jacobian entry `∂xₐ/∂ξₐ` of the map from `[-1,1]^D`
 Relative to the unit-cube map, the factor is halved because each biunit
 reference interval has length `2`.
 """
-function jacobian_diagonal_from_biunit_cube(domain::Domain, cell::Integer, axis::Integer)
+function jacobian_diagonal_from_biunit_cube(domain::AbstractDomain, cell::Integer, axis::Integer)
   jacobian_diagonal_from_biunit_cube(geometry(domain), grid(domain), cell, axis)
 end
 
@@ -384,7 +387,7 @@ Return the Jacobian determinant of the affine map from `[0,1]^D` to `cell`.
 For the axis-aligned geometry used here, this determinant equals the physical
 cell measure.
 """
-function jacobian_determinant_from_unit_cube(domain::Domain, cell::Integer)
+function jacobian_determinant_from_unit_cube(domain::AbstractDomain, cell::Integer)
   jacobian_determinant_from_unit_cube(geometry(domain), grid(domain), cell)
 end
 
@@ -396,7 +399,7 @@ Return the Jacobian determinant of the affine map from `[-1,1]^D` to `cell`.
 This equals the physical cell measure divided by `2^D`, reflecting the fact
 that the biunit reference box has side length `2` on every axis.
 """
-function jacobian_determinant_from_biunit_cube(domain::Domain, cell::Integer)
+function jacobian_determinant_from_biunit_cube(domain::AbstractDomain, cell::Integer)
   jacobian_determinant_from_biunit_cube(geometry(domain), grid(domain), cell)
 end
 
@@ -408,7 +411,7 @@ Write the image of `ξ ∈ [0,1]^D` in `cell` into the preallocated vector `x`.
 This is the allocation-free counterpart of [`map_from_unit_cube`](@ref). The
 length of `x` must equal the spatial dimension.
 """
-function map_from_unit_cube!(x::AbstractVector, domain::Domain{D}, cell::Integer,
+function map_from_unit_cube!(x::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                              ξ::NTuple{D,<:Real}) where {D}
   map_from_unit_cube!(x, geometry(domain), grid(domain), cell, ξ)
 end
@@ -421,7 +424,7 @@ Write the image of `ξ ∈ [-1,1]^D` in `cell` into the preallocated vector `x`.
 This is the allocation-free counterpart of [`map_from_biunit_cube`](@ref). The
 length of `x` must equal the spatial dimension.
 """
-function map_from_biunit_cube!(x::AbstractVector, domain::Domain{D}, cell::Integer,
+function map_from_biunit_cube!(x::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                                ξ::NTuple{D,<:Real}) where {D}
   map_from_biunit_cube!(x, geometry(domain), grid(domain), cell, ξ)
 end
@@ -435,7 +438,7 @@ Write the inverse biunit reference coordinates of the physical point `x` in
 This is the allocation-free counterpart of [`map_to_biunit_cube`](@ref). The
 length of `ξ` must equal the spatial dimension.
 """
-function map_to_biunit_cube!(ξ::AbstractVector, domain::Domain{D}, cell::Integer,
+function map_to_biunit_cube!(ξ::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                              x::NTuple{D,<:Real}) where {D}
   map_to_biunit_cube!(ξ, geometry(domain), grid(domain), cell, x)
 end

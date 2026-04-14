@@ -865,6 +865,21 @@ function _upper_face_neighbor_specs(grid::CartesianGrid{D}) where {D}
   return specs
 end
 
+function _filtered_upper_face_neighbor_specs(grid::CartesianGrid{D},
+                                             active::AbstractVector{<:Integer},
+                                             leaf_to_index::AbstractVector{<:Integer}) where {D}
+  specs = Tuple{Int,Int,Int}[]
+
+  for leaf in active, axis in 1:D
+    for other in opposite_active_leaves(grid, leaf, axis, UPPER)
+      @inbounds leaf_to_index[other] == 0 && continue
+      push!(specs, (leaf, axis, other))
+    end
+  end
+
+  return specs
+end
+
 # Input normalization and low-level argument checks.
 
 # Normalize the periodicity specification to a per-axis tuple and validate its

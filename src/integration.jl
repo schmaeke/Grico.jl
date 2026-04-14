@@ -958,7 +958,8 @@ function _max_local_dof_count(integration::_CompiledIntegration)
   return max_local
 end
 
-@inline function _inverse_jacobian(domain_data::Domain{D,T}, leaf::Int) where {D,T<:AbstractFloat}
+@inline function _inverse_jacobian(domain_data::AbstractDomain{D,T},
+                                   leaf::Int) where {D,T<:AbstractFloat}
   return ntuple(axis -> inv(jacobian_diagonal_from_biunit_cube(domain_data, leaf, axis)), D)
 end
 
@@ -1122,7 +1123,8 @@ end
 # only needs to build the shared quadrature patch and the two one-sided field
 # traces.
 function _compile_interfaces(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
-  specs = _upper_face_neighbor_specs(grid(layout.slots[1].space))
+  space = layout.slots[1].space
+  specs = _filtered_upper_face_neighbor_specs(grid(space), space.active_leaves, space.leaf_to_index)
   isempty(specs) && return InterfaceValues[]
   return _compile_item_collection(specs) do spec
     _compile_interface(layout, spec...)
@@ -1167,8 +1169,8 @@ end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{D},
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat}
-  grid_data = grid(layout.slots[1].space)
-  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(grid_data, surface, D),
+  space = layout.slots[1].space
+  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(space, surface, D),
                                       tag)]
 end
 
@@ -1179,7 +1181,7 @@ end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::EmbeddedSurface,
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat}
-  quadratures = surface_quadratures(surface, layout.slots[1].space.domain)
+  quadratures = surface_quadratures(surface, layout.slots[1].space)
   isempty(quadratures) && return SurfaceValues[]
   return [_compile_surface_quadrature(layout, quadrature, tag) for quadrature in quadratures]
 end
@@ -1249,12 +1251,28 @@ end
 
 # Parse and validate per-cell quadrature overrides attached to a problem. The
 # reference-point checks below enforce that custom rules are still defined on
-# the standard biunit reference cell `[-1, 1]^D`.
+# the standard biunit reference cell `[-1, 1]^D`. Plain background domains have
+# no automatic overrides; `PhysicalDomain`s opt in through `_default_cell_quadrature`.
+function _automatic_cell_quadrature_overrides(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
+  overrides = Dict{Int,AbstractQuadrature{D,T}}()
+  space = layout.slots[1].space
+
+  for leaf in active_leaves(space)
+    quadrature_shape = ntuple(axis -> maximum(cell_quadrature_shape(slot.space, leaf)[axis]
+                                              for slot in layout.slots), D)
+    quadrature = _default_cell_quadrature(domain(space), leaf, quadrature_shape)
+    quadrature === nothing || (overrides[leaf] = quadrature)
+  end
+
+  return overrides
+end
+
 function _cell_quadrature_overrides(layout::FieldLayout{D,T},
                                     cell_quadratures) where {D,T<:AbstractFloat}
-  isempty(cell_quadratures) && return Dict{Int,AbstractQuadrature{D,T}}()
-  overrides = Dict{Int,AbstractQuadrature{D,T}}()
-  grid_data = grid(layout.slots[1].space)
+  overrides = _automatic_cell_quadrature_overrides(layout)
+  space = layout.slots[1].space
+  grid_data = grid(space)
+  explicit = Set{Int}()
 
   for attachment in cell_quadratures
     if attachment isa _CellQuadratureAttachment
@@ -1270,28 +1288,26 @@ function _cell_quadrature_overrides(layout::FieldLayout{D,T},
     end
 
     checked_leaf = _checked_cell(grid_data, leaf)
-    is_active_leaf(grid_data, checked_leaf) ||
-      throw(ArgumentError("cell quadrature may only be attached to active leaves"))
-    haskey(overrides, checked_leaf) &&
+    _checked_active_leaf_index(grid_data, space.leaf_to_index, checked_leaf, "cell quadrature")
+    checked_leaf in explicit &&
       throw(ArgumentError("duplicate cell quadrature attachment for leaf $checked_leaf"))
     dimension(quadrature) == D ||
       throw(ArgumentError("cell quadrature dimension must match the problem dimension"))
     _check_reference_quadrature(quadrature)
+    push!(explicit, checked_leaf)
     overrides[checked_leaf] = quadrature
   end
 
   return overrides
 end
 
-function _checked_surface_quadrature(grid_data::CartesianGrid{D}, surface,
+function _checked_surface_quadrature(space::HpSpace{D}, surface,
                                      dimension_count::Int) where {D}
   surface isa SurfaceQuadrature ||
     throw(ArgumentError("surface quadrature attachments must be SurfaceQuadrature instances"))
   dimension(surface.quadrature) == dimension_count ||
     throw(ArgumentError("surface quadrature dimension must match the problem dimension"))
-  checked_leaf = _checked_cell(grid_data, surface.leaf)
-  is_active_leaf(grid_data, checked_leaf) ||
-    throw(ArgumentError("surface quadrature may only be attached to active leaves"))
+  _checked_active_leaf_index(grid(space), space.leaf_to_index, surface.leaf, "surface quadrature")
   _check_reference_quadrature(surface.quadrature)
   return surface
 end
@@ -1315,7 +1331,7 @@ end
 # For embedded surfaces, the reference quadrature carries normals in reference
 # coordinates. Mapping a codimension-1 measure requires the usual Piola-type
 # scaling: `dΓ = det(J) / ‖J n̂‖ dΓ̂` for diagonal affine `J`.
-function _embedded_surface_weight_scale(domain_data::Domain{D,T}, leaf::Int,
+function _embedded_surface_weight_scale(domain_data::AbstractDomain{D,T}, leaf::Int,
                                         normal_data::NTuple{D,T}) where {D,T<:AbstractFloat}
   det_jacobian = jacobian_determinant_from_biunit_cube(domain_data, leaf)
   mapped_normal = ntuple(axis -> jacobian_diagonal_from_biunit_cube(domain_data, leaf, axis) *
@@ -1324,7 +1340,7 @@ function _embedded_surface_weight_scale(domain_data::Domain{D,T}, leaf::Int,
 end
 
 # Map a reference-space surface normal to the corresponding physical unit normal.
-function _physical_surface_normal(domain_data::Domain{D,T}, leaf::Int,
+function _physical_surface_normal(domain_data::AbstractDomain{D,T}, leaf::Int,
                                   normal_data::NTuple{D,T}) where {D,T<:AbstractFloat}
   transformed = ntuple(axis -> normal_data[axis] /
                                jacobian_diagonal_from_biunit_cube(domain_data, leaf, axis), D)
@@ -1523,7 +1539,7 @@ end
 # while the fixed normal coordinate is placed on the minus and plus faces
 # separately. This is what allows the same interface machinery to handle both
 # ordinary interior faces and periodic face pairings.
-function _interface_face_points(::Type{T}, domain_data::Domain{D,T}, minus_leaf::Int,
+function _interface_face_points(::Type{T}, domain_data::AbstractDomain{D,T}, minus_leaf::Int,
                                 face_axis::Int, minus_side::Int, plus_leaf::Int, plus_side::Int,
                                 shape::NTuple{D,Int}) where {D,T<:AbstractFloat}
   minus_coordinate = minus_side == LOWER ? cell_lower(domain_data, minus_leaf, face_axis) :

@@ -35,7 +35,7 @@
 Abstract supertype for policies that assign polynomial degrees to active leaves
 of an `HpSpace`.
 
-Degree policies are evaluated against a `Domain` and determine the tuple of
+Degree policies are evaluated against a domain object and determine the tuple of
 one-dimensional polynomial degrees used on each active cell. They separate the
 question "which local degree should this leaf use?" from the later continuity
 and compilation machinery that turns those choices into a compiled space with
@@ -124,7 +124,7 @@ intended for user-driven anisotropic degree assignment.
 
 The callback is evaluated on the active leaves of the current domain, so it can
 react to geometric position, refinement level, leaf index, periodicity, or any
-other information accessible from the `Domain`.
+other information accessible from the domain.
 """
 struct ByLeafDegrees{F} <: AbstractDegreePolicy
   f::F
@@ -187,6 +187,7 @@ tuple with one continuity kind per axis. The symbols mean:
 - `:cg`: neighboring leaves share one continuous trace across interfaces normal
   to that axis,
 - `:dg`: leaves keep independent trace coefficients across those interfaces.
+
 """
 struct SpaceOptions{B<:AbstractBasisFamily,D<:AbstractDegreePolicy,Q<:AbstractQuadraturePolicy,C}
   basis::B
@@ -228,9 +229,9 @@ function SpaceOptions(; basis::AbstractBasisFamily=TrunkBasis(),
                       quadrature::AbstractQuadraturePolicy=DegreePlusQuadrature(1), continuity=:cg)
   checked_continuity = _checked_continuity_spec(continuity)
   return SpaceOptions{typeof(basis),typeof(degree),typeof(quadrature),typeof(checked_continuity)}(basis,
-                                                                                                  degree,
-                                                                                                  quadrature,
-                                                                                                  checked_continuity)
+                                                                                                   degree,
+                                                                                                   quadrature,
+                                                                                                   checked_continuity)
 end
 
 # Public compiled-space object.
@@ -238,8 +239,8 @@ end
 """
     HpSpace(domain, options=SpaceOptions())
 
-Compile a dimension-independent high-order finite-element space on a
-Cartesian `Domain`.
+Compile a dimension-independent high-order finite-element space on a Cartesian
+background or physical domain.
 
 `HpSpace` is the public compiled space object of the library. It stores the
 active leaves, the chosen basis family, the materialized degree and quadrature
@@ -267,9 +268,10 @@ and the corresponding trace content stays leaf-local. The public query
 interface in this file intentionally hides those implementation details behind
 one compiled representation.
 """
-struct HpSpace{D,T<:AbstractFloat,B<:AbstractBasisFamily,DG<:AbstractDegreePolicy,
-               Q<:AbstractQuadraturePolicy,C<:_AbstractContinuityPolicy}
-  domain::Domain{D,T}
+struct HpSpace{D,T<:AbstractFloat,DO<:AbstractDomain{D,T},B<:AbstractBasisFamily,
+               DG<:AbstractDegreePolicy,Q<:AbstractQuadraturePolicy,
+               C<:_AbstractContinuityPolicy}
+  domain::DO
   basis::B
   degree_policy::DG
   quadrature_policy::Q
@@ -287,9 +289,10 @@ end
 # 2. compile the resulting face-coupling relations,
 # 3. finalize each leaf into sparse local-to-global mode expansions and record
 #    the quadrature requirements induced by the quadrature policy.
-function HpSpace(domain::Domain{D,T},
+function HpSpace(domain::AbstractDomain{D,T},
                  options::SpaceOptions=SpaceOptions()) where {D,T<:AbstractFloat}
-  raw_degree_policy = StoredDegrees(domain, options.degree)
+  active = _domain_active_leaves(domain)
+  raw_degree_policy = StoredDegrees(domain, options.degree, active)
   continuity_policy = _normalized_continuity_policy(options.continuity, Val(D))
   checked_leaf_degrees = Vector{NTuple{D,Int}}(undef, length(raw_degree_policy.data))
 
@@ -301,6 +304,7 @@ function HpSpace(domain::Domain{D,T},
 
   degree_policy = StoredDegrees{D}(raw_degree_policy.leaf_to_index, checked_leaf_degrees)
   active, leaf_to_index, compiled, scalar_dofs, global_quadrature_shape = _compile_space_data(domain,
+                                                                                              active,
                                                                                               options.basis,
                                                                                               degree_policy.data,
                                                                                               continuity_policy,
@@ -380,9 +384,10 @@ is_continuous_axis(space::HpSpace, axis::Integer) = continuity_kind(space, axis)
 
 Return the number of active leaves on which `space` is compiled.
 
-This equals the active-leaf count of the underlying grid, but the function is
-useful at the space level because the compiled leaf data and local mode tables
-are stored in that same ordering.
+This counts the leaves that actually participate in the compiled space. On a
+plain background `Domain` this is the active frontier of the Cartesian grid. On
+a [`PhysicalDomain`](@ref) it is the physically active subset selected by the
+region after trimming fully fictitious background leaves.
 """
 active_leaf_count(space::HpSpace) = length(space.active_leaves)
 
@@ -560,16 +565,16 @@ end
 # Degree-policy materialization.
 
 # Degree-policy evaluation for the common uniform case.
-function _leaf_degrees(policy::UniformDegree, domain::Domain{D}, leaf::Int) where {D}
+function _leaf_degrees(policy::UniformDegree, domain::AbstractDomain{D}, leaf::Int) where {D}
   ntuple(_ -> policy.degree, D)
 end
 
 # Axis degrees are already stored in the exact format the compiler needs.
-_leaf_degrees(policy::AxisDegrees{D}, domain::Domain{D}, leaf::Int) where {D} = policy.degrees
+_leaf_degrees(policy::AxisDegrees{D}, domain::AbstractDomain{D}, leaf::Int) where {D} = policy.degrees
 
 # Evaluate a user callback and validate that it returns a full nonnegative degree
 # tuple of the correct dimension.
-function _leaf_degrees(policy::ByLeafDegrees, domain::Domain{D}, leaf::Int) where {D}
+function _leaf_degrees(policy::ByLeafDegrees, domain::AbstractDomain{D}, leaf::Int) where {D}
   value = policy.f(domain, leaf)
   value isa NTuple{D,<:Integer} ||
     throw(ArgumentError("custom degree policy must return an NTuple{$D,Int}"))
@@ -578,28 +583,33 @@ end
 
 # Stored degree policies are resolved by direct lookup on the active-leaf index
 # table built when the policy was materialized.
-function _leaf_degrees(policy::StoredDegrees{D}, domain::Domain{D}, leaf::Int) where {D}
+function _leaf_degrees(policy::StoredDegrees{D}, domain::AbstractDomain{D}, leaf::Int) where {D}
   _, leaf_index = _checked_active_leaf_index(grid(domain), policy.leaf_to_index, leaf,
                                              "degree-policy")
   return @inbounds policy.data[leaf_index]
 end
 
-# Materialize an arbitrary public degree policy on the current active-leaf set.
-function StoredDegrees(domain::Domain{D}, policy::AbstractDegreePolicy) where {D}
-  active = active_leaves(grid(domain))
+# Materialize an arbitrary public degree policy on the selected active-leaf set.
+function StoredDegrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy,
+                       active::AbstractVector{<:Integer}) where {D}
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
 
   for index in eachindex(active)
     degrees[index] = _leaf_degrees(policy, domain, active[index])
   end
 
-  return StoredDegrees(domain, degrees)
+  return StoredDegrees(domain, active, degrees)
+end
+
+# Preserve the legacy "all active leaves" shorthand.
+function StoredDegrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy) where {D}
+  return StoredDegrees(domain, policy, _domain_active_leaves(domain))
 end
 
 # Low-level constructor from explicit per-leaf degree tuples.
-function StoredDegrees(domain::Domain{D}, degrees::AbstractVector{<:NTuple{D,<:Integer}}) where {D}
+function StoredDegrees(domain::AbstractDomain{D}, active::AbstractVector{<:Integer},
+                       degrees::AbstractVector{<:NTuple{D,<:Integer}}) where {D}
   grid_data = grid(domain)
-  active = active_leaves(grid_data)
   length(degrees) == length(active) ||
     throw(ArgumentError("degree data must match the active-leaf count"))
   leaf_to_index = _active_leaf_lookup(grid_data, active)
@@ -610,6 +620,11 @@ function StoredDegrees(domain::Domain{D}, degrees::AbstractVector{<:NTuple{D,<:I
   end
 
   return StoredDegrees{D}(leaf_to_index, checked)
+end
+
+function StoredDegrees(domain::AbstractDomain{D},
+                       degrees::AbstractVector{<:NTuple{D,<:Integer}}) where {D}
+  return StoredDegrees(domain, _domain_active_leaves(domain), degrees)
 end
 
 # Quadrature-policy evaluation and full space compilation.
@@ -633,12 +648,12 @@ end
 # produced together so the public constructor stays focused on wiring the final
 # immutable `HpSpace`. Algebraically, this is where a set of leaf-local modal
 # bases becomes one sparse global space description.
-function _compile_space_data(domain::Domain{D,T}, basis::B, leaf_degrees::Vector{NTuple{D,Int}},
+function _compile_space_data(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer}, basis::B,
+                             leaf_degrees::Vector{NTuple{D,Int}},
                              continuity_policy::_AxisContinuity{D},
                              quadrature_policy) where {D,T<:AbstractFloat,B<:AbstractBasisFamily}
   grid_data = grid(domain)
-  active = active_leaves(grid_data)
-  state = _enumerate_space_modes(domain, basis, leaf_degrees, continuity_policy)
+  state = _enumerate_space_modes(domain, active, basis, leaf_degrees, continuity_policy)
   _compile_face_coupling!(state, continuity_policy)
   leaf_to_index = _active_leaf_lookup(grid_data, active)
   compiled, global_quadrature_shape = _finalize_compiled_leaves(state, continuity_policy,

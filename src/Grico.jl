@@ -63,7 +63,7 @@ The source tree is easiest to understand in the following conceptual blocks:
 
 A typical user-facing workflow follows the same structure:
 
-1. build a `CartesianGrid` and `Domain`,
+1. build a `CartesianGrid` and either a background `Domain` or a `PhysicalDomain`,
 2. choose basis, degree, quadrature, and continuity options and compile an
    `HpSpace`,
 3. define fields and a `FieldLayout`,
@@ -125,6 +125,9 @@ include("basis.jl")
 export AbstractBasisFamily, FullTensorBasis, TrunkBasis, basis_mode_count, basis_modes,
        is_active_mode
 
+include("regions.jl")
+export ImplicitRegion, PhysicalDomain, finite_cell_quadrature
+
 include("continuity.jl")
 
 include("space.jl")
@@ -152,7 +155,7 @@ export AffineProblem, BoundaryFace, Dirichlet, MeanValue, ResidualProblem, add_b
 
 include("embedded.jl")
 export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
-       add_surface_quadrature!, finite_cell_quadrature, implicit_surface_quadrature
+       add_surface_quadrature!, implicit_surface_quadrature
 
 include("integration.jl")
 export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_side, jump,

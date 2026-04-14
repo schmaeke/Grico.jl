@@ -214,8 +214,8 @@ end
 # Dense leaf-to-index lookup makes `cell_degrees(plan, leaf)` independent of the
 # current active-leaf ordering and avoids repeated dictionary allocations during
 # plan editing.
-function _target_leaf_lookup(grid_data::CartesianGrid, degrees::AbstractVector{<:Tuple})
-  active = active_leaves(grid_data)
+function _target_leaf_lookup(grid_data::CartesianGrid, active::AbstractVector{<:Integer},
+                             degrees::AbstractVector{<:Tuple})
   length(degrees) == length(active) ||
     throw(ArgumentError("target degree data must match the active-leaf count"))
   lookup = zeros(Int, stored_cell_count(grid_data))
@@ -230,12 +230,17 @@ end
 # Adaptivity plans may only change refinement and degree data, not the physical
 # geometry or root-grid layout. This helper enforces that source and target
 # domains describe the same physical box and periodic topology, so state
-# transfer can be defined by overlap on a common geometric domain.
-function _same_adaptivity_geometry(source_domain::Domain, target_domain::Domain)
+# transfer can be defined by overlap on a common geometric domain. For
+# `PhysicalDomain`s the region test is intentionally object identity: copied
+# domains share one region object and therefore one classification/quadrature
+# cache, while independently constructed regions are treated as distinct
+# physical descriptions.
+function _same_adaptivity_geometry(source_domain::AbstractDomain, target_domain::AbstractDomain)
   root_cell_counts(grid(source_domain)) == root_cell_counts(grid(target_domain)) || return false
   origin(source_domain) == origin(target_domain) || return false
   extent(source_domain) == extent(target_domain) || return false
   periodic_axes(source_domain) == periodic_axes(target_domain) || return false
+  _physical_region(source_domain) === _physical_region(target_domain) || return false
   return true
 end
 
@@ -283,7 +288,7 @@ stores no compiled continuity data, no quadrature policy copies beyond what can
 be inherited later, and no transfer operators. Its purpose is to make target
 editing cheap.
 """
-mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:Domain{D,T},
+mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:AbstractDomain{D,T},
                               V<:Vector{NTuple{D,Int}},I<:Vector{Int},L<:AdaptivityLimits{D}}
   source_space::S
   target_domain::N
@@ -294,13 +299,14 @@ mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:Domain{D,T},
   function AdaptivityPlan{D,T,S,N,V,I,L}(source_space::S, target_domain::N, target_degrees::V,
                                          target_leaf_to_index::I,
                                          limits::L) where {D,T<:AbstractFloat,S<:HpSpace{D,T},
-                                                           N<:Domain{D,T},V<:Vector{NTuple{D,Int}},
+                                                           N<:AbstractDomain{D,T},
+                                                           V<:Vector{NTuple{D,Int}},
                                                            I<:Vector{Int},L<:AdaptivityLimits{D}}
     _same_adaptivity_geometry(domain(source_space), target_domain) ||
       throw(ArgumentError("target domain must share the source geometry and root cell counts"))
     stored_cell_count(grid(target_domain)) == length(target_leaf_to_index) ||
       throw(ArgumentError("target leaf lookup length must match the stored target-cell count"))
-    active = active_leaves(grid(target_domain))
+    active = _domain_active_leaves(target_domain)
     length(target_degrees) == length(active) ||
       throw(ArgumentError("target degree data must match the active-leaf count"))
 
@@ -316,12 +322,12 @@ mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:Domain{D,T},
   end
 end
 
-function AdaptivityPlan(source_space::HpSpace{D,T}, target_domain::Domain{D,T},
+function AdaptivityPlan(source_space::HpSpace{D,T}, target_domain::AbstractDomain{D,T},
                         target_degrees::AbstractVector{<:NTuple{D,<:Integer}};
                         limits::AdaptivityLimits{D}=AdaptivityLimits(source_space)) where {D,
                                                                                            T<:AbstractFloat}
   checked_limits = _checked_limits(limits, source_space)
-  active = active_leaves(grid(target_domain))
+  active = _domain_active_leaves(target_domain)
   length(target_degrees) == length(active) ||
     throw(ArgumentError("target degree data must match the active-leaf count"))
   checked = Vector{NTuple{D,Int}}(undef, length(target_degrees))
@@ -332,7 +338,7 @@ function AdaptivityPlan(source_space::HpSpace{D,T}, target_domain::Domain{D,T},
                                                  "target_degrees[$index]")
   end
 
-  lookup = _target_leaf_lookup(grid(target_domain), checked)
+  lookup = _target_leaf_lookup(grid(target_domain), active, checked)
   for (index, leaf) in enumerate(active)
     _check_target_leaf(grid(target_domain), leaf, checked[index], checked_limits)
   end
@@ -345,8 +351,9 @@ end
 function AdaptivityPlan(space::HpSpace{D,T};
                         limits::AdaptivityLimits{D}=AdaptivityLimits(space)) where {D,
                                                                                     T<:AbstractFloat}
-  degrees = [cell_degrees(space, leaf) for leaf in active_leaves(space)]
-  return AdaptivityPlan(space, copy(domain(space)), degrees; limits=limits)
+  target = copy(domain(space))
+  degrees = _inherited_target_degrees(space, target)
+  return AdaptivityPlan(space, target, degrees; limits=limits)
 end
 
 dimension(plan::AdaptivityPlan) = dimension(plan.source_space)
@@ -370,14 +377,17 @@ degrees are stored separately in `plan.target_degrees`.
 target_domain(plan::AdaptivityPlan) = plan.target_domain
 domain(plan::AdaptivityPlan) = plan.target_domain
 grid(plan::AdaptivityPlan) = grid(plan.target_domain)
-active_leaf_count(plan::AdaptivityPlan) = active_leaf_count(grid(plan))
-active_leaves(plan::AdaptivityPlan) = active_leaves(grid(plan))
-active_leaf(plan::AdaptivityPlan, index::Integer) = active_leaf(grid(plan), index)
+active_leaf_count(plan::AdaptivityPlan) = length(plan.target_degrees)
+active_leaves(plan::AdaptivityPlan) = _domain_active_leaves(plan.target_domain)
+function active_leaf(plan::AdaptivityPlan, index::Integer)
+  @inbounds return active_leaves(plan)[_checked_index(index, active_leaf_count(plan), "active leaf")]
+end
 
 # Check that `leaf` names one active target leaf in `plan`.
 function _checked_target_leaf(plan::AdaptivityPlan, leaf::Integer)
   checked_leaf = _checked_cell(grid(plan), leaf)
-  is_active_leaf(grid(plan), checked_leaf) ||
+  checked_leaf <= length(plan.target_leaf_to_index) &&
+    plan.target_leaf_to_index[checked_leaf] != 0 ||
     throw(ArgumentError("leaf $checked_leaf is not an active target leaf"))
   return checked_leaf
 end
@@ -477,13 +487,10 @@ function _reset_plan_degrees!(plan::AdaptivityPlan{D}, mapping::Dict{Int,NTuple{
   end
 
   plan.target_degrees = degrees
-  plan.target_leaf_to_index = _target_leaf_lookup(grid(plan), degrees)
+  plan.target_leaf_to_index = _target_leaf_lookup(grid(target_domain(plan)), active, degrees)
   return plan
 end
 
-# Build a leaf => degree map from the source space. Later plan-generation
-# routines edit this dictionary under splits/collapses and finally convert it
-# back to the packed target arrays expected by `AdaptivityPlan`.
 function _source_degree_map(space::HpSpace{D}) where {D}
   mapping = Dict{Int,NTuple{D,Int}}()
   sizehint!(mapping, active_leaf_count(space))
@@ -581,7 +588,7 @@ function _batched_h_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_ref
   end
 
   _finish_refinement_update!(target_grid)
-  active = active_leaves(target_grid)
+  active = _domain_active_leaves(target_domain)
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
 
   for index in eachindex(active)
@@ -1005,16 +1012,17 @@ end
 # Lift one target topology onto a companion space by inheriting the maximal
 # degree over every overlapping source leaf. This reproduces refinement
 # inheritance and coarsening-by-maximum without assuming leaf-number identity.
-function _inherited_target_degrees(space::HpSpace{D}, target_domain::Domain{D}) where {D}
+function _inherited_target_degrees(space::HpSpace{D},
+                                   target_domain::AbstractDomain{D},
+                                   active::AbstractVector{<:Integer}=_domain_active_leaves(target_domain)) where {D}
   source_grid = grid(space)
   target_grid = grid(target_domain)
-  active = active_leaves(target_grid)
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
 
   for index in eachindex(active)
     source_leaves = _transition_source_leaves(source_grid, target_grid, active[index])
-    degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis]
-                                            for leaf in source_leaves), D)
+    degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis] for leaf in source_leaves),
+                            D)
   end
 
   return degrees
@@ -1112,6 +1120,7 @@ function transition(plan::AdaptivityPlan{D,T}) where {D,T<:AbstractFloat}
   return SpaceTransition(old_space, new_space, source_offsets, source_counts, source_data)
 end
 
+
 """
     adapted_field(transition, field; name=field_name(field))
 
@@ -1202,7 +1211,7 @@ end
 # State transfer repeatedly asks whether a target quadrature point belongs to a
 # candidate source leaf. The tolerance keeps roundoff near shared faces from
 # creating spurious "point not found" failures.
-function _point_in_cell(domain_data::Domain{D,T}, leaf::Int, x::NTuple{D,<:Real};
+function _point_in_cell(domain_data::AbstractDomain{D,T}, leaf::Int, x::NTuple{D,<:Real};
                         tolerance::T=T(1.0e-12)) where {D,T<:AbstractFloat}
   lower = cell_lower(domain_data, leaf)
   upper = cell_upper(domain_data, leaf)
@@ -1337,7 +1346,7 @@ function _checked_transition_plans(plans::Tuple, state::State)
 
     _same_adaptivity_geometry(reference_target, target_domain(plan)) ||
       throw(ArgumentError("adaptivity plan targets must share one physical domain and periodic topology"))
-    active_leaves(grid(reference_target)) == active_leaves(grid(target_domain(plan))) ||
+    _domain_active_leaves(reference_target) == _domain_active_leaves(target_domain(plan)) ||
       throw(ArgumentError("adaptivity plan targets must share the same active-leaf topology"))
   end
 
@@ -2411,14 +2420,16 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
   source_degrees = cell_degrees(source_space(plan), leaf)
   descendants = Int[]
   _collect_active_descendants!(descendants, grid(plan), leaf)
-  isempty(descendants) &&
-    return _SourceLeafChange(ntuple(_ -> false, D), ntuple(_ -> 0, D), false, false)
   h_axes = fill(false, D)
   p_degree_changes = fill(typemin(Int), D)
   p_refined = false
   p_derefined = false
+  has_target_descendant = false
 
   for target_leaf in descendants
+    target_leaf <= length(plan.target_leaf_to_index) || continue
+    @inbounds plan.target_leaf_to_index[target_leaf] == 0 && continue
+    has_target_descendant = true
     target_levels = level(grid(plan), target_leaf)
     target_degrees = cell_degrees(plan, target_leaf)
 
@@ -2431,6 +2442,8 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
     end
   end
 
+  has_target_descendant ||
+    return _SourceLeafChange(ntuple(_ -> false, D), ntuple(_ -> 0, D), false, false)
   return _SourceLeafChange(ntuple(axis -> h_axes[axis], D),
                            ntuple(axis -> p_degree_changes[axis], D), p_refined, p_derefined)
 end
@@ -2503,7 +2516,9 @@ function adaptivity_summary(plan::AdaptivityPlan)
   for cell in 1:stored_cell_count(grid(source))
     is_expanded(grid(source), cell) || continue
     cell <= stored_cell_count(target_grid) || continue
-    is_active_leaf(target_grid, cell) && (h_derefinement_cell_count += 1)
+    cell <= length(plan.target_leaf_to_index) &&
+      @inbounds(plan.target_leaf_to_index[cell] != 0) &&
+      (h_derefinement_cell_count += 1)
   end
 
   return (marked_leaf_count=marked_leaf_count, h_refinement_leaf_count=h_refinement_leaf_count,

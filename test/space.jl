@@ -101,6 +101,25 @@ end
                                                               continuity=(:cg, :cg)))
 end
 
+@testset "Physical Domains" begin
+  background = Grico.Domain((0.0,), (3.0,), (3,))
+  region = Grico.ImplicitRegion(x -> x[1] - 1.5; subdivision_depth=1)
+  domain = Grico.PhysicalDomain(background, region)
+
+  default_space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
+
+  @test Grico.active_leaves(default_space) == [1, 2]
+
+  sliver_background = Grico.Domain((0.0,), (1.0,), (2,))
+  sliver_region = Grico.ImplicitRegion(x -> x[1] <= 0.05 || x[1] >= 0.75;
+                                       subdivision_depth=0)
+  sliver_domain = Grico.PhysicalDomain(sliver_background, sliver_region)
+  sliver_space = Grico.HpSpace(sliver_domain,
+                               Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
+
+  @test Grico.active_leaves(sliver_space) == [1, 2]
+end
+
 @testset "Field And State Validation" begin
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(2)))

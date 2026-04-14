@@ -60,13 +60,17 @@ end
 
 """
     write_vtk(path, state; kwargs...)
+    write_vtk(path, space; state=nothing, fields=nothing, point_data=(), cell_data=(),
+              field_data=(), subdivisions=1, export_degree=1, vtk_kwargs...)
     write_vtk(path, domain; state=nothing, fields=nothing, point_data=(), cell_data=(),
               field_data=(), subdivisions=1, export_degree=1, vtk_kwargs...)
 
 Export sampled field data and optional custom datasets to a VTK file.
 
 The `state` form infers the domain from the fields stored in the state layout.
-The `domain` form exports geometry even without a state and optionally samples a
+The `space` form uses one compiled `HpSpace` as the geometric/topological
+reference for both export geometry and field compatibility checks. The `domain`
+form exports background geometry even without a state and optionally samples a
 selected subset of fields from `state`.
 
 Each active leaf is sampled on a tensor-product grid of
@@ -96,21 +100,42 @@ merging stage.
 """
 function write_vtk(path::AbstractString, state::State; kwargs...)
   layout = field_layout(state)
-  domain_data = field_space(fields(layout)[1]).domain
-  return write_vtk(path, domain_data; state=state, kwargs...)
+  space = field_space(fields(layout)[1])
+  return write_vtk(path, space; state=state, kwargs...)
 end
 
-function write_vtk(path::AbstractString, domain_data::Domain{D,T};
+function write_vtk(path::AbstractString, space::HpSpace{D,T};
                    state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
                    field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
                    vtk_kwargs...) where {D,T<:AbstractFloat}
+  return _write_vtk(path, space; state=state, fields=fields, point_data=point_data,
+                    cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
+                    export_degree=export_degree, vtk_kwargs...)
+end
+
+function write_vtk(path::AbstractString, domain_data::AbstractDomain{D,T};
+                   state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
+                   field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
+                   vtk_kwargs...) where {D,T<:AbstractFloat}
+  return _write_vtk(path, domain_data; state=state, fields=fields, point_data=point_data,
+                    cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
+                    export_degree=export_degree, vtk_kwargs...)
+end
+
+function _write_vtk(path::AbstractString, reference;
+                    state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
+                    field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
+                    vtk_kwargs...)
   return _with_internal_blas_threads() do
+    reference_domain = _vtk_reference_domain(reference)
+    D = dimension(reference_domain)
+    T = eltype(origin(reference_domain))
     vtk_export_supported(D) ||
       throw(ArgumentError("VTK export requires a domain dimension between 1 and 3"))
     subdivision_count = _checked_positive(subdivisions, "subdivisions")
     vtk_degree = _checked_positive(export_degree, "export_degree")
-    vtk_fields = _vtk_fields(domain_data, state, fields)
-    mesh = _vtk_mesh_data(domain_data, subdivision_count, vtk_degree)
+    vtk_fields = _vtk_fields(reference, state, fields)
+    mesh = _vtk_mesh_data(reference, subdivision_count, vtk_degree)
     sampled_fields = _sample_vtk_fields(vtk_fields, state, mesh, T)
     point_datasets = _vtk_point_datasets(vtk_fields, sampled_fields, point_data, mesh)
     cell_datasets = _vtk_cell_datasets(cell_data, mesh)
@@ -170,19 +195,26 @@ end
 # participating fields may therefore come from compatible spaces built on equal
 # but not identical `Domain` objects, for example after independently compiled
 # adaptive transfers on several spaces.
-function _vtk_matching_domain(space::HpSpace, domain_data::Domain)
-  root_cell_counts(grid(space.domain)) == root_cell_counts(grid(domain_data)) || return false
-  space.active_leaves == active_leaves(grid(domain_data)) || return false
-  origin(space.domain) == origin(domain_data) || return false
-  extent(space.domain) == extent(domain_data) || return false
-  periodic_axes(space.domain) == periodic_axes(domain_data) || return false
+_vtk_reference_domain(space::HpSpace) = domain(space)
+_vtk_reference_domain(domain_data::AbstractDomain) = domain_data
+
+_vtk_reference_active_leaves(space::HpSpace) = active_leaves(space)
+_vtk_reference_active_leaves(domain_data::AbstractDomain) = _domain_active_leaves(domain_data)
+
+function _vtk_matching_domain(space::HpSpace, reference)
+  reference_domain = _vtk_reference_domain(reference)
+  root_cell_counts(grid(space.domain)) == root_cell_counts(grid(reference_domain)) || return false
+  space.active_leaves == _vtk_reference_active_leaves(reference) || return false
+  origin(space.domain) == origin(reference_domain) || return false
+  extent(space.domain) == extent(reference_domain) || return false
+  periodic_axes(space.domain) == periodic_axes(reference_domain) || return false
   return true
 end
 
 # Resolve which state fields should be exported and validate that they all belong
 # to the provided domain/state combination. The exported point-data names are
 # derived from `field_name(field)` and must therefore be unique.
-function _vtk_fields(domain_data::Domain, state::Union{Nothing,State}, selected_fields)
+function _vtk_fields(reference, state::Union{Nothing,State}, selected_fields)
   if state === nothing
     _empty_vtk_field_selector(selected_fields) && return AbstractField[]
     throw(ArgumentError("field export requires a state"))
@@ -204,8 +236,8 @@ function _vtk_fields(domain_data::Domain, state::Union{Nothing,State}, selected_
 
   for field in field_list
     field in available || throw(ArgumentError("field does not belong to the provided state"))
-    _vtk_matching_domain(field_space(field), domain_data) ||
-      throw(ArgumentError("VTK field export requires fields defined on the provided Domain"))
+    _vtk_matching_domain(field_space(field), reference) ||
+      throw(ArgumentError("VTK field export requires fields defined on the provided export reference"))
     name = string(field_name(field))
     name in names && throw(ArgumentError("duplicate VTK point-data name $name"))
     push!(names, name)
@@ -530,9 +562,14 @@ end
 # between neighboring leaves; duplicating them keeps the connectivity compact and
 # allows each exported cell to remain a self-contained Lagrange cell, which is
 # the most robust choice for high-order output.
-function _vtk_mesh_data(domain_data::Domain{D,T}, subdivisions::Int,
-                        export_degree::Int) where {D,T<:AbstractFloat}
-  leaf_data = active_leaves(grid(domain_data))
+function _vtk_mesh_data(reference, subdivisions::Int,
+                        export_degree::Int)
+  return _vtk_mesh_data(_vtk_reference_domain(reference), _vtk_reference_active_leaves(reference),
+                        subdivisions, export_degree)
+end
+
+function _vtk_mesh_data(domain_data::AbstractDomain{D,T}, leaf_data::AbstractVector{<:Integer},
+                        subdivisions::Int, export_degree::Int) where {D,T<:AbstractFloat}
   leaf_count = length(leaf_data)
   point_resolution = subdivisions * export_degree
   point_stride = point_resolution + 1
