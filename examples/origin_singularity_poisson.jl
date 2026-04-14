@@ -165,8 +165,8 @@ end
 function origin_solution_data(; dimension=DIMENSION, singular_exponent=SINGULAR_EXPONENT)
   source_factor = -singular_exponent * (singular_exponent + dimension - 2)
   exact_solution = x -> (r=sqrt(sum(abs2, x)); r == 0.0 ? 0.0 : r^singular_exponent)
-  source_term = x -> (r=sqrt(sum(abs2, x)); r == 0.0 ? 0.0 :
-                                               source_factor * r^(singular_exponent - 2))
+  source_term = x -> (r=sqrt(sum(abs2, x));
+                      r == 0.0 ? 0.0 : source_factor * r^(singular_exponent - 2))
   return (; dimension, singular_exponent, source_factor, exact_solution, source_term)
 end
 
@@ -242,11 +242,11 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
       stop_now = isempty(adaptivity_plan)
     end
 
-    push!(history, (; step, active_leaves=active_leaf_count(field_space(u)),
-                    dofs=scalar_dof_count(field_space(u)), error_value, step_plan))
-    print_summary &&
-      @printf("  %4d %6d %4d %.6e %s\n", step, active_leaf_count(field_space(u)),
-              scalar_dof_count(field_space(u)), error_value, step_plan)
+    push!(history,
+          (; step, active_leaves=active_leaf_count(field_space(u)),
+           dofs=scalar_dof_count(field_space(u)), error_value, step_plan))
+    print_summary && @printf("  %4d %6d %4d %.6e %s\n", step, active_leaf_count(field_space(u)),
+                            scalar_dof_count(field_space(u)), error_value, step_plan)
 
     if write_vtk
       current_space = field_space(u)

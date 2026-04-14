@@ -865,14 +865,13 @@ end
 
   shorthand_problem = Grico.AffineProblem(u)
   Grico.add_constraint!(shorthand_problem,
-                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER),
-                                        (1.0, 2.0, 3.0)))
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), (1.0, 2.0, 3.0)))
   shorthand_state = _dirichlet_state(Grico.compile(shorthand_problem))
 
   explicit_problem = Grico.AffineProblem(u)
   Grico.add_constraint!(explicit_problem,
-                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER),
-                                        (1, 2, 3), (1.0, 2.0, 3.0)))
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), (1, 2, 3),
+                                        (1.0, 2.0, 3.0)))
   explicit_state = _dirichlet_state(Grico.compile(explicit_problem))
 
   for component in 1:3
@@ -881,14 +880,13 @@ end
   end
 
   problem = Grico.AffineProblem(u)
-  Grico.add_constraint!(problem,
-                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 1, -2.0))
+  Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 1, -2.0))
   Grico.add_constraint!(problem,
                         Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 2,
                                         (10.0, 1.5, 30.0)))
   Grico.add_constraint!(problem,
-                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.UPPER),
-                                        (1, 3), x -> (x[1], -x[1])))
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.UPPER), (1, 3),
+                                        x -> (x[1], -x[1])))
   state = _dirichlet_state(Grico.compile(problem))
 
   @test _field_value(u, state, 1, (-1.0,), 1) ≈ -2.0 atol = ASSEMBLY_TOL

@@ -29,8 +29,7 @@ function _parse_args(args)
     if arg == "--worker"
       parsed["worker"] = "true"
     elseif startswith(arg, "--")
-      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) :
-                    (arg[3:end], "true")
+      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) : (arg[3:end], "true")
       parsed[key] = value
     else
       throw(ArgumentError("unsupported argument `$arg`"))
@@ -57,7 +56,8 @@ function _parse_cases(raw)
   return selected
 end
 
-function _include_example_module(module_name::Symbol, env_key::String, relative_path::AbstractString)
+function _include_example_module(module_name::Symbol, env_key::String,
+                                 relative_path::AbstractString)
   previous = get(ENV, env_key, nothing)
   ENV[env_key] = "0"
   module_object = Module(module_name)
@@ -77,14 +77,11 @@ end
 
 const AnnularExample = _include_example_module(:RealWorkloadAnnularPlateNitsche,
                                                "GRICO_ANNULAR_AUTORUN",
-                                               joinpath("examples",
-                                                        "annular_plate_nitsche.jl"))
+                                               joinpath("examples", "annular_plate_nitsche.jl"))
 const OriginExample = _include_example_module(:RealWorkloadOriginSingularityPoisson,
                                               "GRICO_ORIGIN_SINGULARITY_AUTORUN",
-                                              joinpath("examples",
-                                                       "origin_singularity_poisson.jl"))
-const LidExample = _include_example_module(:RealWorkloadLidDrivenCavity,
-                                           "GRICO_LDC_AUTORUN",
+                                              joinpath("examples", "origin_singularity_poisson.jl"))
+const LidExample = _include_example_module(:RealWorkloadLidDrivenCavity, "GRICO_LDC_AUTORUN",
                                            joinpath("examples", "lid_driven_cavity.jl"))
 
 @inline _median(values::Vector{Float64}) = median(values)
@@ -105,16 +102,11 @@ end
 
 function _environment_metadata()
   cpu_info = first(Sys.cpu_info())
-  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC),
-                                              dateformat"yyyy-mm-ddTHH:MM:SS"),
-              "julia_version" => string(VERSION),
-              "os" => string(Sys.KERNEL),
-              "arch" => string(Sys.ARCH),
-              "hostname" => gethostname(),
-              "cpu_model" => cpu_info.model,
-              "logical_cpu_threads" => Sys.CPU_THREADS,
-              "julia_threads" => Threads.nthreads(),
-              "blas_threads" => BLAS.get_num_threads(),
+  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
+              "julia_version" => string(VERSION), "os" => string(Sys.KERNEL),
+              "arch" => string(Sys.ARCH), "hostname" => gethostname(),
+              "cpu_model" => cpu_info.model, "logical_cpu_threads" => Sys.CPU_THREADS,
+              "julia_threads" => Threads.nthreads(), "blas_threads" => BLAS.get_num_threads(),
               "openblas_num_threads" => get(ENV, "OPENBLAS_NUM_THREADS", ""),
               "omp_num_threads" => get(ENV, "OMP_NUM_THREADS", ""))
 end
@@ -122,14 +114,10 @@ end
 # Keep phase timing keys stable across reports so later comparisons can diff
 # the same categories even when a workload does not hit every phase.
 function _phase_dict()
-  return Dict{String,Float64}("setup_seconds" => 0.0,
-                              "problem_setup_seconds" => 0.0,
-                              "compile_seconds" => 0.0,
-                              "assemble_seconds" => 0.0,
-                              "solve_seconds" => 0.0,
-                              "verify_seconds" => 0.0,
-                              "diagnostics_seconds" => 0.0,
-                              "adaptivity_seconds" => 0.0,
+  return Dict{String,Float64}("setup_seconds" => 0.0, "problem_setup_seconds" => 0.0,
+                              "compile_seconds" => 0.0, "assemble_seconds" => 0.0,
+                              "solve_seconds" => 0.0, "verify_seconds" => 0.0,
+                              "diagnostics_seconds" => 0.0, "adaptivity_seconds" => 0.0,
                               "transfer_seconds" => 0.0)
 end
 
@@ -257,8 +245,8 @@ function _measure_origin(config)
 
   for step in 0:config.adaptive_steps
     problem = nothing
-    breakdown["problem_setup_seconds"] += @elapsed problem =
-      OriginExample.build_origin_singularity_problem(u, context)
+    breakdown["problem_setup_seconds"] += @elapsed problem = OriginExample.build_origin_singularity_problem(u,
+                                                                                                            context)
 
     plan = nothing
     breakdown["compile_seconds"] += @elapsed plan = Grico.compile(problem)
@@ -281,8 +269,8 @@ function _measure_origin(config)
     step == config.adaptive_steps && break
 
     adaptivity_plan = nothing
-    breakdown["adaptivity_seconds"] += @elapsed adaptivity_plan =
-      OriginExample.origin_adaptivity_plan(state, u)
+    breakdown["adaptivity_seconds"] += @elapsed adaptivity_plan = OriginExample.origin_adaptivity_plan(state,
+                                                                                                       u)
     if isempty(adaptivity_plan)
       stopped_early = true
       break
@@ -308,7 +296,7 @@ function _measure_origin(config)
                                                               size(final_system.matrix, 1),
                                             "final_relative_l2_error" => final_error,
                                             "final_matrix_nnz" => final_system === nothing ? 0 :
-                                                                 nnz(final_system.matrix)))
+                                                                  nnz(final_system.matrix)))
 end
 
 function _warmup_lid()
@@ -320,15 +308,15 @@ function _warmup_lid()
                 max(config.tol, LidExample.ADAPTIVE_PICARD_TOL)
 
     for _ in 1:config.max_iters
-      context, _, relative_update, _, _ =
-        LidExample.advance_picard_step(context; linear_solve=LidExample.direct_sparse_solve)
+      context, _, relative_update, _, _ = LidExample.advance_picard_step(context;
+                                                                         linear_solve=LidExample.direct_sparse_solve)
       relative_update <= cycle_tol && break
     end
 
     adaptive_step == config.adaptive_steps && break
-    next_context, adaptivity_plan =
-      LidExample.adapt_lid_driven_cavity_context(context; threshold=config.threshold,
-                                                 max_h_level=config.max_h_level)
+    next_context, adaptivity_plan = LidExample.adapt_lid_driven_cavity_context(context;
+                                                                               threshold=config.threshold,
+                                                                               max_h_level=config.max_h_level)
     isempty(adaptivity_plan) && break
     context = next_context
   end
@@ -378,9 +366,9 @@ function _measure_lid(config)
     next_context = nothing
     adaptivity_plan = nothing
     breakdown["adaptivity_seconds"] += @elapsed begin
-      next_context, adaptivity_plan =
-        LidExample.adapt_lid_driven_cavity_context(context; threshold=config.threshold,
-                                                   max_h_level=config.max_h_level)
+      next_context, adaptivity_plan = LidExample.adapt_lid_driven_cavity_context(context;
+                                                                                 threshold=config.threshold,
+                                                                                 max_h_level=config.max_h_level)
     end
     isempty(adaptivity_plan) && break
     context = next_context
@@ -398,10 +386,9 @@ function _measure_lid(config)
                                             "adaptive_steps_used" => adaptive_step_count,
                                             "final_picard_iters" => iteration_count,
                                             "final_relative_update" => final_update,
-                                            "dg_mass_monitor_l2" =>
-                                              LidExample.dg_mass_monitor_l2(context.plan,
-                                                                            context.flow_state,
-                                                                            context.velocity)))
+                                            "dg_mass_monitor_l2" => LidExample.dg_mass_monitor_l2(context.plan,
+                                                                                                  context.flow_state,
+                                                                                                  context.velocity)))
 end
 
 function _measure_case(case_id::AbstractString, profile::AbstractString, repeats::Int)
@@ -465,10 +452,8 @@ end
 
 function _worker_payload(case_ids; profile::AbstractString, repeats::Int)
   BLAS.set_num_threads(1)
-  payload = Dict{String,Any}("environment" => _environment_metadata(),
-                             "profile" => profile,
-                             "repeats" => repeats,
-                             "cases" => Any[])
+  payload = Dict{String,Any}("environment" => _environment_metadata(), "profile" => profile,
+                             "repeats" => repeats, "cases" => Any[])
 
   for case_id in case_ids
     println("benchmarking $case_id on $(Threads.nthreads()) thread(s)")
@@ -493,10 +478,8 @@ function _combined_results(thread_runs, case_ids, thread_counts, profile::Abstra
                            phase_label::AbstractString)
   return Dict("phase" => String(phase_label),
               "generated_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
-              "primary_thread_counts" => thread_counts,
-              "selected_cases" => case_ids,
-              "profile" => profile,
-              "performance_core_note" => DEFAULT_THREAD_NOTE,
+              "primary_thread_counts" => thread_counts, "selected_cases" => case_ids,
+              "profile" => profile, "performance_core_note" => DEFAULT_THREAD_NOTE,
               "thread_runs" => thread_runs)
 end
 
@@ -637,8 +620,9 @@ function _render_markdown(combined)
   return join(lines, "\n")
 end
 
-function _worker_command(script_path::AbstractString, thread_count::Int, output_path::AbstractString,
-                         case_ids; profile::AbstractString, repeats::Int)
+function _worker_command(script_path::AbstractString, thread_count::Int,
+                         output_path::AbstractString, case_ids; profile::AbstractString,
+                         repeats::Int)
   command = `$(Base.julia_cmd()) --project=$(BENCHMARK_PROJECT) --threads=$(thread_count) $(script_path) --worker --output=$(output_path) --profile=$(profile) --repeats=$(repeats) --cases=$(join(case_ids, ","))`
   environment = copy(ENV)
   environment["OPENBLAS_NUM_THREADS"] = "1"
@@ -647,8 +631,7 @@ function _worker_command(script_path::AbstractString, thread_count::Int, output_
 end
 
 function _report_path_for_output(output_path::AbstractString)
-  basename(output_path) == output_path &&
-    return replace(output_path, r"\.toml$" => ".md")
+  basename(output_path) == output_path && return replace(output_path, r"\.toml$" => ".md")
   return joinpath(dirname(output_path), replace(basename(output_path), r"\.toml$" => ".md"))
 end
 
@@ -693,8 +676,8 @@ function main(args=ARGS)
   parsed = _parse_args(args)
 
   if get(parsed, "worker", "false") == "true"
-    output_path = get(parsed, "output", joinpath(BENCHMARK_PROJECT,
-                                                 "real_workload_validation_worker.toml"))
+    output_path = get(parsed, "output",
+                      joinpath(BENCHMARK_PROJECT, "real_workload_validation_worker.toml"))
     case_ids = _parse_cases(get(parsed, "cases", nothing))
     profile = get(parsed, "profile", DEFAULT_PROFILE)
     repeats = parse(Int, get(parsed, "repeats", string(DEFAULT_REPEATS)))

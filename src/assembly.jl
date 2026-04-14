@@ -311,8 +311,7 @@ function _ThreadScratch(::Type{T}, local_dof_count::Int, owner_count::Int,
                         Matrix{T}(undef, local_dof_count, local_dof_count),
                         Vector{T}(undef, local_dof_count), Vector{T}(undef, local_dof_count),
                         foreign_slot_indices, foreign_slot_values, foreign_rhs_rows,
-                        foreign_rhs_values, T[], T[], Int[], T[], Int[],
-                        Int[], T[])
+                        foreign_rhs_values, T[], T[], Int[], T[], Int[], Int[], T[])
 end
 
 function _sparse_matrix_pattern(nrows::Int, ncols::Int, rows::Vector{Int}, cols::Vector{Int};
@@ -333,9 +332,9 @@ function _sparse_matrix_pattern(nrows::Int, ncols::Int, rows::Vector{Int}, cols:
 end
 
 function _sparse_matrix_template(::Type{T}, nrows::Int, ncols::Int, rows::Vector{Int},
-                                 cols::Vector{Int}; compute_ordering::Bool=false) where {T<:AbstractFloat}
-  pattern = _sparse_matrix_pattern(nrows, ncols, rows, cols;
-                                   compute_ordering=compute_ordering)
+                                 cols::Vector{Int};
+                                 compute_ordering::Bool=false) where {T<:AbstractFloat}
+  pattern = _sparse_matrix_pattern(nrows, ncols, rows, cols; compute_ordering=compute_ordering)
   return _SparseMatrixTemplate{T}(pattern, zeros(T, length(pattern.rowval)))
 end
 
@@ -394,12 +393,12 @@ function _compile_assembly_structure(layout::FieldLayout{D,T}, cell_operators, b
                                                         reduced_index, fixed, dirichlet_affine)
   reduced_matrix = _compile_affine_matrix_template(T, integration, cell_operators,
                                                    boundary_operators, interface_operators,
-                                                   surface_operators, condensation,
-                                                   reduced_index, fixed, constraint_rows,
-                                                   dirichlet_affine, mean_constraints,
-                                                   reconstruction_rows, solve_dofs)
-  reconstruction = _compile_reconstruction_template(T, length(fixed), solve_dofs,
-                                                    dirichlet_affine, reconstruction_rows)
+                                                   surface_operators, condensation, reduced_index,
+                                                   fixed, constraint_rows, dirichlet_affine,
+                                                   mean_constraints, reconstruction_rows,
+                                                   solve_dofs)
+  reconstruction = _compile_reconstruction_template(T, length(fixed), solve_dofs, dirichlet_affine,
+                                                    reconstruction_rows)
   tangent = _compile_tangent_template(T, length(fixed), integration, cell_operators,
                                       boundary_operators, interface_operators, surface_operators,
                                       fixed, constraint_masks.blocked_rows, dirichlet,
@@ -439,8 +438,7 @@ function _structural_full_column_targets(item::_AssemblyValues, local_dof::Int)
 end
 
 function _append_reduced_targets!(targets::Vector{Int}, global_dof::Int, reduced_index::Vector{Int},
-                                  fixed::BitVector,
-                                  dirichlet_affine::_ReducedAffineRows)
+                                  fixed::BitVector, dirichlet_affine::_ReducedAffineRows)
   fixed[global_dof] && return targets
   reduced_dof = reduced_index[global_dof]
 
@@ -511,8 +509,7 @@ function _structural_reconstruction_targets(item::CellValues, local_dof::Int,
 end
 
 function _structural_reconstruction_rows(cells, condensation, reduced_index::Vector{Int},
-                                         fixed::BitVector,
-                                         dirichlet_affine::_ReducedAffineRows)
+                                         fixed::BitVector, dirichlet_affine::_ReducedAffineRows)
   rows = Dict{Int,Vector{Int}}()
 
   for global_dof in eachindex(dirichlet_affine.eliminated)
@@ -594,9 +591,8 @@ function _compile_affine_matrix_template(::Type{T}, integration::_CompiledIntegr
   for cell_index in eachindex(cells)
     leaf = integration.leaves[cell_index]
     (!isempty(cell_operators) ||
-     _leaf_has_affine_contributions(leaf, integration.boundary_faces,
-                                    integration.embedded_surfaces, boundary_operators,
-                                    surface_operators)) || continue
+     _leaf_has_affine_contributions(leaf, integration.boundary_faces, integration.embedded_surfaces,
+                                    boundary_operators, surface_operators)) || continue
     cell = cells[cell_index]
     kept_local_dofs = condensation[cell_index].kept_local_dofs
 
@@ -676,17 +672,14 @@ function _compile_reconstruction_template(::Type{T}, ndofs::Int, solve_dofs::Vec
   template = _sparse_matrix_template(T, ndofs, length(solve_dofs), rows, cols)
 
   for reduced_dof in eachindex(solve_dofs)
-    template.initial_nzval[_matrix_slot(template.pattern, solve_dofs[reduced_dof], reduced_dof)] +=
-      one(T)
+    template.initial_nzval[_matrix_slot(template.pattern, solve_dofs[reduced_dof], reduced_dof)] += one(T)
   end
 
   for global_dof in eachindex(dirichlet_affine.eliminated)
     dirichlet_affine.eliminated[global_dof] || continue
 
     for pointer in _affine_row_pointer_range(dirichlet_affine, global_dof)
-      template.initial_nzval[_matrix_slot(template.pattern, global_dof,
-                                          dirichlet_affine.indices[pointer])] +=
-        dirichlet_affine.coefficients[pointer]
+      template.initial_nzval[_matrix_slot(template.pattern, global_dof, dirichlet_affine.indices[pointer])] += dirichlet_affine.coefficients[pointer]
     end
   end
 
@@ -799,16 +792,13 @@ function _compile_tangent_template(::Type{T}, ndofs::Int, integration::_Compiled
     template.initial_nzval[_matrix_slot(template.pattern, row.pivot, row.pivot)] += one(T)
 
     for index in eachindex(row.indices)
-      template.initial_nzval[_matrix_slot(template.pattern, row.pivot, row.indices[index])] -=
-        row.coefficients[index]
+      template.initial_nzval[_matrix_slot(template.pattern, row.pivot, row.indices[index])] -= row.coefficients[index]
     end
   end
 
   for constraint in mean_constraints
     for index in eachindex(constraint.indices)
-      template.initial_nzval[_matrix_slot(template.pattern, constraint.pivot,
-                                          constraint.indices[index])] +=
-        constraint.coefficients[index]
+      template.initial_nzval[_matrix_slot(template.pattern, constraint.pivot, constraint.indices[index])] += constraint.coefficients[index]
     end
   end
 
@@ -929,8 +919,8 @@ function assemble(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
     _prepare_matrix_accumulator!(matrix_accumulator, scratch)
     _prepare_vector_accumulator!(rhs_accumulator, scratch)
     _assemble_leaf_affine_pass!(scratch, matrix_accumulator, rhs_accumulator, plan, traversal,
-                                condensation, reduced_index, fixed,
-                                fixed_values, eliminated, constraint_rows, dirichlet_affine)
+                                condensation, reduced_index, fixed, fixed_values, eliminated,
+                                constraint_rows, dirichlet_affine)
     _assemble_reduced_pass!(scratch, matrix_accumulator, rhs_accumulator,
                             traversal.interface_batches, plan.integration.interfaces,
                             plan.interface_operators, reduced_index, fixed, fixed_values,
@@ -1050,16 +1040,16 @@ function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
     rhs_accumulator = _OwnedVectorAccumulator(result, row_partition)
     _prepare_vector_accumulator!(rhs_accumulator, scratch)
     _residual_pass!(scratch, rhs_accumulator, traversal.cell_batches, plan.integration.cells,
-                    plan.cell_operators, state,
-                    fixed, skipped_rows, cell_residual!)
+                    plan.cell_operators, state, fixed, skipped_rows, cell_residual!)
     _boundary_residual_pass!(scratch, rhs_accumulator, traversal.boundary_batches,
-                             plan.integration.boundary_faces,
-                             plan.boundary_operators, state, fixed, skipped_rows)
-    _residual_pass!(scratch, rhs_accumulator, traversal.interface_batches, plan.integration.interfaces,
-                    plan.interface_operators, state, fixed, skipped_rows, interface_residual!)
+                             plan.integration.boundary_faces, plan.boundary_operators, state, fixed,
+                             skipped_rows)
+    _residual_pass!(scratch, rhs_accumulator, traversal.interface_batches,
+                    plan.integration.interfaces, plan.interface_operators, state, fixed,
+                    skipped_rows, interface_residual!)
     _surface_residual_pass!(scratch, rhs_accumulator, traversal.surface_batches,
-                            plan.integration.embedded_surfaces,
-                            plan.surface_operators, state, fixed, skipped_rows)
+                            plan.integration.embedded_surfaces, plan.surface_operators, state,
+                            fixed, skipped_rows)
     _finalize_vector_accumulator!(rhs_accumulator, scratch)
 
     # Dirichlet and mean-value constraints enter the nonlinear residual as
@@ -1134,22 +1124,19 @@ function _assemble_tangent!(matrix_data::SparseMatrixCSC{T,Int}, plan::AssemblyP
     traversal = plan.traversal_plan
     _reset_scratch!(scratch)
     row_partition = _OwnedRowPartition(size(matrix_data, 1), length(scratch))
-    matrix_accumulator = _OwnedSparseAccumulator(template.pattern, matrix_data.nzval,
-                                                 row_partition)
+    matrix_accumulator = _OwnedSparseAccumulator(template.pattern, matrix_data.nzval, row_partition)
     _prepare_matrix_accumulator!(matrix_accumulator, scratch)
     _tangent_pass!(scratch, matrix_accumulator, traversal.cell_batches, plan.integration.cells,
-                   plan.cell_operators, state,
-                   fixed, skipped_rows, cell_tangent!)
+                   plan.cell_operators, state, fixed, skipped_rows, cell_tangent!)
     _boundary_tangent_pass!(scratch, matrix_accumulator, traversal.boundary_batches,
-                            plan.integration.boundary_faces,
-                            plan.boundary_operators, state, fixed, skipped_rows)
+                            plan.integration.boundary_faces, plan.boundary_operators, state, fixed,
+                            skipped_rows)
     _tangent_pass!(scratch, matrix_accumulator, traversal.interface_batches,
-                   plan.integration.interfaces,
-                   plan.interface_operators, state, fixed, skipped_rows,
-                   interface_tangent!)
+                   plan.integration.interfaces, plan.interface_operators, state, fixed,
+                   skipped_rows, interface_tangent!)
     _surface_tangent_pass!(scratch, matrix_accumulator, traversal.surface_batches,
-                           plan.integration.embedded_surfaces,
-                           plan.surface_operators, state, fixed, skipped_rows)
+                           plan.integration.embedded_surfaces, plan.surface_operators, state, fixed,
+                           skipped_rows)
     _finalize_matrix_accumulator!(matrix_accumulator, scratch)
     return matrix_data
   end
@@ -1166,8 +1153,8 @@ end
 function _assemble_leaf_affine_pass!(scratch, matrix_accumulator::_OwnedSparseAccumulator{T},
                                      rhs_accumulator::_OwnedVectorAccumulator{T},
                                      plan::AssemblyPlan{D,T}, traversal::_TraversalPlan,
-                                     condensation, reduced_index, fixed, fixed_values,
-                                     eliminated, constraint_rows,
+                                     condensation, reduced_index, fixed, fixed_values, eliminated,
+                                     constraint_rows,
                                      dirichlet_affine::_ReducedAffineRows{T}) where {D,
                                                                                      T<:AbstractFloat}
   cells = plan.integration.cells
@@ -1206,7 +1193,9 @@ function _assemble_leaf_affine_pass!(scratch, matrix_accumulator::_OwnedSparseAc
         for face_index in leaf.boundary_faces
           face = @inbounds boundary_faces[face_index]
 
-          for operator_index in @inbounds boundary_lookup[_boundary_lookup_slot(face.axis, face.side)]
+          for operator_index in
+              @inbounds boundary_lookup[_boundary_lookup_slot(face.axis, face.side)]
+
             wrapped = @inbounds boundary_operators[operator_index]
             face_matrix!(local_matrix, wrapped.operator, face)
             face_rhs!(local_rhs, wrapped.operator, face)
@@ -1227,8 +1216,8 @@ function _assemble_leaf_affine_pass!(scratch, matrix_accumulator::_OwnedSparseAc
                                  reduced_index, fixed, fixed_values, dirichlet_affine, tolerance)
         _scatter_affine_reduced!(cache, matrix_accumulator, rhs_accumulator, cell,
                                  condensation_plan.kept_local_dofs, local_matrix, local_rhs,
-                                 reduced_index, fixed, fixed_values, eliminated,
-                                 constraint_rows, dirichlet_affine)
+                                 reduced_index, fixed, fixed_values, eliminated, constraint_rows,
+                                 dirichlet_affine)
       end
     end
   end
@@ -1248,8 +1237,8 @@ function _assemble_reduced_pass!(scratch, matrix_accumulator::_OwnedSparseAccumu
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_item,
-                                                                           last_item
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_item, last_item
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
@@ -1266,8 +1255,8 @@ function _assemble_reduced_pass!(scratch, matrix_accumulator::_OwnedSparseAccumu
 
         _scatter_affine_reduced!(cache, matrix_accumulator, rhs_accumulator, item,
                                  Base.OneTo(batch.local_dof_count), local_matrix, local_rhs,
-                                 reduced_index, fixed, fixed_values, eliminated,
-                                 constraint_rows, dirichlet_affine)
+                                 reduced_index, fixed, fixed_values, eliminated, constraint_rows,
+                                 dirichlet_affine)
       end
     end
   end
@@ -1284,8 +1273,8 @@ function _assemble_boundary_pass!(scratch, matrix_accumulator::_OwnedSparseAccum
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_face,
-                                                                           last_face
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_face, last_face
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
@@ -1301,8 +1290,8 @@ function _assemble_boundary_pass!(scratch, matrix_accumulator::_OwnedSparseAccum
           face_rhs!(local_rhs, wrapped.operator, face)
         end
 
-        _scatter_affine!(cache, matrix_accumulator, rhs_accumulator, face, local_matrix,
-                         local_rhs, fixed, fixed_values, pivot_rows)
+        _scatter_affine!(cache, matrix_accumulator, rhs_accumulator, face, local_matrix, local_rhs,
+                         fixed, fixed_values, pivot_rows)
       end
     end
   end
@@ -1314,14 +1303,13 @@ end
 # optional symbolic surface-tag filtering.
 function _assemble_surface_pass!(scratch, matrix_accumulator::_OwnedSparseAccumulator{T},
                                  rhs_accumulator::_OwnedVectorAccumulator{T},
-                                 batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                                 fixed, fixed_values, pivot_rows) where {T<:AbstractFloat}
+                                 batches::Vector{_FilteredKernelBatch}, surfaces, operators, fixed,
+                                 fixed_values, pivot_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache,
-                                                                           first_surface,
-                                                                           last_surface
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_surface, last_surface
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
@@ -1348,13 +1336,13 @@ end
 
 # Generic nonlinear residual pass on a collection of local integration items.
 function _residual_pass!(scratch, rhs_accumulator::_OwnedVectorAccumulator{T},
-                         batches::Vector{_KernelBatch}, items, operators, state, fixed,
-                         pivot_rows, residual_hook) where {T<:AbstractFloat}
+                         batches::Vector{_KernelBatch}, items, operators, state, fixed, pivot_rows,
+                         residual_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_item,
-                                                                           last_item
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_item, last_item
       _prepare_scratch!(cache, batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
 
@@ -1381,8 +1369,8 @@ function _boundary_residual_pass!(scratch, rhs_accumulator::_OwnedVectorAccumula
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_face,
-                                                                           last_face
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_face, last_face
       _prepare_scratch!(cache, batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
 
@@ -1405,14 +1393,13 @@ end
 
 # Embedded-surface residual traversal with optional surface-tag filtering.
 function _surface_residual_pass!(scratch, rhs_accumulator::_OwnedVectorAccumulator{T},
-                                 batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                                 state, fixed, pivot_rows) where {T<:AbstractFloat}
+                                 batches::Vector{_FilteredKernelBatch}, surfaces, operators, state,
+                                 fixed, pivot_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache,
-                                                                           first_surface,
-                                                                           last_surface
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_surface, last_surface
       _prepare_scratch!(cache, batch.local_dof_count)
       local_rhs = view(cache.rhs, 1:batch.local_dof_count)
 
@@ -1435,13 +1422,13 @@ end
 
 # Generic nonlinear tangent pass on a collection of local integration items.
 function _tangent_pass!(scratch, matrix_accumulator::_OwnedSparseAccumulator{T},
-                        batches::Vector{_KernelBatch}, items, operators, state, fixed,
-                        pivot_rows, tangent_hook) where {T<:AbstractFloat}
+                        batches::Vector{_KernelBatch}, items, operators, state, fixed, pivot_rows,
+                        tangent_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_item,
-                                                                           last_item
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_item, last_item
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
 
@@ -1468,8 +1455,8 @@ function _boundary_tangent_pass!(scratch, matrix_accumulator::_OwnedSparseAccumu
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache, first_face,
-                                                                           last_face
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_face, last_face
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
 
@@ -1492,14 +1479,13 @@ end
 
 # Embedded-surface tangent traversal with optional surface-tag filtering.
 function _surface_tangent_pass!(scratch, matrix_accumulator::_OwnedSparseAccumulator{T},
-                                batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                                state, fixed, pivot_rows) where {T<:AbstractFloat}
+                                batches::Vector{_FilteredKernelBatch}, surfaces, operators, state,
+                                fixed, pivot_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
-    _run_chunks!(scratch, length(batch.item_indices), _WORKLOAD_REGULAR) do cache,
-                                                                           first_surface,
-                                                                           last_surface
+    _run_chunks!(scratch, length(batch.item_indices),
+                 _WORKLOAD_REGULAR) do cache, first_surface, last_surface
       _prepare_scratch!(cache, batch.local_dof_count)
       local_matrix = view(cache.matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
 
@@ -1538,8 +1524,7 @@ end
 
 # Allocate one scratch bundle per worker, sized by the largest local item over
 # all cells/faces/interfaces/surfaces in the compiled integration cache.
-function _scratch_buffers(::Type{T},
-                          integration::_CompiledIntegration) where {T<:AbstractFloat}
+function _scratch_buffers(::Type{T}, integration::_CompiledIntegration) where {T<:AbstractFloat}
   worker_count = _worker_count(length(integration.cells), length(integration.boundary_faces),
                                length(integration.interfaces),
                                length(integration.embedded_surfaces))
@@ -1645,8 +1630,7 @@ function _merge_foreign_rhs!(accumulator::_OwnedVectorAccumulator{T},
   return scratch
 end
 
-@inline function _push_matrix!(cache::_ThreadScratch{T},
-                               accumulator::_OwnedSparseAccumulator{T},
+@inline function _push_matrix!(cache::_ThreadScratch{T}, accumulator::_OwnedSparseAccumulator{T},
                                row::Int, col::Int, value::T) where {T<:AbstractFloat}
   slot = _matrix_slot(accumulator.pattern, row, col)
   owner = accumulator.partition.owner_of_slot[slot]
@@ -1775,9 +1759,11 @@ function _normalize_scheduler_kind(kind::_SchedulerKind, item_count::Int, worker
                                    work_estimate::Union{Nothing,_BatchWorkEstimate})
   item_count <= 1 && return _SCHEDULE_STATIC
   worker_count <= 1 && return _SCHEDULE_STATIC
-  kind == _SCHEDULE_WEIGHTED_STATIC && !_has_weighted_costs(work_estimate) &&
+  kind == _SCHEDULE_WEIGHTED_STATIC &&
+    !_has_weighted_costs(work_estimate) &&
     return _SCHEDULE_STATIC
-  kind == _SCHEDULE_HYBRID && item_count < 4 * worker_count &&
+  kind == _SCHEDULE_HYBRID &&
+    item_count < 4 * worker_count &&
     return (_has_weighted_costs(work_estimate) ? _SCHEDULE_WEIGHTED_STATIC : _SCHEDULE_STATIC)
   return kind
 end
@@ -1788,15 +1774,13 @@ function _scheduler_override_kind()
   raw in ("default", "auto") && return nothing
   raw in ("dynamic", "atomic") && return _SCHEDULE_DYNAMIC
   raw == "static" && return _SCHEDULE_STATIC
-  raw in ("weighted", "weighted_static", "weighted-static") &&
-    return _SCHEDULE_WEIGHTED_STATIC
+  raw in ("weighted", "weighted_static", "weighted-static") && return _SCHEDULE_WEIGHTED_STATIC
   raw == "hybrid" && return _SCHEDULE_HYBRID
   throw(ArgumentError("unsupported scheduler override `$(raw)`; expected one of `dynamic`, `static`, `weighted_static`, `hybrid`, or `default`"))
 end
 
 @inline _has_weighted_costs(::Nothing) = false
-@inline _has_weighted_costs(work_estimate::_BatchWorkEstimate) =
-  !isempty(work_estimate.cumulative_costs)
+@inline _has_weighted_costs(work_estimate::_BatchWorkEstimate) = !isempty(work_estimate.cumulative_costs)
 
 @inline function _static_item_range(item_count::Int, worker_count::Int, worker::Int)
   first_item = fld((worker - 1) * item_count, worker_count) + 1
@@ -1815,7 +1799,8 @@ function _static_chunk_starts(item_count::Int, worker_count::Int)
   return starts
 end
 
-function _weighted_chunk_starts(work_estimate::_BatchWorkEstimate, item_count::Int, worker_count::Int)
+function _weighted_chunk_starts(work_estimate::_BatchWorkEstimate, item_count::Int,
+                                worker_count::Int)
   starts = Vector{Int}(undef, worker_count + 1)
   starts[1] = 1
   cumulative_costs = work_estimate.cumulative_costs
@@ -1831,7 +1816,7 @@ function _weighted_chunk_starts(work_estimate::_BatchWorkEstimate, item_count::I
 
   starts[worker_count+1] = item_count + 1
 
-  for worker in 2:(worker_count + 1)
+  for worker in 2:(worker_count+1)
     starts[worker] = max(starts[worker], starts[worker-1])
   end
 
@@ -1844,7 +1829,8 @@ end
   return cumulative_costs[last_item+1] - cumulative_costs[first_item]
 end
 
-function _static_cost_imbalance(work_estimate::_BatchWorkEstimate, item_count::Int, worker_count::Int)
+function _static_cost_imbalance(work_estimate::_BatchWorkEstimate, item_count::Int,
+                                worker_count::Int)
   _has_weighted_costs(work_estimate) || return 1.0
   average_cost = work_estimate.total_cost / worker_count
   average_cost == 0 && return 1.0
@@ -1918,8 +1904,8 @@ function _run_hybrid_chunks!(f::F, scratch, item_count::Int, worker_count::Int,
   chunk_size = _dynamic_chunk_size(max(tail_count, 1), worker_count)
   next_item = Threads.Atomic{Int}(head_count + 1)
   starts = head_count == 0 ? Int[] :
-           _has_weighted_costs(work_estimate) ? _weighted_chunk_starts(work_estimate, head_count,
-                                                                       worker_count) :
+           _has_weighted_costs(work_estimate) ?
+           _weighted_chunk_starts(work_estimate, head_count, worker_count) :
            _static_chunk_starts(head_count, worker_count)
 
   @sync for worker in 1:worker_count
@@ -1955,8 +1941,7 @@ end
 # Each local test/trial function may itself expand into several global dofs due
 # to continuity constraints, so scattering loops over the sparse local term maps
 # stored in the compiled integration item.
-function _scatter_affine!(cache::_ThreadScratch{T},
-                          matrix_accumulator::_OwnedSparseAccumulator{T},
+function _scatter_affine!(cache::_ThreadScratch{T}, matrix_accumulator::_OwnedSparseAccumulator{T},
                           rhs_accumulator::_OwnedVectorAccumulator{T}, item::_AssemblyValues,
                           local_matrix::AbstractMatrix{T}, local_rhs::AbstractVector{T},
                           fixed::BitVector, fixed_values::Vector{T},
@@ -1973,8 +1958,7 @@ function _scatter_affine!(cache::_ThreadScratch{T},
         row = item.term_indices[row_term_index]
         fixed[row] && continue
         pivot_rows[row] && continue
-        _push_rhs!(cache, rhs_accumulator, row,
-                   item.term_coefficients[row_term_index] * rhs_value)
+        _push_rhs!(cache, rhs_accumulator, row, item.term_coefficients[row_term_index] * rhs_value)
       end
     end
 
@@ -2087,9 +2071,8 @@ function _scatter_affine_reduced!(cache::_ThreadScratch{T},
           contribution = row_scale * item.term_coefficients[col_term_index]
           abs(contribution) > tolerance || continue
           _scatter_reduced_column!(cache, matrix_accumulator, rhs_accumulator, row_reduced,
-                                   contribution, item.term_indices[col_term_index],
-                                   reduced_index, fixed, fixed_values, dirichlet_affine,
-                                   tolerance)
+                                   contribution, item.term_indices[col_term_index], reduced_index,
+                                   fixed, fixed_values, dirichlet_affine, tolerance)
         end
       end
     end
@@ -2101,8 +2084,7 @@ end
 # Scatter a local nonlinear residual contribution to the full global residual,
 # skipping rows reserved for explicit constraints.
 function _scatter_residual!(cache::_ThreadScratch{T}, rhs_accumulator::_OwnedVectorAccumulator{T},
-                            item::_AssemblyValues,
-                            local_rhs::AbstractVector{T}, fixed::BitVector,
+                            item::_AssemblyValues, local_rhs::AbstractVector{T}, fixed::BitVector,
                             pivot_rows::BitVector) where {T<:AbstractFloat}
   tolerance = 1000 * eps(T)
 
@@ -2114,8 +2096,7 @@ function _scatter_residual!(cache::_ThreadScratch{T}, rhs_accumulator::_OwnedVec
       row = item.term_indices[row_term_index]
       fixed[row] && continue
       pivot_rows[row] && continue
-      _push_rhs!(cache, rhs_accumulator, row,
-                 item.term_coefficients[row_term_index] * rhs_value)
+      _push_rhs!(cache, rhs_accumulator, row, item.term_coefficients[row_term_index] * rhs_value)
     end
   end
 
@@ -2124,8 +2105,7 @@ end
 
 # Scatter a local nonlinear tangent contribution to the full global tangent.
 function _scatter_tangent!(cache::_ThreadScratch{T}, matrix_accumulator::_OwnedSparseAccumulator{T},
-                           item::_AssemblyValues,
-                           local_matrix::AbstractMatrix{T}, fixed::BitVector,
+                           item::_AssemblyValues, local_matrix::AbstractMatrix{T}, fixed::BitVector,
                            pivot_rows::BitVector) where {T<:AbstractFloat}
   tolerance = 1000 * eps(T)
 
@@ -2198,11 +2178,10 @@ end
 # eliminated columns through the reduced affine representation when necessary.
 function _scatter_reduced_column!(cache::_ThreadScratch{T},
                                   matrix_accumulator::_OwnedSparseAccumulator{T},
-                                  rhs_accumulator::_OwnedVectorAccumulator{T},
-                                  row_reduced::Int,
-                                  contribution::T,
-                                  global_dof::Int, reduced_index::Vector{Int}, fixed::BitVector,
-                                  fixed_values::Vector{T}, dirichlet_affine::_ReducedAffineRows{T},
+                                  rhs_accumulator::_OwnedVectorAccumulator{T}, row_reduced::Int,
+                                  contribution::T, global_dof::Int, reduced_index::Vector{Int},
+                                  fixed::BitVector, fixed_values::Vector{T},
+                                  dirichlet_affine::_ReducedAffineRows{T},
                                   tolerance::T) where {T<:AbstractFloat}
   if fixed[global_dof]
     _push_rhs!(cache, rhs_accumulator, row_reduced, -contribution * fixed_values[global_dof])
@@ -2220,8 +2199,7 @@ function _scatter_reduced_column!(cache::_ThreadScratch{T},
     throw(ArgumentError("local column $global_dof does not belong to the reduced system"))
 
   shift_value = contribution * dirichlet_affine.shifts[global_dof]
-  abs(shift_value) > tolerance &&
-    _push_rhs!(cache, rhs_accumulator, row_reduced, -shift_value)
+  abs(shift_value) > tolerance && _push_rhs!(cache, rhs_accumulator, row_reduced, -shift_value)
 
   for pointer in _affine_row_pointer_range(dirichlet_affine, global_dof)
     reduced_contribution = contribution * dirichlet_affine.coefficients[pointer]
@@ -2329,9 +2307,9 @@ function _solve_topology(layout::FieldLayout{D,T}, integration::_CompiledIntegra
   end
 
   return _PatchSolveTopology{T}(leaf_patches,
-                                _geometric_coarse_prolongation(T, layout, domain_data,
-                                                               grid_data, support_sums,
-                                                               support_counts, solve_dofs))
+                                _geometric_coarse_prolongation(T, layout, domain_data, grid_data,
+                                                               support_sums, support_counts,
+                                                               solve_dofs))
 end
 
 function _solve_topology(plan::AssemblyPlan{D,T}, condensation, reduced_index::Vector{Int},

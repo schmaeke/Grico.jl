@@ -32,8 +32,7 @@ function _parse_args(args)
     if arg == "--worker"
       parsed["worker"] = "true"
     elseif startswith(arg, "--")
-      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) :
-                    (arg[3:end], "true")
+      key, value = occursin("=", arg) ? split(arg[3:end], "="; limit=2) : (arg[3:end], "true")
       parsed[key] = value
     else
       throw(ArgumentError("unsupported argument `$arg`"))
@@ -74,8 +73,7 @@ function _benchmark_operation(operation::OperationSpec; samples::Int, seconds::F
   minimum_estimate = minimum(trial)
   median_estimate = median(trial)
 
-  return Dict("samples" => length(trial.times),
-              "minimum_seconds" => minimum_estimate.time / 1.0e9,
+  return Dict("samples" => length(trial.times), "minimum_seconds" => minimum_estimate.time / 1.0e9,
               "median_seconds" => median_estimate.time / 1.0e9,
               "minimum_memory_bytes" => minimum_estimate.memory,
               "median_memory_bytes" => median_estimate.memory,
@@ -87,16 +85,11 @@ function _environment_metadata()
   cpu_info = first(Sys.cpu_info())
   scheduler_override = get(ENV, "GRICO_SCHEDULER_OVERRIDE", "")
 
-  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC),
-                                              dateformat"yyyy-mm-ddTHH:MM:SS"),
-              "julia_version" => string(VERSION),
-              "os" => string(Sys.KERNEL),
-              "arch" => string(Sys.ARCH),
-              "hostname" => gethostname(),
-              "cpu_model" => cpu_info.model,
-              "logical_cpu_threads" => Sys.CPU_THREADS,
-              "julia_threads" => Threads.nthreads(),
-              "blas_threads" => BLAS.get_num_threads(),
+  return Dict("timestamp_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
+              "julia_version" => string(VERSION), "os" => string(Sys.KERNEL),
+              "arch" => string(Sys.ARCH), "hostname" => gethostname(),
+              "cpu_model" => cpu_info.model, "logical_cpu_threads" => Sys.CPU_THREADS,
+              "julia_threads" => Threads.nthreads(), "blas_threads" => BLAS.get_num_threads(),
               "openblas_num_threads" => get(ENV, "OPENBLAS_NUM_THREADS", ""),
               "omp_num_threads" => get(ENV, "OMP_NUM_THREADS", ""),
               "grico_scheduler_override" => scheduler_override,
@@ -109,11 +102,9 @@ function _worker_payload(case_ids; samples::Int, seconds::Float64)
 
   for case_id in case_ids
     prepared = build_phase0_case(case_id)
-    case_entry = Dict{String,Any}("id" => prepared.id,
-                                  "label" => prepared.label,
+    case_entry = Dict{String,Any}("id" => prepared.id, "label" => prepared.label,
                                   "description" => prepared.description,
-                                  "metadata" => prepared.metadata,
-                                  "operations" => Any[])
+                                  "metadata" => prepared.metadata, "operations" => Any[])
 
     for operation in prepared.operations
       println("benchmarking $(prepared.id) / $(operation.id) on $(Threads.nthreads()) thread(s)")
@@ -150,8 +141,7 @@ end
 function _combined_results(thread_runs, case_ids, thread_counts, phase_label::AbstractString)
   return Dict("phase" => String(phase_label),
               "generated_utc" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS"),
-              "primary_thread_counts" => thread_counts,
-              "selected_cases" => case_ids,
+              "primary_thread_counts" => thread_counts, "selected_cases" => case_ids,
               "performance_core_note" => _benchmark_thread_note(thread_counts),
               "thread_runs" => thread_runs)
 end
@@ -172,14 +162,12 @@ function _flatten_records(combined)
     for case_entry in thread_run["cases"]
       for operation in case_entry["operations"]
         metrics = operation["metrics"]
-        push!(records, (case_id=case_entry["id"],
-                        case_label=case_entry["label"],
-                        operation_id=operation["id"],
-                        operation_label=operation["label"],
-                        thread_count=thread_count,
-                        median_seconds=metrics["median_seconds"],
-                        median_memory_bytes=metrics["median_memory_bytes"],
-                        median_allocations=metrics["median_allocations"]))
+        push!(records,
+              (case_id=case_entry["id"], case_label=case_entry["label"],
+               operation_id=operation["id"], operation_label=operation["label"],
+               thread_count=thread_count, median_seconds=metrics["median_seconds"],
+               median_memory_bytes=metrics["median_memory_bytes"],
+               median_allocations=metrics["median_allocations"]))
       end
     end
   end
@@ -212,9 +200,7 @@ function _format_time(seconds::Real)
   return @sprintf("%.2f ns", 1.0e9 * seconds)
 end
 
-function _format_speedup(value)
-  isfinite(value) ? @sprintf("%.2f", value) : "-"
-end
+_format_speedup(value) = isfinite(value) ? @sprintf("%.2f", value) : "-"
 
 function _case_lookup(combined)
   lookup = Dict{String,Dict{String,Any}}()
@@ -257,7 +243,8 @@ function _scaled_range(record_lookup, entries, thread_count::Int)
   return minimum(speedups), maximum(speedups)
 end
 
-@inline function _has_record(record_lookup, case_id::String, operation_id::String, thread_count::Int)
+@inline function _has_record(record_lookup, case_id::String, operation_id::String,
+                             thread_count::Int)
   return haskey(record_lookup, (case_id, operation_id, thread_count))
 end
 
@@ -268,32 +255,32 @@ function _benchmark_observations(records)
 
   if _has_record(lookup, "affine_cell_diffusion", "assemble", 1) &&
      _has_record(lookup, "affine_cell_diffusion", "assemble", max_threads)
-    base, current, speedup, efficiency, memory_ratio =
-      _speedup(lookup, "affine_cell_diffusion", "assemble", max_threads)
+    base, current, speedup, efficiency, memory_ratio = _speedup(lookup, "affine_cell_diffusion",
+                                                                "assemble", max_threads)
     push!(observations,
           "Cell-dominated affine assembly is the clearest shared-memory success: `assemble(plan)` on `affine_cell_diffusion` improves from $(_format_time(base.median_seconds)) at 1 thread to $(_format_time(current.median_seconds)) at $max_threads threads, a `$( @sprintf("%.2f", speedup) )x` speedup with `$( @sprintf("%.2f", efficiency) )` efficiency. Allocation volume stays essentially flat at about `$(@sprintf("%.2f", _mib(base.median_memory_bytes)))` to `$(@sprintf("%.2f", _mib(current.median_memory_bytes))) MiB` per call.")
   end
 
   if _has_record(lookup, "affine_interface_dg", "assemble", 1) &&
      _has_record(lookup, "affine_interface_dg", "assemble", max_threads)
-    base, current, speedup, efficiency, memory_ratio =
-      _speedup(lookup, "affine_interface_dg", "assemble", max_threads)
+    base, current, speedup, efficiency, memory_ratio = _speedup(lookup, "affine_interface_dg",
+                                                                "assemble", max_threads)
     push!(observations,
           "Interface-heavy affine assembly remains the main affine stress case: `assemble(plan)` on `affine_interface_dg` moves from $(_format_time(base.median_seconds)) to $(_format_time(current.median_seconds)) at $max_threads threads, or `$( @sprintf("%.2f", speedup) )x` with `$( @sprintf("%.2f", efficiency) )` efficiency, while memory changes by about `$( @sprintf("%.2f", memory_ratio) )x`.")
   end
 
   if _has_record(lookup, "nonlinear_interface_dg", "residual_bang", 1) &&
      _has_record(lookup, "nonlinear_interface_dg", "residual_bang", max_threads)
-    base, current, speedup, efficiency, _ =
-      _speedup(lookup, "nonlinear_interface_dg", "residual_bang", max_threads)
+    base, current, speedup, efficiency, _ = _speedup(lookup, "nonlinear_interface_dg",
+                                                     "residual_bang", max_threads)
     push!(observations,
           "Nonlinear residual evaluation scales very well in the current design: `residual!` on `nonlinear_interface_dg` improves from $(_format_time(base.median_seconds)) to $(_format_time(current.median_seconds)) at $max_threads threads, which is `$( @sprintf("%.2f", speedup) )x` and `$( @sprintf("%.2f", efficiency) )` efficiency.")
   end
 
   if _has_record(lookup, "nonlinear_interface_dg", "tangent", 1) &&
      _has_record(lookup, "nonlinear_interface_dg", "tangent", max_threads)
-    base, current, speedup, efficiency, _ =
-      _speedup(lookup, "nonlinear_interface_dg", "tangent", max_threads)
+    base, current, speedup, efficiency, _ = _speedup(lookup, "nonlinear_interface_dg", "tangent",
+                                                     max_threads)
     push!(observations,
           "Nonlinear tangent assembly remains noticeably less regular than residual evaluation: `tangent(plan, state)` improves from $(_format_time(base.median_seconds)) to $(_format_time(current.median_seconds)) at $max_threads threads, or `$( @sprintf("%.2f", speedup) )x` with `$( @sprintf("%.2f", efficiency) )` efficiency.")
   end
@@ -304,22 +291,23 @@ function _benchmark_observations(records)
           ("affine_interface_dg", "preconditioner_build")]) &&
      all(entry -> _has_record(lookup, entry[1], entry[2], 1) &&
                   _has_record(lookup, entry[1], entry[2], max_threads),
-         [("affine_cell_diffusion", "solve_direct"),
-          ("affine_interface_dg", "solve_direct")])
-    preconditioner_min, preconditioner_max =
-      _scaled_range(lookup, [("affine_cell_diffusion", "preconditioner_build"),
-                             ("affine_interface_dg", "preconditioner_build")], max_threads)
-    solve_min, solve_max = _scaled_range(lookup, [("affine_cell_diffusion", "solve_direct"),
-                                                  ("affine_interface_dg", "solve_direct")],
-                                         max_threads)
+         [("affine_cell_diffusion", "solve_direct"), ("affine_interface_dg", "solve_direct")])
+    preconditioner_min, preconditioner_max = _scaled_range(lookup,
+                                                           [("affine_cell_diffusion",
+                                                             "preconditioner_build"),
+                                                            ("affine_interface_dg",
+                                                             "preconditioner_build")], max_threads)
+    solve_min, solve_max = _scaled_range(lookup,
+                                         [("affine_cell_diffusion", "solve_direct"),
+                                          ("affine_interface_dg", "solve_direct")], max_threads)
     push!(observations,
           "The solver-side measurements confirm that Phase 1 and Phase 2 should stay focused on assembly, not solver tuning. At $max_threads threads, preconditioner build speedups are only `$( @sprintf("%.2f", preconditioner_min) )x` to `$( @sprintf("%.2f", preconditioner_max) )x`, and direct solve speedups remain `$( @sprintf("%.2f", solve_min) )x` to `$( @sprintf("%.2f", solve_max) )x`.")
   end
 
   if _has_record(lookup, "adaptive_poisson", "adaptivity_plan", 1) &&
      _has_record(lookup, "adaptive_poisson", "adaptivity_plan", max_threads)
-    base, current, speedup, efficiency, _ =
-      _speedup(lookup, "adaptive_poisson", "adaptivity_plan", max_threads)
+    base, current, speedup, efficiency, _ = _speedup(lookup, "adaptive_poisson", "adaptivity_plan",
+                                                     max_threads)
     push!(observations,
           "Adaptivity planning is not a node-local bottleneck at current problem sizes. The dedicated adaptivity case stays below one millisecond per call on this machine, and the thread-scaling signal is weak enough that it should not compete with assembly work for immediate attention.")
   end
@@ -376,7 +364,8 @@ function _render_markdown(combined)
     push!(lines, "")
     push!(lines, case_entry["description"])
     push!(lines, "")
-    push!(lines, "| Operation | Threads | Median time | Median memory | Median allocs | Speedup | Efficiency |")
+    push!(lines,
+          "| Operation | Threads | Median time | Median memory | Median allocs | Speedup | Efficiency |")
     push!(lines, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
 
     for record in _records_for_case(records, case_id)
@@ -400,8 +389,8 @@ function _render_markdown(combined)
   return join(lines, "\n")
 end
 
-function _worker_command(script_path::AbstractString, thread_count::Int, output_path::AbstractString,
-                         case_ids; samples::Int, seconds::Float64)
+function _worker_command(script_path::AbstractString, thread_count::Int,
+                         output_path::AbstractString, case_ids; samples::Int, seconds::Float64)
   command = `$(Base.julia_cmd()) --project=$(BENCHMARK_PROJECT) --threads=$(thread_count) $(script_path) --worker --output=$(output_path) --samples=$(samples) --seconds=$(seconds) --cases=$(join(case_ids, ","))`
   environment = copy(ENV)
   environment["OPENBLAS_NUM_THREADS"] = "1"
@@ -415,8 +404,8 @@ function _run_driver(raw_args)
   samples = parse(Int, get(raw_args, "samples", string(DEFAULT_SAMPLES)))
   seconds = parse(Float64, get(raw_args, "seconds", string(DEFAULT_SECONDS)))
   phase_label = get(raw_args, "phase-label", DEFAULT_PHASE_LABEL)
-  output_path = get(raw_args, "output", joinpath(BENCHMARK_PROJECT,
-                                                 "phase0_shared_memory_baseline.toml"))
+  output_path = get(raw_args, "output",
+                    joinpath(BENCHMARK_PROJECT, "phase0_shared_memory_baseline.toml"))
   report_path = get(raw_args, "report", _report_path_for_output(output_path))
   script_path = abspath(@__FILE__)
   temporary_paths = String[]
@@ -447,8 +436,7 @@ function _run_driver(raw_args)
 end
 
 function _report_path_for_output(output_path::AbstractString)
-  basename(output_path) == output_path &&
-    return replace(output_path, r"\.toml$" => ".md")
+  basename(output_path) == output_path && return replace(output_path, r"\.toml$" => ".md")
   return joinpath(dirname(output_path), replace(basename(output_path), r"\.toml$" => ".md"))
 end
 

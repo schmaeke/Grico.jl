@@ -4,8 +4,8 @@ using LinearAlgebra
 using SparseArrays
 using Grico
 
-import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!,
-              face_tangent!, interface_matrix!, interface_residual!, interface_tangent!
+import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!, face_tangent!,
+              interface_matrix!, interface_residual!, interface_tangent!
 
 export OperationSpec, PreparedCase, build_phase0_case, phase0_case_ids
 
@@ -31,8 +31,9 @@ struct PreparedCase
   operations::Vector{OperationSpec}
 end
 
-phase0_case_ids() = ("affine_cell_diffusion", "affine_interface_dg", "nonlinear_interface_dg",
-                     "adaptive_poisson")
+function phase0_case_ids()
+  ("affine_cell_diffusion", "affine_interface_dg", "nonlinear_interface_dg", "adaptive_poisson")
+end
 
 struct Diffusion{F,T}
   field::F
@@ -118,12 +119,9 @@ function interface_matrix!(local_matrix, operator::GradientJumpPenalty, values::
   plus_values = Grico.plus(values)
   minus_minus = Grico.block(local_matrix, minus_values, operator.field, minus_values,
                             operator.field)
-  minus_plus = Grico.block(local_matrix, minus_values, operator.field, plus_values,
-                           operator.field)
-  plus_minus = Grico.block(local_matrix, plus_values, operator.field, minus_values,
-                           operator.field)
-  plus_plus = Grico.block(local_matrix, plus_values, operator.field, plus_values,
-                          operator.field)
+  minus_plus = Grico.block(local_matrix, minus_values, operator.field, plus_values, operator.field)
+  plus_minus = Grico.block(local_matrix, plus_values, operator.field, minus_values, operator.field)
+  plus_plus = Grico.block(local_matrix, plus_values, operator.field, plus_values, operator.field)
   minus_modes = Grico.local_mode_count(minus_values, operator.field)
   plus_modes = Grico.local_mode_count(plus_values, operator.field)
 
@@ -148,8 +146,7 @@ function interface_matrix!(local_matrix, operator::GradientJumpPenalty, values::
     end
 
     for row_mode in 1:plus_modes
-      row_gradient = Grico.shape_normal_gradient(plus_values, operator.field, point_index,
-                                                 row_mode)
+      row_gradient = Grico.shape_normal_gradient(plus_values, operator.field, point_index, row_mode)
 
       for col_mode in 1:minus_modes
         col_gradient = Grico.shape_normal_gradient(minus_values, operator.field, point_index,
@@ -173,8 +170,7 @@ struct NonlinearReaction{F,T}
   source::T
 end
 
-function cell_residual!(local_rhs, operator::NonlinearReaction, values::CellValues,
-                        state::State)
+function cell_residual!(local_rhs, operator::NonlinearReaction, values::CellValues, state::State)
   block = Grico.block(local_rhs, values, operator.field)
   mode_count = Grico.local_mode_count(values, operator.field)
 
@@ -191,8 +187,7 @@ function cell_residual!(local_rhs, operator::NonlinearReaction, values::CellValu
   return nothing
 end
 
-function cell_tangent!(local_matrix, operator::NonlinearReaction, values::CellValues,
-                       state::State)
+function cell_tangent!(local_matrix, operator::NonlinearReaction, values::CellValues, state::State)
   block = Grico.block(local_matrix, values, operator.field, operator.field)
   mode_count = Grico.local_mode_count(values, operator.field)
 
@@ -296,12 +291,9 @@ function interface_tangent!(local_matrix, operator::NonlinearGradientJump, value
   plus_values = Grico.plus(values)
   minus_minus = Grico.block(local_matrix, minus_values, operator.field, minus_values,
                             operator.field)
-  minus_plus = Grico.block(local_matrix, minus_values, operator.field, plus_values,
-                           operator.field)
-  plus_minus = Grico.block(local_matrix, plus_values, operator.field, minus_values,
-                           operator.field)
-  plus_plus = Grico.block(local_matrix, plus_values, operator.field, plus_values,
-                          operator.field)
+  minus_plus = Grico.block(local_matrix, minus_values, operator.field, plus_values, operator.field)
+  plus_minus = Grico.block(local_matrix, plus_values, operator.field, minus_values, operator.field)
+  plus_plus = Grico.block(local_matrix, plus_values, operator.field, plus_values, operator.field)
   minus_modes = Grico.local_mode_count(minus_values, operator.field)
   plus_modes = Grico.local_mode_count(plus_values, operator.field)
 
@@ -328,8 +320,7 @@ function interface_tangent!(local_matrix, operator::NonlinearGradientJump, value
     end
 
     for row_mode in 1:plus_modes
-      row_gradient = Grico.shape_normal_gradient(plus_values, operator.field, point_index,
-                                                 row_mode)
+      row_gradient = Grico.shape_normal_gradient(plus_values, operator.field, point_index, row_mode)
 
       for col_mode in 1:minus_modes
         col_gradient = Grico.shape_normal_gradient(minus_values, operator.field, point_index,
@@ -348,17 +339,11 @@ function interface_tangent!(local_matrix, operator::NonlinearGradientJump, value
   return nothing
 end
 
-@inline function _state_pattern(index::Int)
-  return 0.35 * sin(0.017 * index) + 0.25 * cos(0.011 * index)
-end
+@inline _state_pattern(index::Int) = 0.35 * sin(0.017 * index) + 0.25 * cos(0.011 * index)
 
-@inline function _poisson_exact_solution(x)
-  sinpi(x[1]) * sinpi(x[2])
-end
+@inline _poisson_exact_solution(x) = sinpi(x[1]) * sinpi(x[2])
 
-@inline function _poisson_source_term(x)
-  2 * pi^2 * _poisson_exact_solution(x)
-end
+@inline _poisson_source_term(x) = 2 * pi^2 * _poisson_exact_solution(x)
 
 @inline function _singular_exact_solution(x)
   radius = sqrt(sum(abs2, x))
@@ -394,8 +379,7 @@ function _integration_metadata(plan)
                           "boundary_faces" => length(integration.boundary_faces),
                           "interfaces" => length(integration.interfaces),
                           "embedded_surfaces" => length(integration.embedded_surfaces),
-                          "max_local_dofs" => isempty(local_counts) ? 0 :
-                                              maximum(local_counts))
+                          "max_local_dofs" => isempty(local_counts) ? 0 : maximum(local_counts))
 end
 
 function _prepared_metadata(plan; system=nothing, extra::Dict{String,Any}=Dict{String,Any}())
@@ -426,8 +410,9 @@ function _affine_cell_case()
   Grico.add_cell!(problem, Source(u, _poisson_source_term))
 
   for axis in 1:2, side in (Grico.LOWER, Grico.UPPER)
-    Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(axis, side),
-                                                   _poisson_exact_solution))
+    Grico.add_constraint!(problem,
+                          Grico.Dirichlet(u, Grico.BoundaryFace(axis, side),
+                                          _poisson_exact_solution))
   end
 
   plan = Grico.compile(problem)
@@ -436,24 +421,26 @@ function _affine_cell_case()
   state = Grico.State(plan, solution)
   preconditioner = Grico.AdditiveSchwarzPreconditioner(min_dofs=0)
   metadata = _prepared_metadata(plan; system,
-                                extra=Dict("case_kind" => "affine",
-                                           "continuity" => "cg",
-                                           "degree" => 3,
-                                           "root_counts" => [40, 40],
+                                extra=Dict("case_kind" => "affine", "continuity" => "cg",
+                                           "degree" => 3, "root_counts" => [40, 40],
                                            "active_leaves" => length(Grico.active_leaves(space))))
 
-  operations = OperationSpec[
-    OperationSpec("assemble", "assemble(plan)", () -> Grico.assemble(plan), () -> nothing),
-    OperationSpec("preconditioner_build", "build AdditiveSchwarzPreconditioner",
-                  () -> Grico._preconditioner_operator(system, preconditioner),
-                  () -> empty!(system.preconditioner_cache)),
-    OperationSpec("solve_direct", "solve(system; linear_solve=A\\\\b)",
-                  () -> Grico.solve(system; linear_solve=DIRECT_LINEAR_SOLVE), () -> nothing),
-    OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
-                  () -> Grico.hp_adaptivity_plan(state, u; threshold=ADAPTIVITY_THRESHOLD,
-                                                 smoothness_threshold=SMOOTHNESS_THRESHOLD),
-                  () -> nothing),
-  ]
+  operations = OperationSpec[OperationSpec("assemble", "assemble(plan)", () -> Grico.assemble(plan),
+                                           () -> nothing),
+                             OperationSpec("preconditioner_build",
+                                           "build AdditiveSchwarzPreconditioner",
+                                           () -> Grico._preconditioner_operator(system,
+                                                                                preconditioner),
+                                           () -> empty!(system.preconditioner_cache)),
+                             OperationSpec("solve_direct", "solve(system; linear_solve=A\\\\b)",
+                                           () -> Grico.solve(system;
+                                                             linear_solve=DIRECT_LINEAR_SOLVE),
+                                           () -> nothing),
+                             OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
+                                           () -> Grico.hp_adaptivity_plan(state, u;
+                                                                          threshold=ADAPTIVITY_THRESHOLD,
+                                                                          smoothness_threshold=SMOOTHNESS_THRESHOLD),
+                                           () -> nothing)]
 
   return PreparedCase("affine_cell_diffusion", "Affine Cell-Dominated Diffusion",
                       "Continuous scalar Poisson problem with volume-dominated affine assembly.",
@@ -464,8 +451,7 @@ function _affine_interface_case()
   domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (40, 40))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
-                                           degree=Grico.UniformDegree(2),
-                                           continuity=:dg))
+                                           degree=Grico.UniformDegree(2), continuity=:dg))
   u = Grico.ScalarField(space; name=:u)
   problem = Grico.AffineProblem(u)
   Grico.add_cell!(problem, MassCoupling(u, u, 1.0))
@@ -474,20 +460,21 @@ function _affine_interface_case()
   system = Grico.assemble(plan)
   preconditioner = Grico.AdditiveSchwarzPreconditioner(min_dofs=0)
   metadata = _prepared_metadata(plan; system,
-                                extra=Dict("case_kind" => "affine",
-                                           "continuity" => "dg",
-                                           "degree" => 2,
-                                           "root_counts" => [40, 40],
+                                extra=Dict("case_kind" => "affine", "continuity" => "dg",
+                                           "degree" => 2, "root_counts" => [40, 40],
                                            "active_leaves" => length(Grico.active_leaves(space))))
 
-  operations = OperationSpec[
-    OperationSpec("assemble", "assemble(plan)", () -> Grico.assemble(plan), () -> nothing),
-    OperationSpec("preconditioner_build", "build AdditiveSchwarzPreconditioner",
-                  () -> Grico._preconditioner_operator(system, preconditioner),
-                  () -> empty!(system.preconditioner_cache)),
-    OperationSpec("solve_direct", "solve(system; linear_solve=A\\\\b)",
-                  () -> Grico.solve(system; linear_solve=DIRECT_LINEAR_SOLVE), () -> nothing),
-  ]
+  operations = OperationSpec[OperationSpec("assemble", "assemble(plan)", () -> Grico.assemble(plan),
+                                           () -> nothing),
+                             OperationSpec("preconditioner_build",
+                                           "build AdditiveSchwarzPreconditioner",
+                                           () -> Grico._preconditioner_operator(system,
+                                                                                preconditioner),
+                                           () -> empty!(system.preconditioner_cache)),
+                             OperationSpec("solve_direct", "solve(system; linear_solve=A\\\\b)",
+                                           () -> Grico.solve(system;
+                                                             linear_solve=DIRECT_LINEAR_SOLVE),
+                                           () -> nothing)]
 
   return PreparedCase("affine_interface_dg", "Affine Interface-Heavy DG Mass + Jump",
                       "Discontinuous scalar mass problem with explicit interior interface work.",
@@ -498,8 +485,7 @@ function _nonlinear_interface_case()
   domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (28, 28))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
-                                           degree=Grico.UniformDegree(2),
-                                           continuity=:dg))
+                                           degree=Grico.UniformDegree(2), continuity=:dg))
   u = Grico.ScalarField(space; name=:u)
   problem = Grico.ResidualProblem(u)
   Grico.add_cell!(problem, NonlinearReaction(u, 0.2))
@@ -520,18 +506,15 @@ function _nonlinear_interface_case()
 
   residual_buffer = zeros(Float64, Grico.dof_count(plan))
   metadata = _prepared_metadata(plan;
-                                extra=Dict("case_kind" => "nonlinear",
-                                           "continuity" => "dg",
-                                           "degree" => 2,
-                                           "root_counts" => [28, 28],
+                                extra=Dict("case_kind" => "nonlinear", "continuity" => "dg",
+                                           "degree" => 2, "root_counts" => [28, 28],
                                            "active_leaves" => length(Grico.active_leaves(space))))
 
-  operations = OperationSpec[
-    OperationSpec("residual_bang", "residual!(buffer, plan, state)",
-                  () -> Grico.residual!(residual_buffer, plan, state), () -> nothing),
-    OperationSpec("tangent", "tangent(plan, state)", () -> Grico.tangent(plan, state),
-                  () -> nothing),
-  ]
+  operations = OperationSpec[OperationSpec("residual_bang", "residual!(buffer, plan, state)",
+                                           () -> Grico.residual!(residual_buffer, plan, state),
+                                           () -> nothing),
+                             OperationSpec("tangent", "tangent(plan, state)",
+                                           () -> Grico.tangent(plan, state), () -> nothing)]
 
   return PreparedCase("nonlinear_interface_dg", "Nonlinear DG Residual + Tangent",
                       "Nonlinear discontinuous problem with cell, boundary, and interface terms.",
@@ -568,20 +551,16 @@ function _adaptive_poisson_case()
     Grico.coefficients(state)[index] = _state_pattern(index)
   end
 
-  metadata = Dict{String,Any}("case_kind" => "adaptivity",
-                              "continuity" => "cg",
-                              "degree" => 3,
-                              "root_counts" => [8, 8],
-                              "manual_refinement_passes" => 2,
+  metadata = Dict{String,Any}("case_kind" => "adaptivity", "continuity" => "cg", "degree" => 3,
+                              "root_counts" => [8, 8], "manual_refinement_passes" => 2,
                               "active_leaves" => length(Grico.active_leaves(space)),
                               "full_dofs" => length(Grico.coefficients(state)))
 
-  operations = OperationSpec[
-    OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
-                  () -> Grico.hp_adaptivity_plan(state, u; threshold=ADAPTIVITY_THRESHOLD,
-                                                 smoothness_threshold=SMOOTHNESS_THRESHOLD),
-                  () -> nothing),
-  ]
+  operations = OperationSpec[OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
+                                           () -> Grico.hp_adaptivity_plan(state, u;
+                                                                          threshold=ADAPTIVITY_THRESHOLD,
+                                                                          smoothness_threshold=SMOOTHNESS_THRESHOLD),
+                                           () -> nothing)]
 
   return PreparedCase("adaptive_poisson", "Adaptive Planning On Refined Mesh",
                       "Adaptivity-planning benchmark on a deterministic manually refined mesh.",

@@ -105,19 +105,22 @@ struct Dirichlet
   components::Tuple{Vararg{Int}}
   data
 
-  function Dirichlet(field::AbstractField, boundary::BoundaryFace,
-                     components::Tuple{Vararg{Int}}, data)
+  function Dirichlet(field::AbstractField, boundary::BoundaryFace, components::Tuple{Vararg{Int}},
+                     data)
     return new(field, boundary, _checked_dirichlet_components(field, components), data)
   end
 end
 
-Dirichlet(field::AbstractField, boundary::BoundaryFace, data) =
+function Dirichlet(field::AbstractField, boundary::BoundaryFace, data)
   Dirichlet(field, boundary, _all_dirichlet_components(field), data)
-Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data) =
+end
+function Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data)
   Dirichlet(field, boundary, (Int(component),), data)
-Dirichlet(field::AbstractField, boundary::BoundaryFace,
-          components::Tuple{Vararg{<:Integer}}, data) =
+end
+function Dirichlet(field::AbstractField, boundary::BoundaryFace,
+                   components::Tuple{Vararg{<:Integer}}, data)
   Dirichlet(field, boundary, Tuple(Int(component) for component in components), data)
+end
 
 """
     MeanValue(field, target)
