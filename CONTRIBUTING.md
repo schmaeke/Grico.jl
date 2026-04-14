@@ -21,8 +21,9 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
 The package root intentionally tracks only [`Project.toml`](Project.toml), not
-`Manifest.toml`. Reproducibility-specific environments such as
-[`benchmark/`](benchmark) keep their own committed manifests.
+`Manifest.toml`. The [`benchmark/`](benchmark) environment keeps its own
+[`Project.toml`](benchmark/Project.toml), while local manifests and generated
+benchmark reports stay untracked.
 
 - Add or update tests when behavior changes.
 - If a change affects exported API, user-facing examples, or mathematical

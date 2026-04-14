@@ -51,8 +51,9 @@ julia --project=.
 
 The package root intentionally does not track a `Manifest.toml`. Dependency
 resolution for normal package development therefore comes from
-[`Project.toml`](Project.toml), while reproducibility-specific sub-environments
-such as [`benchmark/`](benchmark) keep their own committed manifests.
+[`Project.toml`](Project.toml). The [`benchmark/`](benchmark) environment keeps
+its own [`Project.toml`](benchmark/Project.toml), while local manifests and
+generated benchmark reports stay untracked.
 
 ## Workflow
 

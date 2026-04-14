@@ -1,38 +1,21 @@
-*
-!/.gitignore
-!/.JuliaFormatter.toml
-# The package root tracks only Project.toml. Reproducible sub-environments such
-# as benchmarks keep their own committed manifests.
-!/Project.toml
-!/format.jl
-!/README.md
-!/LICENSE
-!/CITATION.cff
-!/CITATION.bib
-!/CONTRIBUTING.md
-!/cleanup_inventory.md
-!/.github/
-!/.github/workflows/
-!/.github/workflows/*.yml
-!/res/
-!/res/*.png
-!/res/*.svg
-!/res/*.tex
-!/src/
-!/src/*.jl
-!/test/
-!/test/*.jl
-!/benchmark/
-!/benchmark/*.jl
-!/benchmark/*.md
-!/benchmark/Manifest.toml
-!/benchmark/Project.toml
-!/examples/
-!/examples/*.jl
-!/todo.md
-!/rewrite.md
+# macOS / editor noise
+.DS_Store
+*.swp
+*~
 
-/examples/output/
+# Local Julia environments stay machine-specific.
+Manifest.toml
+
+# Benchmark scripts currently emit reports and raw data into benchmark/.
+/benchmark/*.md
+/benchmark/*.toml
+!/benchmark/Project.toml
+/benchmark/*.txt
+
+# Generated output directories.
 /benchmark/output/
+/examples/output/
+
+# Local scratch directories.
 /old/
 /tmp/
