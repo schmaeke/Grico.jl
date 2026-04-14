@@ -31,4 +31,8 @@ using Grico
       include("vtk.jl")
     end
   end
+
+  @testset verbose = true "Examples" begin
+    include("examples.jl")
+  end
 end
