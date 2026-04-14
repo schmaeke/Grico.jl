@@ -20,6 +20,10 @@ julia format.jl
 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
+The package root intentionally tracks only [`Project.toml`](Project.toml), not
+`Manifest.toml`. Reproducibility-specific environments such as
+[`benchmark/`](benchmark) keep their own committed manifests.
+
 - Add or update tests when behavior changes.
 - If a change affects exported API, user-facing examples, or mathematical
   behavior, update the corresponding documentation and comments in the same

@@ -49,6 +49,11 @@ From a local checkout:
 julia --project=.
 ```
 
+The package root intentionally does not track a `Manifest.toml`. Dependency
+resolution for normal package development therefore comes from
+[`Project.toml`](Project.toml), while reproducibility-specific sub-environments
+such as [`benchmark/`](benchmark) keep their own committed manifests.
+
 ## Workflow
 
 1. Build a `Domain` on a Cartesian grid.

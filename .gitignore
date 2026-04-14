@@ -1,8 +1,9 @@
 *
 !/.gitignore
 !/.JuliaFormatter.toml
+# The package root tracks only Project.toml. Reproducible sub-environments such
+# as benchmarks keep their own committed manifests.
 !/Project.toml
-!/Manifest.toml
 !/format.jl
 !/README.md
 !/LICENSE
