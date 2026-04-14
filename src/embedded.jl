@@ -271,10 +271,9 @@ end
 # subdivision itself is shared across dimensions.
 function _append_embedded_surface_subcells!(points::Vector{NTuple{D,T}}, weights::Vector{T},
                                             normals::Vector{NTuple{D,T}},
-                                            domain::AbstractDomain{D,T},
-                                            leaf::Int, classifier, rule, lower::NTuple{D,T},
-                                            upper::NTuple{D,T}, depth::Int,
-                                            max_depth::Int) where {D,T<:AbstractFloat}
+                                            domain::AbstractDomain{D,T}, leaf::Int, classifier,
+                                            rule, lower::NTuple{D,T}, upper::NTuple{D,T},
+                                            depth::Int, max_depth::Int) where {D,T<:AbstractFloat}
   _embedded_surface_state(domain, leaf, classifier, lower, upper, T) == :uniform && return nothing
 
   if depth >= max_depth
@@ -298,8 +297,8 @@ end
 # uniform means that no zero crossing is detected on the sampled corners and
 # center, regardless of which side of the interface the subcell lies on.
 function _embedded_surface_state(domain::AbstractDomain{D,T}, leaf::Int, classifier,
-                                 lower::NTuple{D,T},
-                                 upper::NTuple{D,T}, ::Type{T}) where {D,T<:AbstractFloat}
+                                 lower::NTuple{D,T}, upper::NTuple{D,T},
+                                 ::Type{T}) where {D,T<:AbstractFloat}
   minimum_value, maximum_value = _subcell_sample_extrema(domain, leaf, classifier, lower, upper,
                                                          _surface_classifier_value, T)
   tolerance = _EMBEDDED_SURFACE_TOLERANCE(T)
@@ -313,9 +312,9 @@ end
 # classifier derivative.
 function _append_terminal_embedded_surface!(points::Vector{NTuple{1,T}}, weights::Vector{T},
                                             normals::Vector{NTuple{1,T}},
-                                            domain::AbstractDomain{1,T},
-                                            leaf::Int, classifier, ::Nothing, lower::NTuple{1,T},
-                                            upper::NTuple{1,T}, ::Type{T}) where {T<:AbstractFloat}
+                                            domain::AbstractDomain{1,T}, leaf::Int, classifier,
+                                            ::Nothing, lower::NTuple{1,T}, upper::NTuple{1,T},
+                                            ::Type{T}) where {T<:AbstractFloat}
   root = _subcell_root(lower[1], upper[1],
                        _surface_classifier_value(classifier,
                                                  map_from_biunit_cube(domain, leaf, lower), T),
@@ -334,10 +333,9 @@ end
 # from the cut reference square and place quadrature points on each segment.
 function _append_terminal_embedded_surface!(points::Vector{NTuple{2,T}}, weights::Vector{T},
                                             normals::Vector{NTuple{2,T}},
-                                            domain::AbstractDomain{2,T},
-                                            leaf::Int, classifier, rule::GaussLegendreRule{T},
-                                            lower::NTuple{2,T}, upper::NTuple{2,T},
-                                            ::Type{T}) where {T<:AbstractFloat}
+                                            domain::AbstractDomain{2,T}, leaf::Int, classifier,
+                                            rule::GaussLegendreRule{T}, lower::NTuple{2,T},
+                                            upper::NTuple{2,T}, ::Type{T}) where {T<:AbstractFloat}
   segments = _terminal_embedded_surface_segments(domain, leaf, classifier, lower, upper, T)
 
   for (first_point, second_point) in segments
@@ -421,9 +419,8 @@ end
 # Place Gauss-Legendre quadrature points on one straight reference segment and
 # assign a consistent reference normal orientation.
 function _append_segment_quadrature!(points::Vector{NTuple{2,T}}, weights::Vector{T},
-                                     normals::Vector{NTuple{2,T}},
-                                     domain::AbstractDomain{2,T}, leaf::Int,
-                                     classifier, rule::GaussLegendreRule{T},
+                                     normals::Vector{NTuple{2,T}}, domain::AbstractDomain{2,T},
+                                     leaf::Int, classifier, rule::GaussLegendreRule{T},
                                      first_point::NTuple{2,T}, second_point::NTuple{2,T},
                                      ::Type{T}) where {T<:AbstractFloat}
   midpoint, half_vector, half_length = _segment_rule_geometry(first_point, second_point, T)
@@ -636,8 +633,8 @@ function _segment_mesh_surface_quadratures(mesh::SegmentMesh, domain::AbstractDo
 end
 
 function _segment_leaf_surface_quadrature(domain::AbstractDomain{2,T}, leaf::Int,
-                                          first_point::NTuple{2,T},
-                                          second_point::NTuple{2,T}, quadrature_point_count::Int,
+                                          first_point::NTuple{2,T}, second_point::NTuple{2,T},
+                                          quadrature_point_count::Int,
                                           ::Type{T}) where {T<:AbstractFloat}
   _segment_bbox_overlaps(domain, leaf, first_point, second_point, T) || return nothing
   clipped = _clip_segment_to_leaf(domain, leaf, first_point, second_point, T)
@@ -725,8 +722,8 @@ end
 # Convert one physical segment piece inside a leaf to reference coordinates and
 # place a one-dimensional Gauss-Legendre rule on that reference segment.
 function _segment_surface_quadrature(domain::AbstractDomain{2,T}, leaf::Int,
-                                     first_point::NTuple{2,T},
-                                     second_point::NTuple{2,T}, quadrature_point_count::Int,
+                                     first_point::NTuple{2,T}, second_point::NTuple{2,T},
+                                     quadrature_point_count::Int,
                                      ::Type{T}) where {T<:AbstractFloat}
   first_reference = map_to_biunit_cube(domain, leaf, first_point)
   second_reference = map_to_biunit_cube(domain, leaf, second_point)

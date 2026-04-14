@@ -104,9 +104,9 @@ function write_vtk(path::AbstractString, state::State; kwargs...)
   return write_vtk(path, space; state=state, kwargs...)
 end
 
-function write_vtk(path::AbstractString, space::HpSpace{D,T};
-                   state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
-                   field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
+function write_vtk(path::AbstractString, space::HpSpace{D,T}; state::Union{Nothing,State}=nothing,
+                   fields=nothing, point_data=(), cell_data=(), field_data=(),
+                   subdivisions::Integer=1, export_degree::Integer=1,
                    vtk_kwargs...) where {D,T<:AbstractFloat}
   return _write_vtk(path, space; state=state, fields=fields, point_data=point_data,
                     cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
@@ -122,10 +122,9 @@ function write_vtk(path::AbstractString, domain_data::AbstractDomain{D,T};
                     export_degree=export_degree, vtk_kwargs...)
 end
 
-function _write_vtk(path::AbstractString, reference;
-                    state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
-                    field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
-                    vtk_kwargs...)
+function _write_vtk(path::AbstractString, reference; state::Union{Nothing,State}=nothing,
+                    fields=nothing, point_data=(), cell_data=(), field_data=(),
+                    subdivisions::Integer=1, export_degree::Integer=1, vtk_kwargs...)
   return _with_internal_blas_threads() do
     reference_domain = _vtk_reference_domain(reference)
     D = dimension(reference_domain)
@@ -562,8 +561,7 @@ end
 # between neighboring leaves; duplicating them keeps the connectivity compact and
 # allows each exported cell to remain a self-contained Lagrange cell, which is
 # the most robust choice for high-order output.
-function _vtk_mesh_data(reference, subdivisions::Int,
-                        export_degree::Int)
+function _vtk_mesh_data(reference, subdivisions::Int, export_degree::Int)
   return _vtk_mesh_data(_vtk_reference_domain(reference), _vtk_reference_active_leaves(reference),
                         subdivisions, export_degree)
 end

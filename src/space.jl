@@ -229,9 +229,9 @@ function SpaceOptions(; basis::AbstractBasisFamily=TrunkBasis(),
                       quadrature::AbstractQuadraturePolicy=DegreePlusQuadrature(1), continuity=:cg)
   checked_continuity = _checked_continuity_spec(continuity)
   return SpaceOptions{typeof(basis),typeof(degree),typeof(quadrature),typeof(checked_continuity)}(basis,
-                                                                                                   degree,
-                                                                                                   quadrature,
-                                                                                                   checked_continuity)
+                                                                                                  degree,
+                                                                                                  quadrature,
+                                                                                                  checked_continuity)
 end
 
 # Public compiled-space object.
@@ -269,8 +269,7 @@ interface in this file intentionally hides those implementation details behind
 one compiled representation.
 """
 struct HpSpace{D,T<:AbstractFloat,DO<:AbstractDomain{D,T},B<:AbstractBasisFamily,
-               DG<:AbstractDegreePolicy,Q<:AbstractQuadraturePolicy,
-               C<:_AbstractContinuityPolicy}
+               DG<:AbstractDegreePolicy,Q<:AbstractQuadraturePolicy,C<:_AbstractContinuityPolicy}
   domain::DO
   basis::B
   degree_policy::DG
@@ -570,7 +569,9 @@ function _leaf_degrees(policy::UniformDegree, domain::AbstractDomain{D}, leaf::I
 end
 
 # Axis degrees are already stored in the exact format the compiler needs.
-_leaf_degrees(policy::AxisDegrees{D}, domain::AbstractDomain{D}, leaf::Int) where {D} = policy.degrees
+function _leaf_degrees(policy::AxisDegrees{D}, domain::AbstractDomain{D}, leaf::Int) where {D}
+  policy.degrees
+end
 
 # Evaluate a user callback and validate that it returns a full nonnegative degree
 # tuple of the correct dimension.
@@ -648,8 +649,8 @@ end
 # produced together so the public constructor stays focused on wiring the final
 # immutable `HpSpace`. Algebraically, this is where a set of leaf-local modal
 # bases becomes one sparse global space description.
-function _compile_space_data(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer}, basis::B,
-                             leaf_degrees::Vector{NTuple{D,Int}},
+function _compile_space_data(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
+                             basis::B, leaf_degrees::Vector{NTuple{D,Int}},
                              continuity_policy::_AxisContinuity{D},
                              quadrature_policy) where {D,T<:AbstractFloat,B<:AbstractBasisFamily}
   grid_data = grid(domain)

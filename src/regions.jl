@@ -45,7 +45,8 @@ corner, are treated as outside and are therefore trimmed as well.
 `PhysicalDomain` does not modify the wrapped background mesh. It only changes
 how later discretization layers interpret that mesh.
 """
-struct PhysicalDomain{D,T<:AbstractFloat,B<:Domain{D,T},R<:AbstractPhysicalRegion} <: AbstractDomain{D,T}
+struct PhysicalDomain{D,T<:AbstractFloat,B<:Domain{D,T},R<:AbstractPhysicalRegion} <:
+       AbstractDomain{D,T}
   background::B
   region::R
 end
@@ -162,7 +163,8 @@ function _domain_active_leaves(domain::PhysicalDomain{D,T}) where {D,T<:Abstract
     _classify_leaf(domain.region, domain, leaf) === :outside || push!(leaves, leaf)
   end
 
-  isempty(leaves) && throw(ArgumentError("physical domains must contain at least one active physical leaf"))
+  isempty(leaves) &&
+    throw(ArgumentError("physical domains must contain at least one active physical leaf"))
   return leaves
 end
 
@@ -360,8 +362,8 @@ const _FINITE_CELL_MOMENT_TOLERANCE_SCALE = 1.0e3
 const _FINITE_CELL_WEIGHT_PRUNE_RATIO = 1.0e-8
 const _FINITE_CELL_MAX_ELIMINATION_ITERATIONS = 1024
 
-@inline _finite_cell_moment_tolerance(::Type{T}) where {T<:AbstractFloat} =
-  T(_FINITE_CELL_MOMENT_TOLERANCE_SCALE) * eps(T)
+@inline _finite_cell_moment_tolerance(::Type{T}) where {T<:AbstractFloat} = T(_FINITE_CELL_MOMENT_TOLERANCE_SCALE) *
+                                                                            eps(T)
 
 function _moment_fit_finite_cell_quadrature(points::Vector{NTuple{D,T}}, weights::Vector{T},
                                             quadrature_shape::NTuple{D,Int}) where {D,

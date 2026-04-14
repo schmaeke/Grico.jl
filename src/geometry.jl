@@ -276,7 +276,9 @@ selected axis.
 Because the geometry is axis-aligned and affine, the center is simply the
 midpoint of the lower and upper bounds on each axis.
 """
-cell_center(domain::AbstractDomain, cell::Integer) = cell_center(geometry(domain), grid(domain), cell)
+function cell_center(domain::AbstractDomain, cell::Integer)
+  cell_center(geometry(domain), grid(domain), cell)
+end
 function cell_center(domain::AbstractDomain, cell::Integer, axis::Integer)
   cell_center(geometry(domain), grid(domain), cell, axis)
 end
@@ -292,7 +294,9 @@ For an axis-aligned affine cell, the measure is
 
 where `hₐ` are the per-axis cell sizes.
 """
-cell_volume(domain::AbstractDomain, cell::Integer) = cell_volume(geometry(domain), grid(domain), cell)
+function cell_volume(domain::AbstractDomain, cell::Integer)
+  cell_volume(geometry(domain), grid(domain), cell)
+end
 
 """
     face_measure(domain, cell, axis)
@@ -336,7 +340,8 @@ quadrature code:
 
 where `x_c` is the cell center and `h` is the vector of cell sizes.
 """
-function map_from_biunit_cube(domain::AbstractDomain{D}, cell::Integer, ξ::NTuple{D,<:Real}) where {D}
+function map_from_biunit_cube(domain::AbstractDomain{D}, cell::Integer,
+                              ξ::NTuple{D,<:Real}) where {D}
   map_from_biunit_cube(geometry(domain), grid(domain), cell, ξ)
 end
 

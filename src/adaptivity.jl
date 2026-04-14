@@ -300,8 +300,8 @@ mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:AbstractDoma
                                          target_leaf_to_index::I,
                                          limits::L) where {D,T<:AbstractFloat,S<:HpSpace{D,T},
                                                            N<:AbstractDomain{D,T},
-                                                           V<:Vector{NTuple{D,Int}},
-                                                           I<:Vector{Int},L<:AdaptivityLimits{D}}
+                                                           V<:Vector{NTuple{D,Int}},I<:Vector{Int},
+                                                           L<:AdaptivityLimits{D}}
     _same_adaptivity_geometry(domain(source_space), target_domain) ||
       throw(ArgumentError("target domain must share the source geometry and root cell counts"))
     stored_cell_count(grid(target_domain)) == length(target_leaf_to_index) ||
@@ -380,14 +380,15 @@ grid(plan::AdaptivityPlan) = grid(plan.target_domain)
 active_leaf_count(plan::AdaptivityPlan) = length(plan.target_degrees)
 active_leaves(plan::AdaptivityPlan) = _domain_active_leaves(plan.target_domain)
 function active_leaf(plan::AdaptivityPlan, index::Integer)
-  @inbounds return active_leaves(plan)[_checked_index(index, active_leaf_count(plan), "active leaf")]
+  @inbounds return active_leaves(plan)[_checked_index(index, active_leaf_count(plan),
+                                                      "active leaf")]
 end
 
 # Check that `leaf` names one active target leaf in `plan`.
 function _checked_target_leaf(plan::AdaptivityPlan, leaf::Integer)
   checked_leaf = _checked_cell(grid(plan), leaf)
   checked_leaf <= length(plan.target_leaf_to_index) &&
-    plan.target_leaf_to_index[checked_leaf] != 0 ||
+  plan.target_leaf_to_index[checked_leaf] != 0 ||
     throw(ArgumentError("leaf $checked_leaf is not an active target leaf"))
   return checked_leaf
 end
@@ -1012,8 +1013,7 @@ end
 # Lift one target topology onto a companion space by inheriting the maximal
 # degree over every overlapping source leaf. This reproduces refinement
 # inheritance and coarsening-by-maximum without assuming leaf-number identity.
-function _inherited_target_degrees(space::HpSpace{D},
-                                   target_domain::AbstractDomain{D},
+function _inherited_target_degrees(space::HpSpace{D}, target_domain::AbstractDomain{D},
                                    active::AbstractVector{<:Integer}=_domain_active_leaves(target_domain)) where {D}
   source_grid = grid(space)
   target_grid = grid(target_domain)
@@ -1021,8 +1021,8 @@ function _inherited_target_degrees(space::HpSpace{D},
 
   for index in eachindex(active)
     source_leaves = _transition_source_leaves(source_grid, target_grid, active[index])
-    degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis] for leaf in source_leaves),
-                            D)
+    degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis]
+                                            for leaf in source_leaves), D)
   end
 
   return degrees
@@ -1119,7 +1119,6 @@ function transition(plan::AdaptivityPlan{D,T}) where {D,T<:AbstractFloat}
 
   return SpaceTransition(old_space, new_space, source_offsets, source_counts, source_data)
 end
-
 
 """
     adapted_field(transition, field; name=field_name(field))
@@ -1267,9 +1266,7 @@ end
 # cells. The transfer mass matrix is therefore block diagonal with one dense
 # block per active target cell, so it is cheaper to solve those local systems
 # directly than to assemble one global sparse projection problem.
-function _is_fully_dg_space(space::HpSpace)
-  all(kind -> kind === :dg, continuity_policy(space))
-end
+_is_fully_dg_space(space::HpSpace) = all(kind -> kind === :dg, continuity_policy(space))
 
 function _checked_cellwise_single_term_mapping(cell::CellValues)
   local_dofs = cell.local_dof_count
@@ -1282,7 +1279,8 @@ function _checked_cellwise_single_term_mapping(cell::CellValues)
   for local_dof in 1:local_dofs
     cell.single_term_indices[local_dof] >= 1 ||
       throw(ArgumentError("cellwise DG transfer requires each local dof to map to one global dof"))
-    abs(cell.single_term_coefficients[local_dof] - one(eltype(cell.single_term_coefficients))) <= coefficient_tolerance ||
+    abs(cell.single_term_coefficients[local_dof] - one(eltype(cell.single_term_coefficients))) <=
+    coefficient_tolerance ||
       throw(ArgumentError("cellwise DG transfer requires unit local-to-global coefficients"))
   end
 
@@ -1298,14 +1296,12 @@ end
 end
 
 function _cellwise_dg_transfer_state(plan, old_fields::Tuple, new_fields::Tuple, state::State,
-                                     transition::SpaceTransition;
-                                     linear_solve=default_linear_solve)
+                                     transition::SpaceTransition; linear_solve=default_linear_solve)
   T = eltype(coefficients(state))
   state_coefficients = zeros(T, dof_count(field_layout(plan)))
   operators = ntuple(index -> (_TransferMass(new_fields[index]),
                                _TransferSource(new_fields[index], old_fields[index], state,
-                                               transition)),
-                    length(old_fields))
+                                               transition)), length(old_fields))
   max_local_dofs = isempty(plan.integration.cells) ? 0 :
                    maximum(cell.local_dof_count for cell in plan.integration.cells)
   local_matrix = zeros(T, max_local_dofs, max_local_dofs)
