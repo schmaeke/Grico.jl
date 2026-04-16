@@ -1165,8 +1165,7 @@ end
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{D},
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat}
   space = layout.slots[1].space
-  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(space, surface, D),
-                                      tag)]
+  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(space, surface, D), tag)]
 end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::SurfaceQuadrature{SD},
@@ -1296,8 +1295,7 @@ function _cell_quadrature_overrides(layout::FieldLayout{D,T},
   return overrides
 end
 
-function _checked_surface_quadrature(space::HpSpace{D}, surface,
-                                     dimension_count::Int) where {D}
+function _checked_surface_quadrature(space::HpSpace{D}, surface, dimension_count::Int) where {D}
   surface isa SurfaceQuadrature ||
     throw(ArgumentError("surface quadrature attachments must be SurfaceQuadrature instances"))
   dimension(surface.quadrature) == dimension_count ||

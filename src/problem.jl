@@ -117,8 +117,8 @@ end
 function Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data)
   Dirichlet(field, boundary, (Int(component),), data)
 end
-function Dirichlet(field::AbstractField, boundary::BoundaryFace,
-                   components::Tuple{Vararg{Integer}}, data)
+function Dirichlet(field::AbstractField, boundary::BoundaryFace, components::Tuple{Vararg{Integer}},
+                   data)
   Dirichlet(field, boundary, Tuple(Int(component) for component in components), data)
 end
 

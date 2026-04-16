@@ -1427,8 +1427,8 @@ end
 
 @testset "Physical Domain Compile" begin
   background = Grico.Domain((0.0,), (3.0,), (3,))
-  domain = Grico.PhysicalDomain(background, Grico.ImplicitRegion(x -> x[1] - 1.5;
-                                                                 subdivision_depth=1))
+  domain = Grico.PhysicalDomain(background,
+                                Grico.ImplicitRegion(x -> x[1] - 1.5; subdivision_depth=1))
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                            degree=Grico.UniformDegree(2)))
@@ -1452,8 +1452,8 @@ end
                                            degree=Grico.UniformDegree(1)))
   u = Grico.ScalarField(space; name=:u)
   quadrature = Grico.finite_cell_quadrature(Grico.domain(space), 1,
-                                            Grico.cell_quadrature_shape(space, 1),
-                                            x -> x[1] - 0.5; subdivision_depth=1)
+                                            Grico.cell_quadrature_shape(space, 1), x -> x[1] - 0.5;
+                                            subdivision_depth=1)
   @test quadrature !== nothing
 
   problem = Grico.AffineProblem(u)
