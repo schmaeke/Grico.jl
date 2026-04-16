@@ -1,14 +1,22 @@
 using Test
 
-ENV["GRICO_KH_EULER_AUTORUN"] = "0"
-include("../examples/kelvin_helmholtz_euler.jl")
+ENV["GRICO_BLAST_WAVE_EULER_AUTORUN"] = "0"
+include("../examples/blast_wave_euler.jl")
 
-@testset "Kelvin-Helmholtz Euler Example" begin
-  context = build_kelvin_helmholtz_euler_context(; root_counts=(2, 2), degree=1,
-                                                 quadrature_extra_points=1, cfl=0.1)
+@testset "Blast-Wave Euler Example" begin
+  coarse_context = build_blast_wave_euler_context(; root_counts=(2, 2), degree=1,
+                                                  quadrature_extra_points=1, cfl=0.08,
+                                                  initial_refinement_layers=0)
+  context = build_blast_wave_euler_context(; root_counts=(2, 2), degree=1,
+                                           quadrature_extra_points=1, cfl=0.08,
+                                           initial_refinement_layers=2)
 
-  @test active_leaf_count(context.space) == 4
-  @test length(coefficients(context.state)) == 64
+  @test active_leaf_count(coarse_context.space) == 4
+  @test length(coefficients(coarse_context.state)) == 64
+  @test origin(coarse_context.domain) == (0.0, 0.0)
+  @test extent(coarse_context.domain) == (1.0, 1.0)
+  @test active_leaf_count(context.space) > active_leaf_count(coarse_context.space)
+  @test length(coefficients(context.state)) > length(coefficients(coarse_context.state))
   @test context.diagnostics.min_density > 0.0
   @test context.diagnostics.min_pressure > 0.0
   @test context.dt > 0.0
@@ -16,48 +24,61 @@ include("../examples/kelvin_helmholtz_euler.jl")
   @test !hasproperty(context, :mass_matrix)
   @test merge_time_grids([0.0, 0.01], [0.0, 0.005, 0.01]) ≈ [0.0, 0.005, 0.01]
 
+  q = conservative_variables(1.0, (0.3, -0.2), 1.0, GAMMA)
+  q_reflected = reflective_ghost_state(q, (1.0, 0.0))
+  wall_flux = lax_friedrichs_flux(q, q_reflected, (1.0, 0.0), GAMMA)
+  @test wall_flux[1] ≈ 0.0 atol = 1.0e-12
+  @test wall_flux[4] ≈ 0.0 atol = 1.0e-12
+
   semi = EulerSemidiscretization(context.spatial_plan, context.conserved, context.state,
-                                 context.mass_factorization)
+                                 context.mass_inverse)
   du = similar(coefficients(context.state))
   euler_rhs!(du, copy(coefficients(context.state)), semi, 0.0)
   @test all(isfinite, du)
   @test any(!iszero, du)
 
-  adapted_context, plan = adapt_kelvin_helmholtz_context(context; threshold=1.0,
-                                                         smoothness_threshold=0.5,
-                                                         max_h_level=0, max_p_degree=2)
+  adapted_context, plan = adapt_blast_wave_context(context; threshold=1.0, max_h_level=3)
   plan_summary = adaptivity_summary(plan)
-  @test plan_summary.p_refinement_leaf_count > 0
-  @test plan_summary.h_refinement_leaf_count == 0
-  @test active_leaf_count(adapted_context.space) == active_leaf_count(context.space)
+  @test plan_summary.h_refinement_leaf_count > 0
+  @test active_leaf_count(adapted_context.space) > active_leaf_count(context.space)
   @test length(coefficients(adapted_context.state)) > length(coefficients(context.state))
   @test adapted_context.dt > 0.0
 
-  coarsened_context, coarsen_plan = adapt_kelvin_helmholtz_context(adapted_context; threshold=0.0,
-                                                                   smoothness_threshold=0.5,
-                                                                   p_coarsening_threshold=1.0,
-                                                                   h_coarsening_threshold=1.0,
-                                                                   max_h_level=0,
-                                                                   max_p_degree=2)
-  coarsen_summary = adaptivity_summary(coarsen_plan)
-  @test coarsen_summary.p_derefinement_leaf_count > 0
-  @test active_leaf_count(coarsened_context.space) == active_leaf_count(adapted_context.space)
-  @test length(coefficients(coarsened_context.state)) == length(coefficients(context.state))
-  @test coarsened_context.dt > 0.0
+  relative_context, relative_plan = adapt_blast_wave_context(context; strategy=:relative_max,
+                                                             relative_refinement_fraction=1.0,
+                                                             relative_coarsening_fraction=0.0,
+                                                             max_h_level=3)
+  relative_summary = adaptivity_summary(relative_plan)
+  @test relative_summary.h_refinement_leaf_count > 0
+  @test active_leaf_count(relative_context.space) > active_leaf_count(context.space)
+  @test length(coefficients(relative_context.state)) > length(coefficients(context.state))
+  @test relative_context.dt > 0.0
+
+  entry = blast_wave_history_entry(0, 0.0, context, context.diagnostics)
+  mktempdir() do directory
+    vtk_path = write_blast_wave_vtk(context, entry; output_directory=directory)
+    @test isfile(vtk_path)
+  end
 
   if ORDINARYDIFFEQ_AVAILABLE
-    result = run_kelvin_helmholtz_euler_example(; root_counts=(2, 2), degree=1,
-                                                quadrature_extra_points=1, cfl=0.08,
-                                                final_time=0.01, save_interval=0.01,
-                                                adapt_interval=0.01,
-                                                write_vtk=false, print_summary=false,
-                                                adaptivity_threshold=1.0,
-                                                smoothness_threshold=0.5,
-                                                p_coarsening_threshold=1.0,
-                                                h_coarsening_threshold=1.0,
-                                                max_h_level=1, max_p_degree=2)
+    result = run_blast_wave_euler_example(; root_counts=(2, 2), degree=1, quadrature_extra_points=1,
+                                          cfl=0.08, final_time=0.01, save_interval=0.01,
+                                          initial_refinement_layers=2, adapt_interval=0.01,
+                                          write_vtk=false, print_summary=false,
+                                          adaptivity_threshold=1.0, max_h_level=3)
     @test !isempty(result.history)
     @test result.segment_solutions === nothing
     @test last(result.history).time ≈ 0.01 atol = 1.0e-12
+
+    relative_result = run_blast_wave_euler_example(; root_counts=(2, 2), degree=1,
+                                                   quadrature_extra_points=1, cfl=0.08,
+                                                   final_time=0.01, save_interval=0.01,
+                                                   initial_refinement_layers=2, adapt_interval=0.01,
+                                                   write_vtk=false, print_summary=false,
+                                                   adaptivity_strategy=:relative_max,
+                                                   relative_refinement_fraction=1.0,
+                                                   relative_coarsening_fraction=0.0, max_h_level=3)
+    @test !isempty(relative_result.history)
+    @test last(relative_result.history).time ≈ 0.01 atol = 1.0e-12
   end
 end
