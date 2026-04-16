@@ -144,6 +144,32 @@ end
     @test length(unique(vtk_data_array(xml, "connectivity", Int))) == 50
   end
 
+  mktempdir() do directory
+    path = write_vtk(joinpath(directory, "quad_with_mesh"), refined_domain; state=refined_state,
+                     fields=(v,), subdivisions=2, export_degree=1, mesh=true, append=false,
+                     ascii=true)
+    solution_path = joinpath(directory, "quad_with_mesh_solution.vtu")
+    mesh_path = joinpath(directory, "quad_with_mesh_mesh.vtu")
+    xml = read(path, String)
+    solution_xml = read(solution_path, String)
+    mesh_xml = read(mesh_path, String)
+
+    @test isfile(path)
+    @test endswith(path, ".vtm")
+    @test occursin("type=\"vtkMultiBlockDataSet\"", xml)
+    @test occursin("name=\"solution\"", xml)
+    @test occursin("name=\"mesh\"", xml)
+    @test occursin("quad_with_mesh_solution.vtu", xml)
+    @test occursin("quad_with_mesh_mesh.vtu", xml)
+    @test vtk_xml_attribute(solution_xml, "NumberOfCells") == "8"
+    @test vtk_xml_attribute(mesh_xml, "NumberOfPoints") == "6"
+    @test vtk_xml_attribute(mesh_xml, "NumberOfCells") == "7"
+    @test vtk_data_array(mesh_xml, "types", Int) == fill(3, 7)
+    @test vtk_data_array(mesh_xml, "h_level", Int) == fill(1, 7)
+    @test Set(vtk_data_array(mesh_xml, "axis", Int)) == Set([1, 2])
+    @test Set(vtk_data_array(mesh_xml, "leaf", Int)) == Set(active_leaves(grid(refined_domain)))
+  end
+
   filtered_space = HpSpace(PhysicalDomain(Domain((0.0,), (3.0,), (3,)),
                                           ImplicitRegion(x -> x[1] - 1.5; subdivision_depth=1)),
                            SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
@@ -156,6 +182,14 @@ end
     xml = read(path, String)
 
     @test vtk_xml_attribute(xml, "NumberOfCells") == "2"
+
+    mesh_path = write_vtk(joinpath(directory, "filtered_mesh.vtu"), filtered_state; mesh=true,
+                          append=false, ascii=true)
+    mesh_xml = read(joinpath(directory, "filtered_mesh_mesh.vtu"), String)
+
+    @test endswith(mesh_path, ".vtm")
+    @test vtk_xml_attribute(mesh_xml, "NumberOfCells") == "2"
+    @test vtk_data_array(mesh_xml, "leaf", Int) == [1, 2]
   end
 
   mktempdir() do directory
@@ -171,6 +205,12 @@ end
     @test occursin("series_0000.vtu", xml)
     @test occursin("series_0001.vtu", xml)
     @test_throws ArgumentError write_pvd(joinpath(directory, "bad.pvd"), paths; timesteps=[0.0])
+
+    mesh_path = write_vtk(joinpath(directory, "series_mesh_0000"), state; mesh=true, append=false,
+                          ascii=true)
+    mesh_pvd_path = write_pvd(joinpath(directory, "series_mesh.pvd"), [mesh_path]; timesteps=[0.0])
+    mesh_pvd_xml = read(mesh_pvd_path, String)
+    @test occursin("series_mesh_0000.vtm", mesh_pvd_xml)
   end
 
   refined_domain = copy(domain)

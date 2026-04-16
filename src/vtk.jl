@@ -8,7 +8,8 @@
 # 3. evaluate optional user-provided point, cell, and field datasets on the
 #    same exported mesh, and
 # 4. package the result as VTK Lagrange cells in the ordering expected by
-#    WriteVTK and ParaView.
+#    WriteVTK and ParaView, optionally together with a separate true-mesh
+#    skeleton block.
 #
 # Two export parameters control the balance between compactness and visual
 # fidelity. `export_degree` is the polynomial degree of each emitted VTK
@@ -19,6 +20,12 @@
 # points are intentionally duplicated across interfaces. This avoids imposing a
 # single conforming VTK point numbering on locally refined meshes and keeps the
 # export logic aligned with the leaf-wise structure used throughout the library.
+#
+# The optional `mesh=true` export deliberately uses a `.vtm` multiblock wrapper
+# instead of mixing wire cells into the solution `.vtu`. The sampled solution
+# grid and the true active-leaf mesh have different roles, datasets, and
+# rendering needs, so keeping them as separate blocks avoids polluting point and
+# cell data while still presenting one logical result to ParaView.
 
 # Internal export-mesh storage shared by field sampling and custom datasets.
 
@@ -61,9 +68,9 @@ end
 """
     write_vtk(path, state; kwargs...)
     write_vtk(path, space; state=nothing, fields=nothing, point_data=(), cell_data=(),
-              field_data=(), subdivisions=1, export_degree=1, vtk_kwargs...)
+              field_data=(), subdivisions=1, export_degree=1, mesh=false, vtk_kwargs...)
     write_vtk(path, domain; state=nothing, fields=nothing, point_data=(), cell_data=(),
-              field_data=(), subdivisions=1, export_degree=1, vtk_kwargs...)
+              field_data=(), subdivisions=1, export_degree=1, mesh=false, vtk_kwargs...)
 
 Export sampled field data and optional custom datasets to a VTK file.
 
@@ -90,13 +97,22 @@ Point and cell datasets may be given directly as arrays or as callables that
 are evaluated on sampled points or cells. The accepted callable signatures are
 described by the internal dataset normalization rules in this file.
 
-The returned value is the path of the written VTK file as returned by
-`WriteVTK.vtk_grid`. The export is leaf-wise: every active hp leaf contributes
-its own structured block of sampled points and `subdivisions^D` VTK Lagrange
-cells, even when neighboring leaves touch geometrically. This is the natural
-representation for locally refined high-order spaces because it preserves the
-piecewise structure of the discrete field without forcing a separate global mesh
-merging stage.
+When `mesh=false`, the returned value is the path of the written `.vtu` file as
+returned by `WriteVTK.vtk_grid`. When `mesh=true`, the returned value is a
+`.vtm` multiblock file with a sampled `solution` block and a separate true-mesh
+`mesh` block made from `VTK_LINE` cells on active-leaf edges. The solution
+export is leaf-wise: every active hp leaf contributes its own structured block
+of sampled points and `subdivisions^D` VTK Lagrange cells, even when neighboring
+leaves touch geometrically. This is the natural representation for locally
+refined high-order spaces because it preserves the piecewise structure of the
+discrete field without forcing a separate global mesh merging stage.
+
+User-supplied point, cell, and field datasets are written to the `solution`
+block. The `mesh` block is intentionally only a wire skeleton with shared
+vertices on conforming interfaces and small cell-data arrays identifying one
+owning leaf, the edge axis, and the maximum h-level of that owning leaf. Hanging
+interfaces are left visible rather than converted into a conforming VTK graph:
+coarse edges and fine subedges are both emitted.
 """
 function write_vtk(path::AbstractString, state::State; kwargs...)
   layout = field_layout(state)
@@ -106,25 +122,26 @@ end
 
 function write_vtk(path::AbstractString, space::HpSpace{D,T}; state::Union{Nothing,State}=nothing,
                    fields=nothing, point_data=(), cell_data=(), field_data=(),
-                   subdivisions::Integer=1, export_degree::Integer=1,
+                   subdivisions::Integer=1, export_degree::Integer=1, mesh::Bool=false,
                    vtk_kwargs...) where {D,T<:AbstractFloat}
   return _write_vtk(path, space; state=state, fields=fields, point_data=point_data,
                     cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
-                    export_degree=export_degree, vtk_kwargs...)
+                    export_degree=export_degree, mesh=mesh, vtk_kwargs...)
 end
 
 function write_vtk(path::AbstractString, domain_data::AbstractDomain{D,T};
                    state::Union{Nothing,State}=nothing, fields=nothing, point_data=(), cell_data=(),
                    field_data=(), subdivisions::Integer=1, export_degree::Integer=1,
-                   vtk_kwargs...) where {D,T<:AbstractFloat}
+                   mesh::Bool=false, vtk_kwargs...) where {D,T<:AbstractFloat}
   return _write_vtk(path, domain_data; state=state, fields=fields, point_data=point_data,
                     cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
-                    export_degree=export_degree, vtk_kwargs...)
+                    export_degree=export_degree, mesh=mesh, vtk_kwargs...)
 end
 
 function _write_vtk(path::AbstractString, reference; state::Union{Nothing,State}=nothing,
                     fields=nothing, point_data=(), cell_data=(), field_data=(),
-                    subdivisions::Integer=1, export_degree::Integer=1, vtk_kwargs...)
+                    subdivisions::Integer=1, export_degree::Integer=1, mesh::Bool=false,
+                    vtk_kwargs...)
   return _with_internal_blas_threads() do
     reference_domain = _vtk_reference_domain(reference)
     D = dimension(reference_domain)
@@ -134,20 +151,69 @@ function _write_vtk(path::AbstractString, reference; state::Union{Nothing,State}
     subdivision_count = _checked_positive(subdivisions, "subdivisions")
     vtk_degree = _checked_positive(export_degree, "export_degree")
     vtk_fields = _vtk_fields(reference, state, fields)
-    mesh = _vtk_mesh_data(reference, subdivision_count, vtk_degree)
-    sampled_fields = _sample_vtk_fields(vtk_fields, state, mesh, T)
-    point_datasets = _vtk_point_datasets(vtk_fields, sampled_fields, point_data, mesh)
-    cell_datasets = _vtk_cell_datasets(cell_data, mesh)
+    vtk_mesh = _vtk_mesh_data(reference, subdivision_count, vtk_degree)
+    sampled_fields = _sample_vtk_fields(vtk_fields, state, vtk_mesh, T)
+    point_datasets = _vtk_point_datasets(vtk_fields, sampled_fields, point_data, vtk_mesh)
+    cell_datasets = _vtk_cell_datasets(cell_data, vtk_mesh)
     field_datasets = _checked_vtk_datasets(field_data, "field")
-    _require_vtk_dataset_sizes(point_datasets, size(mesh.points, 2), "point")
-    _require_vtk_dataset_sizes(cell_datasets, length(mesh.cells), "cell")
+    _require_vtk_dataset_sizes(point_datasets, size(vtk_mesh.points, 2), "point")
+    _require_vtk_dataset_sizes(cell_datasets, length(vtk_mesh.cells), "cell")
     grid_kwargs = haskey(vtk_kwargs, :vtkversion) ? (; vtk_kwargs...) :
                   (; vtk_kwargs..., vtkversion=:latest)
-    saved_files = vtk_grid(path, mesh.points, mesh.cells; grid_kwargs...) do vtk
-      _write_vtk_datasets!(vtk, point_datasets, cell_datasets, field_datasets)
+
+    if mesh
+      return _write_vtk_multiblock(path, reference, vtk_mesh, point_datasets, cell_datasets,
+                                   field_datasets, grid_kwargs)
     end
+
+    saved_files = _write_vtk_solution_grid(path, vtk_mesh, point_datasets, cell_datasets,
+                                           field_datasets, grid_kwargs)
     return only(saved_files)
   end
+end
+
+# Write the sampled solution grid as one ordinary `.vtu` file. This is the
+# legacy export path and remains the default because it produces a single compact
+# dataset for field post-processing.
+function _write_vtk_solution_grid(path::AbstractString, mesh::_VtkMesh, point_datasets,
+                                  cell_datasets, field_datasets, grid_kwargs)
+  return vtk_grid(path, mesh.points, mesh.cells; grid_kwargs...) do vtk
+    _write_vtk_datasets!(vtk, point_datasets, cell_datasets, field_datasets)
+  end
+end
+
+# With `mesh=true`, the user-facing result is one `.vtm` file. Its first block
+# is the sampled solution grid and its second block is the true active-leaf mesh
+# skeleton. The child `.vtu` files live next to the wrapper and are named from
+# the same stem so a time series remains easy to manage.
+function _write_vtk_multiblock(path::AbstractString, reference, mesh::_VtkMesh, point_datasets,
+                               cell_datasets, field_datasets, grid_kwargs)
+  base_path = _vtk_multiblock_base_path(path)
+  vtm = vtk_multiblock(base_path)
+  solution_path = _vtk_block_path(base_path, "solution")
+  solution = vtk_grid(solution_path, mesh.points, mesh.cells; grid_kwargs...)
+  _write_vtk_datasets!(solution, point_datasets, cell_datasets, field_datasets)
+  multiblock_add_block(vtm, solution, "solution")
+
+  mesh_points, mesh_cells, mesh_cell_datasets = _vtk_mesh_skeleton_data(reference)
+  mesh_block = vtk_grid(_vtk_block_path(base_path, "mesh"), mesh_points, mesh_cells; grid_kwargs...)
+  _write_vtk_datasets!(mesh_block, Pair{String,_VtkArrayData}[], mesh_cell_datasets,
+                       Pair{String,Any}[])
+  multiblock_add_block(vtm, mesh_block, "mesh")
+
+  return first(close(vtm))
+end
+
+function _vtk_multiblock_base_path(path::AbstractString)
+  stem, extension = splitext(path)
+  extension in (".vtu", ".vtm") && return stem
+  return path
+end
+
+function _vtk_block_path(base_path::AbstractString, suffix::AbstractString)
+  directory = dirname(base_path)
+  stem = basename(base_path)
+  return joinpath(directory, "$(stem)_$suffix")
 end
 
 """
@@ -645,6 +711,127 @@ function _vtk_mesh_data(domain_data::AbstractDomain{D,T}, leaf_data::AbstractVec
 
   return _VtkMesh{D,T,eltype(cells)}(points, point_leaves, point_references, cells, leaf_data,
                                      cell_leaves, cell_references, cell_centers, cells_per_leaf)
+end
+
+# True active-leaf mesh skeleton construction for the optional multiblock mesh
+# overlay. The skeleton uses one global dyadic vertex map, so conforming leaf
+# edges share endpoints. Equal edges are deduplicated, while hanging interfaces
+# intentionally keep both the coarse edge and the finer subedges so T-junctions
+# remain visible in ParaView.
+function _vtk_mesh_skeleton_data(reference)
+  domain_data = _vtk_reference_domain(reference)
+  leaf_data = _vtk_reference_active_leaves(reference)
+  return _vtk_mesh_skeleton_data(domain_data, leaf_data)
+end
+
+function _vtk_mesh_skeleton_data(domain_data::AbstractDomain{D,T},
+                                 leaf_data::AbstractVector{<:Integer}) where {D,T<:AbstractFloat}
+  grid_data = grid(domain_data)
+  max_levels = _vtk_mesh_skeleton_levels(grid_data, leaf_data, Val(D))
+  vertex_lookup = Dict{NTuple{D,Int128},Int}()
+  point_data = NTuple{3,T}[]
+  edge_lookup = Set{NTuple{2,Int}}()
+  cells = MeshCell[]
+  edge_leaves = Int[]
+  edge_axes = Int[]
+  edge_levels = Int[]
+
+  for leaf in leaf_data
+    checked_leaf = _checked_cell(grid_data, leaf)
+
+    for axis in 1:D
+      for side_index in 0:(2^(D-1)-1)
+        lower_corner = _vtk_mesh_edge_corner(axis, side_index, 0, Val(D))
+        upper_corner = _vtk_mesh_edge_corner(axis, side_index, 1, Val(D))
+        lower_key = _vtk_mesh_vertex_key(grid_data, checked_leaf, lower_corner, max_levels)
+        upper_key = _vtk_mesh_vertex_key(grid_data, checked_leaf, upper_corner, max_levels)
+        lower_vertex = _vtk_mesh_vertex_index!(vertex_lookup, point_data, domain_data, lower_key,
+                                               max_levels)
+        upper_vertex = _vtk_mesh_vertex_index!(vertex_lookup, point_data, domain_data, upper_key,
+                                               max_levels)
+        edge_key = lower_vertex <= upper_vertex ? (lower_vertex, upper_vertex) :
+                   (upper_vertex, lower_vertex)
+        edge_key in edge_lookup && continue
+        push!(edge_lookup, edge_key)
+        push!(cells, MeshCell(VTKCellTypes.VTK_LINE, [lower_vertex, upper_vertex]))
+        push!(edge_leaves, checked_leaf)
+        push!(edge_axes, axis)
+        push!(edge_levels, maximum(level(grid_data, checked_leaf)))
+      end
+    end
+  end
+
+  cell_datasets = Pair{String,_VtkArrayData}["leaf" => edge_leaves, "axis" => edge_axes,
+                                             "h_level" => edge_levels]
+  return _vtk_point_matrix(point_data, T), cells, cell_datasets
+end
+
+# Choose the finest logical lattice needed to represent all active-leaf
+# vertices. All skeleton vertices are keyed on this common dyadic lattice so
+# shared geometric vertices receive the same VTK point number.
+function _vtk_mesh_skeleton_levels(grid_data::CartesianGrid, leaf_data, ::Val{D}) where {D}
+  isempty(leaf_data) && return ntuple(_ -> 0, D)
+  return ntuple(axis -> maximum(level(grid_data, leaf, axis) for leaf in leaf_data), D)
+end
+
+# Enumerate one corner pair of an active leaf edge. The edge axis selects the
+# moving coordinate, while `side_index` encodes the fixed side bits on all
+# tangential axes.
+function _vtk_mesh_edge_corner(edge_axis::Int, side_index::Int, endpoint::Int, ::Val{D}) where {D}
+  return ntuple(axis -> axis == edge_axis ? endpoint :
+                        (side_index >> (axis < edge_axis ? axis - 1 : axis - 2)) & 1, D)
+end
+
+# Convert a leaf-local corner into a global integer vertex key. The topology
+# helpers perform the same endpoint scaling used for neighbor comparisons,
+# which keeps the VTK skeleton aligned with the refinement-tree semantics.
+function _vtk_mesh_vertex_key(grid_data::CartesianGrid{D}, leaf::Int, corner::NTuple{D,Int},
+                              max_levels::NTuple{D,Int}) where {D}
+  return ntuple(axis -> corner[axis] == 0 ?
+                        _scaled_lower_coordinate(grid_data, leaf, axis, max_levels[axis]) :
+                        _scaled_upper_coordinate(grid_data, leaf, axis, max_levels[axis]), D)
+end
+
+# Look up or insert the VTK point for one logical vertex. The dictionary is the
+# connectivity bridge that makes conforming leaf interfaces share point numbers
+# in the mesh block.
+function _vtk_mesh_vertex_index!(lookup::Dict{NTuple{D,Int128},Int}, points::Vector{NTuple{3,T}},
+                                 domain_data::AbstractDomain{D,T}, key::NTuple{D,Int128},
+                                 max_levels::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  index = get(lookup, key, 0)
+  index != 0 && return index
+  point = _vtk_mesh_vertex_point(domain_data, key, max_levels)
+  push!(points, point)
+  lookup[key] = length(points)
+  return length(points)
+end
+
+# Map one global dyadic vertex key to physical coordinates. This repeats the
+# affine background-domain formula directly instead of mapping through an
+# arbitrary owning leaf, so equal logical vertices are converted to bitwise equal
+# physical points.
+function _vtk_mesh_vertex_point(domain_data::AbstractDomain{D,T}, key::NTuple{D,Int128},
+                                max_levels::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  root_counts = root_cell_counts(grid(domain_data))
+  return ntuple(axis -> axis <= D ?
+                        origin(domain_data, axis) +
+                        ldexp(extent(domain_data, axis) * T(key[axis]) / T(root_counts[axis]),
+                              -max_levels[axis]) : zero(T), 3)
+end
+
+# WriteVTK expects unstructured-grid points as a `3 × N` coordinate matrix even
+# for one- and two-dimensional domains. Missing coordinates are already stored
+# as zero in the tuple representation.
+function _vtk_point_matrix(points::Vector{NTuple{3,T}}, ::Type{T}) where {T<:AbstractFloat}
+  matrix = Matrix{T}(undef, 3, length(points))
+
+  for (index, point) in enumerate(points)
+    @inbounds for axis in 1:3
+      matrix[axis, index] = point[axis]
+    end
+  end
+
+  return matrix
 end
 
 # Dimension-specific VTK Lagrange connectivity construction.

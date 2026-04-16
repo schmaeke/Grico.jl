@@ -84,7 +84,8 @@ using AlgebraicMultigrid: aspreconditioner, smoothed_aggregation
 using IncompleteLU: ilu
 using Krylov: cg, gmres
 using SymRCM: symrcm
-using WriteVTK: MeshCell, VTKCellData, VTKCellTypes, VTKFieldData, VTKPointData, vtk_grid
+using WriteVTK: MeshCell, VTKCellData, VTKCellTypes, VTKFieldData, VTKPointData,
+                multiblock_add_block, vtk_grid, vtk_multiblock
 
 # Part I. Internal utilities shared throughout the implementation. This file is
 # intentionally included first because nearly every later layer depends on its
