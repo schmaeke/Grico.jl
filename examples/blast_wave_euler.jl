@@ -59,18 +59,14 @@ const QUADRATURE_EXTRA_POINTS = 1
 # Gas model and time-integration controls.
 const GAMMA = 1.4
 const CFL = 0.025
-const FINAL_TIME = 2.5
+const FINAL_TIME = 4.0
 const SAVE_INTERVAL = 0.0125
 const ADAPT_INTERVAL = 0.00125 / 2
 
 # Adaptivity controls. This example uses pure `h`-adaptivity and keeps the
 # polynomial degree fixed.
-const ADAPTIVITY_STRATEGY = :relative_max
-const ADAPTIVITY_THRESHOLD = 0.4
-const H_COARSENING_THRESHOLD = 1.0e-3
-const RELATIVE_REFINEMENT_FRACTION = 0.15
-const RELATIVE_COARSENING_FRACTION = 0.05
-const MAX_H_LEVEL = 3
+const ADAPTIVITY_TOLERANCE = 2.5e-2
+const MAX_H_LEVEL = 5
 
 # Physical floors and blast parameters.
 const DENSITY_FLOOR = 1.0e-12
@@ -80,13 +76,13 @@ const INNER_PRESSURE = 3.0
 const OUTER_PRESSURE = 1.0
 const BLAST_RADIUS = 0.2
 const BLAST_TRANSITION_WIDTH = 0.03
-const INITIAL_BLAST_REFINEMENT_LAYERS = 3
+const INITIAL_BLAST_REFINEMENT_LAYERS = 4
 const INITIAL_BLAST_REFINEMENT_RADIUS = BLAST_RADIUS + 2.0 * BLAST_TRANSITION_WIDTH
 
 # Output controls.
 const WRITE_VTK = true
 const EXPORT_SUBDIVISIONS = 1
-const EXPORT_DEGREE = 2
+const EXPORT_DEGREE = 1
 
 # The example auto-runs only when it is executed directly. Tests disable this
 # by setting `GRICO_BLAST_WAVE_EULER_AUTORUN=0` before including the file.
@@ -681,152 +677,21 @@ function build_blast_wave_euler_context(; root_counts=ROOT_COUNTS, degree=POLYDE
   return blast_wave_context(conserved, initial_state; gamma, cfl, degree)
 end
 
-# Keep the example-local refinement signal in one place so adaptation and VTK
-# output stay consistent while testing different indicators.
-blast_wave_refinement_indicators(state, field) = Grico.interface_jump_indicators(state, field)
-
-function checked_blast_wave_adaptivity_strategy(strategy)
-  strategy in (:bulk, :relative_max) ||
-    throw(ArgumentError("adaptivity_strategy must be :bulk or :relative_max"))
-  return strategy
-end
-
-function checked_relative_fraction(value, name)
-  checked = Float64(value)
-  isfinite(checked) || throw(ArgumentError("$name must be finite"))
-  0.0 <= checked <= 1.0 || throw(ArgumentError("$name must lie in [0, 1]"))
-  return checked
-end
-
-function relative_max_h_refinement_axes(space, indicators, limits; fraction)
-  checked_fraction = checked_relative_fraction(fraction, "relative_refinement_fraction")
-  D = dimension(space)
-  leaves = active_leaves(space)
-  marked = fill(ntuple(_ -> false, D), active_leaf_count(space))
-  max_indicator = 0.0
-
-  for (leaf_index, values) in enumerate(indicators)
-    leaf = leaves[leaf_index]
-
-    for axis in 1:D
-      level(grid(space), leaf, axis) < limits.max_h_level[axis] || continue
-      value = abs(Float64(values[axis]))
-      isfinite(value) || throw(ArgumentError("refinement indicators must be finite"))
-      max_indicator = max(max_indicator, value)
-    end
-  end
-
-  max_indicator == 0.0 && return marked
-  cutoff = checked_fraction * max_indicator
-
-  for (leaf_index, values) in enumerate(indicators)
-    leaf = leaves[leaf_index]
-    current = marked[leaf_index]
-
-    for axis in 1:D
-      level(grid(space), leaf, axis) < limits.max_h_level[axis] || continue
-      value = abs(Float64(values[axis]))
-      value == 0.0 && continue
-      value >= cutoff || continue
-      current = ntuple(current_axis -> current_axis == axis ? true : current[current_axis], D)
-    end
-
-    marked[leaf_index] = current
-  end
-
-  return marked
-end
-
-function relative_max_h_coarsening_candidates(state, field, limits, blocked; fraction,
-                                              indicator=Grico.projection_coarsening_indicators)
-  checked_fraction = checked_relative_fraction(fraction, "relative_coarsening_fraction")
-  space = field_space(field)
-  candidates = Grico.h_coarsening_candidates(space; limits=limits)
-  isempty(candidates) && return candidates
-  length(blocked) == active_leaf_count(space) ||
-    throw(ArgumentError("blocked leaf flags must match the active-leaf count"))
-  candidate_indicators = indicator(state, field, candidates)
-  leaf_lookup = Dict(leaf => leaf_index for (leaf_index, leaf) in enumerate(active_leaves(space)))
-  max_indicator = 0.0
-
-  for value in candidate_indicators
-    checked_value = Float64(value)
-    isfinite(checked_value) || throw(ArgumentError("h coarsening indicators must be finite"))
-    max_indicator = max(max_indicator, checked_value)
-  end
-
-  cutoff = checked_fraction * max_indicator
-  selected = typeof(candidates)(undef, 0)
-
-  for candidate_index in eachindex(candidates)
-    candidate = candidates[candidate_index]
-    candidate_indicators[candidate_index] <= cutoff || continue
-    any(blocked[leaf_lookup[child]] for child in candidate.children) && continue
-    push!(selected, candidate)
-  end
-
-  return selected
-end
-
-function relative_max_h_adaptivity_plan(context; relative_refinement_fraction,
-                                        relative_coarsening_fraction, max_h_level=MAX_H_LEVEL)
-  limits = AdaptivityLimits(context.space; min_p=context.degree, max_p=context.degree,
-                            max_h_level=max_h_level)
-  refinement = blast_wave_refinement_indicators(context.state, context.conserved)
-  marked = relative_max_h_refinement_axes(context.space, refinement, limits;
-                                          fraction=relative_refinement_fraction)
-  blocked = [any(marked[leaf_index]) for leaf_index in eachindex(marked)]
-  selected = relative_max_h_coarsening_candidates(context.state, context.conserved, limits, blocked;
-                                                  fraction=relative_coarsening_fraction)
-  plan = AdaptivityPlan(context.space; limits=limits)
-  leaves = active_leaves(context.space)
-
-  for candidate in selected
-    request_h_derefinement!(plan, candidate.cell, candidate.axis)
-  end
-
-  for (leaf_index, axes) in enumerate(marked)
-    any(axes) || continue
-    request_h_refinement!(plan, leaves[leaf_index], axes)
-  end
-
-  return plan
-end
-
-function blast_wave_adaptivity_plan(context; strategy=ADAPTIVITY_STRATEGY,
-                                    threshold=ADAPTIVITY_THRESHOLD,
-                                    h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                    relative_refinement_fraction=RELATIVE_REFINEMENT_FRACTION,
-                                    relative_coarsening_fraction=RELATIVE_COARSENING_FRACTION,
+# The example follows the library-level multiresolution planner: one normalized
+# tolerance controls both refinement and derefinement, while fixed degree limits
+# make this a pure `h` experiment.
+function blast_wave_adaptivity_plan(context; tolerance=ADAPTIVITY_TOLERANCE,
                                     max_h_level=MAX_H_LEVEL)
-  checked_strategy = checked_blast_wave_adaptivity_strategy(strategy)
   limits = AdaptivityLimits(context.space; min_p=context.degree, max_p=context.degree,
                             max_h_level=max_h_level)
-
-  checked_strategy == :bulk &&
-    return h_adaptivity_plan(context.state, context.conserved; threshold=threshold,
-                             indicator=blast_wave_refinement_indicators,
-                             h_coarsening_threshold=h_coarsening_threshold, limits=limits)
-
-  return relative_max_h_adaptivity_plan(context;
-                                        relative_refinement_fraction=relative_refinement_fraction,
-                                        relative_coarsening_fraction=relative_coarsening_fraction,
-                                        max_h_level=max_h_level)
+  return adaptivity_plan(context.state, context.conserved; tolerance=tolerance, limits=limits)
 end
 
 # Mesh adaptation is performed between fixed-mesh ODE segments. The current DG
 # state is used as an error indicator, then transferred to the adapted mesh.
-function adapt_blast_wave_context(context; strategy=ADAPTIVITY_STRATEGY,
-                                  threshold=ADAPTIVITY_THRESHOLD,
-                                  h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                  relative_refinement_fraction=RELATIVE_REFINEMENT_FRACTION,
-                                  relative_coarsening_fraction=RELATIVE_COARSENING_FRACTION,
-                                  max_h_level=MAX_H_LEVEL, linear_solve=direct_sparse_solve)
-  plan = blast_wave_adaptivity_plan(context; strategy=strategy, threshold=threshold,
-                                    h_coarsening_threshold=h_coarsening_threshold,
-                                    relative_refinement_fraction=relative_refinement_fraction,
-                                    relative_coarsening_fraction=relative_coarsening_fraction,
-                                    max_h_level=max_h_level)
+function adapt_blast_wave_context(context; tolerance=ADAPTIVITY_TOLERANCE, max_h_level=MAX_H_LEVEL,
+                                  linear_solve=direct_sparse_solve)
+  plan = blast_wave_adaptivity_plan(context; tolerance=tolerance, max_h_level=max_h_level)
 
   if isempty(plan)
     return context, plan
@@ -924,10 +789,30 @@ function blast_wave_history_entry(step, time, context, initial_diagnostics)
                                 energy_scale)
 end
 
+function blast_wave_adaptivity_limits(context; max_h_level=MAX_H_LEVEL)
+  return AdaptivityLimits(context.space; min_p=context.degree, max_p=context.degree,
+                          max_h_level=max_h_level)
+end
+
+function blast_wave_adaptivity_entry(step, time, before_context, after_context, plan)
+  summary = adaptivity_summary(plan)
+
+  return (; step, time=Float64(time), before_active_leaves=active_leaf_count(before_context.space),
+          after_active_leaves=active_leaf_count(after_context.space),
+          before_dofs=length(coefficients(before_context.state)),
+          after_dofs=length(coefficients(after_context.state)),
+          marked_leaf_count=summary.marked_leaf_count,
+          h_refinement_leaf_count=summary.h_refinement_leaf_count,
+          h_derefinement_cell_count=summary.h_derefinement_cell_count,
+          p_refinement_leaf_count=summary.p_refinement_leaf_count,
+          p_derefinement_leaf_count=summary.p_derefinement_leaf_count)
+end
+
 # Export the active refinement signal as leaf-wise cell data so it is easy to
 # inspect where the current adaptive mesh logic sees under-resolution.
-function blast_wave_refinement_indicator_data(context)
-  indicators = blast_wave_refinement_indicators(context.state, context.conserved)
+function blast_wave_refinement_indicator_data(context; max_h_level=MAX_H_LEVEL)
+  limits = blast_wave_adaptivity_limits(context; max_h_level=max_h_level)
+  indicators = Grico.multiresolution_indicators(context.state, context.conserved; limits=limits)
   axis_values = Matrix{Float64}(undef, dimension(context.space), length(indicators))
   norms = Vector{Float64}(undef, length(indicators))
 
@@ -946,9 +831,11 @@ end
 # Export the current DG state. The point data expose the main physical fields a
 # new user typically wants to inspect first: density, velocity, and pressure,
 # while the cell data carry leaf metadata and the current adaptivity signal.
-function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__, "output"))
+function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__, "output"),
+                              max_h_level=MAX_H_LEVEL)
   current_grid = grid(context.domain)
-  refinement_indicator, refinement_indicator_norm = blast_wave_refinement_indicator_data(context)
+  refinement_indicator, refinement_indicator_norm = blast_wave_refinement_indicator_data(context;
+                                                                                         max_h_level=max_h_level)
   return write_vtk(joinpath(output_directory, @sprintf("blast_wave_euler_%04d", entry.step)),
                    context.state; fields=(context.conserved,),
                    point_data=(density=(x, values) -> sampled_conserved(values, context.conserved)[1],
@@ -977,15 +864,9 @@ end
 # opening the file again while the example is running.
 function print_blast_wave_header(context, final_time; save_interval=SAVE_INTERVAL,
                                  adapt_interval=ADAPT_INTERVAL,
-                                 adaptivity_strategy=ADAPTIVITY_STRATEGY,
-                                 adaptivity_threshold=ADAPTIVITY_THRESHOLD,
-                                 h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                 relative_refinement_fraction=RELATIVE_REFINEMENT_FRACTION,
-                                 relative_coarsening_fraction=RELATIVE_COARSENING_FRACTION,
-                                 max_h_level=MAX_H_LEVEL,
+                                 adaptivity_tolerance=ADAPTIVITY_TOLERANCE, max_h_level=MAX_H_LEVEL,
                                  initial_refinement_layers=INITIAL_BLAST_REFINEMENT_LAYERS,
                                  initial_refinement_radius=INITIAL_BLAST_REFINEMENT_RADIUS)
-  checked_strategy = checked_blast_wave_adaptivity_strategy(adaptivity_strategy)
   println("blast_wave_euler.jl")
   @printf("  domain             : [%.1f, %.1f] x [%.1f, %.1f] (quarter model with symmetry)\n",
           origin(context.domain, 1), origin(context.domain, 1) + extent(context.domain, 1),
@@ -1001,15 +882,7 @@ function print_blast_wave_header(context, final_time; save_interval=SAVE_INTERVA
   @printf("  save interval      : %.3f\n", save_interval)
   @printf("  adapt interval     : %.3f\n", adapt_interval)
   @printf("  max h level        : %d\n", max_h_level)
-  @printf("  adapt strategy     : %s\n", String(checked_strategy))
-
-  if checked_strategy == :bulk
-    @printf("  refinement thresh. : %.2f\n", adaptivity_threshold)
-    @printf("  h coarsening thr.  : %.2e\n", h_coarsening_threshold)
-  else
-    @printf("  refine rel. max    : %.2f\n", relative_refinement_fraction)
-    @printf("  coarsen rel. max   : %.2f\n", relative_coarsening_fraction)
-  end
+  @printf("  adapt tolerance    : %.2e\n", adaptivity_tolerance)
 
   @printf("  final time         : %.3f\n", final_time)
   println("  step time leaves dofs min(rho) min(p) rel-mass rel-energy max-wave")
@@ -1019,12 +892,6 @@ function print_blast_wave_history_entry(entry)
   @printf("  %4d %.3f %5d %5d %.6e %.6e %.6e %.6e %.6e\n", entry.step, entry.time,
           entry.active_leaves, entry.dofs, entry.min_density, entry.min_pressure,
           entry.relative_mass_drift, entry.relative_energy_drift, entry.max_wave_speed)
-end
-
-function print_blast_wave_adaptivity(step, plan)
-  summary = adaptivity_summary(plan)
-  @printf("  adapt after %4d marked=%d h+=%d h-=%d\n", step, summary.marked_leaf_count,
-          summary.h_refinement_leaf_count, summary.h_derefinement_cell_count)
 end
 
 # ---------------------------------------------------------------------------
@@ -1045,11 +912,7 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
                                       adapt_interval=ADAPT_INTERVAL,
                                       initial_refinement_layers=INITIAL_BLAST_REFINEMENT_LAYERS,
                                       initial_refinement_radius=INITIAL_BLAST_REFINEMENT_RADIUS,
-                                      solver=nothing, adaptivity_strategy=ADAPTIVITY_STRATEGY,
-                                      adaptivity_threshold=ADAPTIVITY_THRESHOLD,
-                                      h_coarsening_threshold=H_COARSENING_THRESHOLD,
-                                      relative_refinement_fraction=RELATIVE_REFINEMENT_FRACTION,
-                                      relative_coarsening_fraction=RELATIVE_COARSENING_FRACTION,
+                                      solver=nothing, adaptivity_tolerance=ADAPTIVITY_TOLERANCE,
                                       max_h_level=MAX_H_LEVEL, store_segment_solutions=false,
                                       write_vtk=WRITE_VTK, print_summary=true)
   require_ordinarydiffeq()
@@ -1064,6 +927,7 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
   adapt_times = saved_times((0.0, final_time), adapt_interval)
   times = merge_time_grids(save_times, adapt_times)
   history = NamedTuple[blast_wave_history_entry(0, 0.0, context, initial_diagnostics)]
+  adaptivity_history = NamedTuple[]
   segment_solutions = store_segment_solutions ? Any[] : nothing
   vtk_files = String[]
   pvd_path = nothing
@@ -1071,18 +935,14 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
   adapt_index = 2
 
   write_vtk && mkpath(joinpath(@__DIR__, "output"))
-  write_vtk && push!(vtk_files, write_blast_wave_vtk(context, history[1]))
+  write_vtk && push!(vtk_files, write_blast_wave_vtk(context, history[1]; max_h_level=max_h_level))
 
   if print_summary
     print_blast_wave_header(context, final_time; save_interval=save_interval,
-                            adapt_interval=adapt_interval, adaptivity_strategy=adaptivity_strategy,
+                            adapt_interval=adapt_interval,
                             initial_refinement_layers=initial_refinement_layers,
                             initial_refinement_radius=initial_refinement_radius,
-                            adaptivity_threshold=adaptivity_threshold,
-                            h_coarsening_threshold=h_coarsening_threshold,
-                            relative_refinement_fraction=relative_refinement_fraction,
-                            relative_coarsening_fraction=relative_coarsening_fraction,
-                            max_h_level=max_h_level)
+                            adaptivity_tolerance=adaptivity_tolerance, max_h_level=max_h_level)
     print_blast_wave_history_entry(history[1])
   end
 
@@ -1099,21 +959,19 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
                                        initial_diagnostics)
       push!(history, entry)
       print_summary && print_blast_wave_history_entry(entry)
-      write_vtk && push!(vtk_files, write_blast_wave_vtk(context, entry))
+      write_vtk && push!(vtk_files, write_blast_wave_vtk(context, entry; max_h_level=max_h_level))
       save_index += 1
     end
 
     while adapt_index <= length(adapt_times) && same_time(adapt_times[adapt_index], times[step + 1])
       if !same_time(adapt_times[adapt_index], final_time)
-        context, adaptivity_plan = adapt_blast_wave_context(context; strategy=adaptivity_strategy,
-                                                            threshold=adaptivity_threshold,
-                                                            h_coarsening_threshold=h_coarsening_threshold,
-                                                            relative_refinement_fraction=relative_refinement_fraction,
-                                                            relative_coarsening_fraction=relative_coarsening_fraction,
+        before_context = context
+        context, adaptivity_plan = adapt_blast_wave_context(before_context;
+                                                            tolerance=adaptivity_tolerance,
                                                             max_h_level=max_h_level)
-        print_summary &&
-          !isempty(adaptivity_plan) &&
-          print_blast_wave_adaptivity(step, adaptivity_plan)
+        adaptivity_entry = blast_wave_adaptivity_entry(step, adapt_times[adapt_index],
+                                                       before_context, context, adaptivity_plan)
+        push!(adaptivity_history, adaptivity_entry)
       end
       adapt_index += 1
     end
@@ -1126,7 +984,7 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
     print_summary && println("  pvd  $pvd_path")
   end
 
-  return (; context, history, vtk_files, pvd_path, segment_solutions)
+  return (; context, history, adaptivity_history, vtk_files, pvd_path, segment_solutions)
 end
 
 RUN_BLAST_WAVE_EULER && run_blast_wave_euler_example()

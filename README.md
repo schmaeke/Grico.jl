@@ -32,7 +32,7 @@ framework. Its core model is affine Cartesian geometry with anisotropic dyadic
 - State transfer across adaptive space changes.
 - Embedded geometry support through finite-cell quadrature, implicit surface
   quadrature, and explicit segment-mesh surfaces.
-- `L2` and relative `L2` verification helpers, plus VTK/PVD export.
+- `L²` and relative `L²` verification helpers, plus VTK/PVD export.
 
 ## Installation
 
@@ -63,7 +63,7 @@ generated benchmark reports stay untracked.
    `ResidualProblem`.
 4. `compile`, `assemble`, and `solve`.
 5. Optionally verify, export, or build a new adaptive space with
-   `h_adaptivity_plan`, `p_adaptivity_plan`, or `hp_adaptivity_plan`.
+   `adaptivity_plan`.
 
 ## Minimal Example
 

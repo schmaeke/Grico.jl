@@ -157,11 +157,13 @@ end
 function _lid_config(profile::AbstractString)
   if profile == "smoke"
     return (; root_counts=(8, 8), adaptive_steps=1, max_iters=6, tol=1.0e-4,
-            threshold=LidExample.ADAPTIVITY_THRESHOLD, max_h_level=LidExample.MAX_H_LEVEL)
+            adaptivity_tolerance=LidExample.ADAPTIVITY_TOLERANCE,
+            max_h_level=LidExample.MAX_H_LEVEL)
   elseif profile == "validation"
     return (; root_counts=LidExample.ROOT_COUNTS, adaptive_steps=LidExample.ADAPTIVE_STEPS,
             max_iters=LidExample.PICARD_MAX_ITERS, tol=LidExample.PICARD_TOL,
-            threshold=LidExample.ADAPTIVITY_THRESHOLD, max_h_level=LidExample.MAX_H_LEVEL)
+            adaptivity_tolerance=LidExample.ADAPTIVITY_TOLERANCE,
+            max_h_level=LidExample.MAX_H_LEVEL)
   end
 
   throw(ArgumentError("unsupported profile `$profile`"))
@@ -315,7 +317,7 @@ function _warmup_lid()
 
     adaptive_step == config.adaptive_steps && break
     next_context, adaptivity_plan = LidExample.adapt_lid_driven_cavity_context(context;
-                                                                               threshold=config.threshold,
+                                                                               tolerance=config.adaptivity_tolerance,
                                                                                max_h_level=config.max_h_level)
     isempty(adaptivity_plan) && break
     context = next_context
@@ -367,7 +369,7 @@ function _measure_lid(config)
     adaptivity_plan = nothing
     breakdown["adaptivity_seconds"] += @elapsed begin
       next_context, adaptivity_plan = LidExample.adapt_lid_driven_cavity_context(context;
-                                                                                 threshold=config.threshold,
+                                                                                 tolerance=config.adaptivity_tolerance,
                                                                                  max_h_level=config.max_h_level)
     end
     isempty(adaptivity_plan) && break

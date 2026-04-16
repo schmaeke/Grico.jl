@@ -1,9 +1,9 @@
 using Test
 using Grico
-import Grico: coefficient_coarsening_indicators, coefficient_decay_indicators,
-              coefficient_indicators, h_adaptation_axes, h_coarsening_candidates,
+import Grico: coefficient_coarsening_indicators, h_adaptation_axes, h_coarsening_candidates,
               interface_jump_indicators, is_domain_boundary, p_degree_change,
-              projection_coarsening_indicators, source_leaves, target_space
+              multiresolution_indicators, projection_coarsening_indicators, source_leaves,
+              target_space
 
 const ADAPTIVITY_TOL = 1.0e-8
 
@@ -152,7 +152,7 @@ end
   end
 end
 
-@testset "Automatic H Coarsening" begin
+@testset "Projection H Coarsening Indicators" begin
   coarse_domain = Domain((0.0,), (1.0,), (1,))
   coarse_space = HpSpace(coarse_domain,
                          SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3)))
@@ -170,64 +170,6 @@ end
 
   @test length(candidates) == 1
   @test indicators[1] <= coarsening_tol
-
-  plan = h_adaptivity_plan(fine_state, fine_u; threshold=0.0, h_coarsening_threshold=coarsening_tol)
-  summary = adaptivity_summary(plan)
-  @test summary.h_derefinement_cell_count == 1
-  @test active_leaf_count(target_space(transition(plan))) == 1
-end
-
-@testset "State H Coarsening Stabilization" begin
-  coarse_domain = Domain((0.0,), (1.0,), (1,))
-  coarse_space = HpSpace(coarse_domain,
-                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
-  refine_plan = AdaptivityPlan(coarse_space)
-  request_h_refinement!(refine_plan, 1, 1)
-  fine_space = target_space(transition(refine_plan))
-  v = ScalarField(fine_space; name=:v)
-  u = ScalarField(fine_space; name=:u)
-  state = State(FieldLayout((v, u)))
-  candidates = h_coarsening_candidates(fine_space)
-  refinement = (current_state, current_field) -> begin
-    @test field_count(field_layout(current_state)) == 2
-    @test length(field_values(current_state, v)) > 0
-    active_leaf_count(field_space(current_field)) == 2 ? [(0.0,), (0.0,)] : [(1.0,)]
-  end
-  h_coarsening = (_state, _field, checked_candidates) -> fill(0.0, length(checked_candidates))
-
-  raw = h_adaptivity_plan(fine_space, [(0.0,), (0.0,)]; threshold=1.0,
-                          h_coarsening_candidates=candidates, h_coarsening_indicators=[0.0],
-                          h_coarsening_threshold=0.1)
-  @test adaptivity_summary(raw).h_derefinement_cell_count == 1
-
-  stabilized = h_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
-                                 h_coarsening_indicator=h_coarsening, h_coarsening_threshold=0.1)
-  @test isempty(stabilized)
-end
-
-@testset "State Coarsening Stabilization Transfers Companion Spaces" begin
-  coarse_domain = Domain((0.0,), (1.0,), (1,))
-  coarse_space = HpSpace(coarse_domain,
-                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
-  refine_plan = AdaptivityPlan(coarse_space)
-  request_h_refinement!(refine_plan, 1, 1)
-  fine_space = target_space(transition(refine_plan))
-  companion_space = HpSpace(Grico.domain(fine_space),
-                            SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
-  v = ScalarField(companion_space; name=:v)
-  u = ScalarField(fine_space; name=:u)
-  state = State(FieldLayout((v, u)))
-  candidates = h_coarsening_candidates(fine_space)
-  refinement = (current_state, current_field) -> begin
-    @test field_count(field_layout(current_state)) == 2
-    @test length(field_values(current_state, v)) > 0
-    active_leaf_count(field_space(current_field)) == 2 ? [(0.0,), (0.0,)] : [(1.0,)]
-  end
-  h_coarsening = (_state, _field, checked_candidates) -> fill(0.0, length(checked_candidates))
-
-  stabilized = h_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
-                                 h_coarsening_indicator=h_coarsening, h_coarsening_threshold=0.1)
-  @test isempty(stabilized)
 end
 
 @testset "Transfer State Linear Solve Hook" begin
@@ -430,34 +372,7 @@ end
   @test_throws ArgumentError request_h_derefinement!(derefine_plan, 1, 1)
 end
 
-@testset "H Adaptivity Planning" begin
-  domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 1))
-  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=AxisDegrees((3, 2))))
-  u = ScalarField(space; name=:u)
-  values = zeros(scalar_dof_count(space))
-
-  for term in mode_terms(space, 1, (3, 2))
-    values[term.first] = 1 / term.second
-  end
-
-  state = State(FieldLayout((u,)), values)
-  indicators = coefficient_indicators(state, u)
-
-  @test indicators[1][1] > 0
-  @test indicators[1][2] > 0
-  @test indicators[2] == (0.0, 0.0)
-
-  plan = h_adaptivity_plan(space, indicators; threshold=1.0)
-  @test h_adaptation_axes(plan, 1) == (true, true)
-  @test h_adaptation_axes(plan, 2) == (false, false)
-  @test p_degree_change(plan, 1) == (0, 0)
-
-  auto_plan = h_adaptivity_plan(state, u; threshold=1.0)
-  @test h_adaptation_axes(auto_plan, 1) == (true, true)
-  @test h_adaptation_axes(auto_plan, 2) == (false, false)
-end
-
-@testset "Coefficient Indicators At P1" begin
+@testset "Modal Detail At P1" begin
   domain = Domain((0.0,), (1.0,), (1,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
   u = ScalarField(space; name=:u)
@@ -473,10 +388,10 @@ end
   end
 
   constant_state = State(FieldLayout((u,)), constant_values)
-  @test coefficient_indicators(constant_state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
   @test coefficient_coarsening_indicators(constant_state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
-  @test coefficient_decay_indicators(constant_state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
-  @test h_adaptation_axes(h_adaptivity_plan(constant_state, u; threshold=1.0), 1) == (false,)
+  constant_plan = adaptivity_plan(constant_state, u; tolerance=0.0,
+                                  limits=AdaptivityLimits(space; max_h_level=0, max_p=2))
+  @test isempty(constant_plan)
 
   linear_values = zeros(scalar_dof_count(space))
 
@@ -489,8 +404,11 @@ end
   end
 
   linear_state = State(FieldLayout((u,)), linear_values)
-  @test coefficient_indicators(linear_state, u)[1][1] ≈ 1.0 atol = ADAPTIVITY_TOL
-  @test h_adaptation_axes(h_adaptivity_plan(linear_state, u; threshold=1.0), 1) == (true,)
+  @test coefficient_coarsening_indicators(linear_state, u)[1][1] ≈ inv(sqrt(2)) atol = ADAPTIVITY_TOL
+  linear_plan = adaptivity_plan(linear_state, u; tolerance=0.0,
+                                limits=AdaptivityLimits(space; max_h_level=0, max_p=2))
+  @test h_adaptation_axes(linear_plan, 1) == (false,)
+  @test p_degree_change(linear_plan, 1) == (1,)
 end
 
 @testset "DG P0 Adaptivity Support" begin
@@ -501,9 +419,7 @@ end
   state = State(FieldLayout((u,)), [2.5])
 
   @test AdaptivityLimits(space).min_p == (0,)
-  @test coefficient_indicators(state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
   @test coefficient_coarsening_indicators(state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
-  @test coefficient_decay_indicators(state, u)[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
 
   refine_plan = AdaptivityPlan(space)
   request_p_refinement!(refine_plan, 1, 1)
@@ -561,11 +477,8 @@ end
                   SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
   u = ScalarField(space; name=:u)
   state = State(FieldLayout((u,)), [1.0, 3.0])
-  modal = coefficient_indicators(state, u)
   jumps = interface_jump_indicators(state, u)
 
-  @test modal[1][1] ≈ 0.0 atol = ADAPTIVITY_TOL
-  @test modal[2][1] ≈ 0.0 atol = ADAPTIVITY_TOL
   @test jumps[1][1] > 0.0
   @test jumps[1][1] ≈ jumps[2][1] atol = ADAPTIVITY_TOL
   v = ScalarField(space; name=:v)
@@ -574,19 +487,131 @@ end
   @test mixed_jumps[1][1] ≈ jumps[1][1] atol = ADAPTIVITY_TOL
   @test mixed_jumps[2][1] ≈ jumps[2][1] atol = ADAPTIVITY_TOL
 
-  default_h = h_adaptivity_plan(state, u; threshold=1.0)
-  @test h_adaptation_axes(default_h, 1) == (true,)
-  @test h_adaptation_axes(default_h, 2) == (true,)
+  jump_plan = adaptivity_plan(state, u; tolerance=0.0,
+                              limits=AdaptivityLimits(space; min_p=0, max_p=0, max_h_level=1))
+  @test h_adaptation_axes(jump_plan, 1) == (true,)
+  @test h_adaptation_axes(jump_plan, 2) == (true,)
+  @test p_degree_change(jump_plan, 1) == (0,)
+  @test p_degree_change(jump_plan, 2) == (0,)
+end
 
-  modal_h = h_adaptivity_plan(state, u; indicator=coefficient_indicators, threshold=1.0)
-  @test h_adaptation_axes(modal_h, 1) == (false,)
-  @test h_adaptation_axes(modal_h, 2) == (false,)
+@testset "Multiresolution Adaptivity Planning" begin
+  jump_domain = Domain((0.0,), (1.0,), (2,))
+  jump_space = HpSpace(jump_domain,
+                       SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
+                                    continuity=:dg))
+  jump_u = ScalarField(jump_space; name=:u)
+  jump_state = State(FieldLayout((jump_u,)), [1.0, 3.0])
+  jump_limits = AdaptivityLimits(jump_space; min_p=0, max_p=0, max_h_level=1)
+  jump_details = multiresolution_indicators(jump_state, jump_u; limits=jump_limits)
 
-  default_hp = hp_adaptivity_plan(state, u; threshold=1.0, smoothness_threshold=0.5)
-  @test h_adaptation_axes(default_hp, 1) == (true,)
-  @test h_adaptation_axes(default_hp, 2) == (true,)
-  @test p_degree_change(default_hp, 1) == (0,)
-  @test p_degree_change(default_hp, 2) == (0,)
+  @test jump_details[1][1] > 0.0
+  @test jump_details[2][1] > 0.0
+
+  jump_plan = adaptivity_plan(jump_state, jump_u; tolerance=0.0, limits=jump_limits)
+  @test h_adaptation_axes(jump_plan, 1) == (true,)
+  @test h_adaptation_axes(jump_plan, 2) == (true,)
+
+  coarse_domain = Domain((0.0,), (1.0,), (1,))
+  coarse_space = HpSpace(coarse_domain,
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
+                                      continuity=:dg))
+  coarse_u = ScalarField(coarse_space; name=:u)
+  coarse_state = State(FieldLayout((coarse_u,)), [2.0])
+  refine_plan = AdaptivityPlan(coarse_space)
+  request_h_refinement!(refine_plan, 1, 1)
+  refine_transition = transition(refine_plan)
+  refined_u = adapted_field(refine_transition, coarse_u)
+  refined_state = transfer_state(refine_transition, coarse_state, coarse_u, refined_u)
+  refined_space = field_space(refined_u)
+  coarsen_limits = AdaptivityLimits(refined_space; min_p=0, max_p=0, max_h_level=1)
+  coarsen_plan = adaptivity_plan(refined_state, refined_u; tolerance=10 * sqrt(eps(Float64)),
+                                 limits=coarsen_limits)
+
+  @test adaptivity_summary(coarsen_plan).h_derefinement_cell_count == 1
+
+  saturated_domain = Domain((0.0,), (1.0,), (1,))
+  saturated_space = HpSpace(saturated_domain,
+                            SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
+                                         continuity=:dg))
+  saturated_u = ScalarField(saturated_space; name=:u)
+  split_plan = AdaptivityPlan(saturated_space)
+  request_h_refinement!(split_plan, 1, 1)
+  split_transition = transition(split_plan)
+  split_space = target_space(split_transition)
+  split_u = adapted_field(split_transition, saturated_u)
+  saturated_plan = AdaptivityPlan(split_space)
+
+  for leaf in active_leaves(split_space)
+    request_h_refinement!(saturated_plan, leaf, 1)
+  end
+
+  saturated_transition = transition(saturated_plan)
+  saturated_u = adapted_field(saturated_transition, split_u)
+  saturated_space = field_space(saturated_u)
+  saturated_state = State(FieldLayout((saturated_u,)), [2.0, 2.0, 3.0, 3.0])
+  saturated_limits = AdaptivityLimits(saturated_space; min_p=0, max_p=0, max_h_level=2)
+  saturated_candidates = h_coarsening_candidates(saturated_space; limits=saturated_limits)
+
+  @test all(<(1.0e-2),
+            projection_coarsening_indicators(saturated_state, saturated_u, saturated_candidates))
+
+  retained_plan = adaptivity_plan(saturated_state, saturated_u; tolerance=1.0e-2,
+                                  limits=saturated_limits)
+  @test adaptivity_summary(retained_plan).h_derefinement_cell_count == 0
+
+  p_domain = Domain((0.0,), (1.0,), (1,))
+  p_space = HpSpace(p_domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  p_u = ScalarField(p_space; name=:u)
+  p_values = zeros(scalar_dof_count(p_space))
+
+  for term in mode_terms(p_space, 1, (0,))
+    p_values[term.first] -= term.second
+  end
+
+  for term in mode_terms(p_space, 1, (1,))
+    p_values[term.first] += term.second
+  end
+
+  p_state = State(FieldLayout((p_u,)), p_values)
+  p_limits = AdaptivityLimits(p_space; min_h_level=0, max_h_level=0, min_p=1, max_p=2)
+  p_plan = adaptivity_plan(p_state, p_u; tolerance=0.0, limits=p_limits)
+
+  @test h_adaptation_axes(p_plan, 1) == (false,)
+  @test p_degree_change(p_plan, 1) == (1,)
+
+  hp_limits = AdaptivityLimits(p_space; min_h_level=0, max_h_level=1, min_p=1, max_p=2)
+  hp_plan = adaptivity_plan(p_state, p_u; tolerance=0.0, limits=hp_limits)
+
+  @test h_adaptation_axes(hp_plan, 1) == (false,)
+  @test p_degree_change(hp_plan, 1) == (1,)
+
+  h_only_limits = AdaptivityLimits(p_space; min_p=1, max_p=1, max_h_level=1)
+  h_only_plan = adaptivity_plan(p_state, p_u; tolerance=0.0, limits=h_only_limits)
+
+  @test h_adaptation_axes(h_only_plan, 1) == (true,)
+  @test p_degree_change(h_only_plan, 1) == (0,)
+
+  dg_p_space = HpSpace(p_domain,
+                       SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1),
+                                    continuity=:dg))
+  dg_p_u = ScalarField(dg_p_space; name=:u)
+  dg_p_values = zeros(scalar_dof_count(dg_p_space))
+
+  for term in mode_terms(dg_p_space, 1, (0,))
+    dg_p_values[term.first] -= term.second
+  end
+
+  for term in mode_terms(dg_p_space, 1, (1,))
+    dg_p_values[term.first] += term.second
+  end
+
+  dg_p_state = State(FieldLayout((dg_p_u,)), dg_p_values)
+  dg_p_limits = AdaptivityLimits(dg_p_space; min_h_level=0, max_h_level=1, min_p=1, max_p=2)
+  dg_p_plan = adaptivity_plan(dg_p_state, dg_p_u; tolerance=0.0, limits=dg_p_limits)
+
+  @test h_adaptation_axes(dg_p_plan, 1) == (false,)
+  @test p_degree_change(dg_p_plan, 1) == (1,)
 end
 
 @testset "DG Jump Indicators On Hanging Interface" begin
@@ -625,31 +650,17 @@ end
   state = State(FieldLayout((u,)), [1.0, 1.0, 1.0, 3.0, 3.0, 3.0])
 
   @test AdaptivityLimits(space).min_p == (1, 0)
-  @test coefficient_indicators(state, u) == [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
   @test interface_jump_indicators(state, u) == [(0.0, 2.0), (0.0, 2.0), (0.0, 2.0), (0.0, 2.0)]
 
-  plan = h_adaptivity_plan(state, u; threshold=1.0)
+  plan = adaptivity_plan(state, u; tolerance=0.0,
+                         limits=AdaptivityLimits(space; min_p=(1, 0), max_p=(1, 0), max_h_level=1))
   for leaf in active_leaves(space)
     @test h_adaptation_axes(plan, leaf) == (false, true)
   end
 end
 
-@testset "Dorfler Bulk Marking" begin
-  domain = Domain((0.0,), (1.0,), (2,))
-  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
-  indicators = [(0.2,), (1.0,)]
-
-  focused = h_adaptivity_plan(space, indicators; threshold=0.5)
-  @test h_adaptation_axes(focused, 1) == (false,)
-  @test h_adaptation_axes(focused, 2) == (true,)
-
-  full = h_adaptivity_plan(space, indicators; threshold=1.0)
-  @test h_adaptation_axes(full, 1) == (true,)
-  @test h_adaptation_axes(full, 2) == (true,)
-end
-
 @testset "Coefficient Coarsening Indicators" begin
-  domain = Domain((0.0,), (1.0,), (2,))
+  domain = Domain((0.0,), (1.0,), (3,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3)))
   u = ScalarField(space; name=:u)
   values = zeros(scalar_dof_count(space))
@@ -663,141 +674,44 @@ end
   end
 
   for term in mode_terms(space, 2, (2,))
-    values[term.first] = 0.1 / term.second
+    values[term.first] = 1 / term.second
   end
 
   for term in mode_terms(space, 2, (3,))
+    values[term.first] = 0.1 / term.second
+  end
+
+  for term in mode_terms(space, 3, (2,))
+    values[term.first] = 0.1 / term.second
+  end
+
+  for term in mode_terms(space, 3, (3,))
     values[term.first] = 1 / term.second
   end
 
   state = State(FieldLayout((u,)), values)
   coarsening = coefficient_coarsening_indicators(state, u)
 
-  @test 0.0 <= coarsening[1][1] < coarsening[2][1] <= 1.0
+  @test 0.0 <= coarsening[1][1] < coarsening[3][1] <= 1.0
 
-  plan = p_adaptivity_plan(space, [(0.0,), (0.0,)], coarsening; threshold=0.0,
-                           p_coarsening_threshold=0.2)
+  plan = adaptivity_plan(state, u; tolerance=0.2,
+                         limits=AdaptivityLimits(space; min_h_level=0, max_h_level=0, min_p=2,
+                                                 max_p=3))
   @test p_degree_change(plan, 1) == (-1,)
   @test p_degree_change(plan, 2) == (0,)
-end
+  @test p_degree_change(plan, 3) == (0,)
 
-@testset "State P Coarsening Stabilization" begin
-  domain = Domain((0.0,), (1.0,), (1,))
-  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
-  v = ScalarField(space; name=:v)
-  u = ScalarField(space; name=:u)
-  state = State(FieldLayout((v, u)))
-  refinement = (current_state, current_field) -> begin
-    @test field_count(field_layout(current_state)) == 2
-    @test length(field_values(current_state, v)) > 0
-    cell_degrees(field_space(current_field), 1)[1] == 2 ? [(0.0,)] : [(1.0,)]
-  end
-  p_coarsening = (_state, _field) -> [(0.0,)]
-
-  raw = p_adaptivity_plan(space, [(0.0,)], [(0.0,)]; threshold=1.0, p_coarsening_threshold=0.1)
-  @test p_degree_change(raw, 1) == (-1,)
-
-  stabilized = p_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
-                                 p_coarsening_indicator=p_coarsening, p_coarsening_threshold=0.1)
-  @test isempty(stabilized)
-end
-
-@testset "Custom Indicator Hooks" begin
-  domain = Domain((0.0,), (1.0,), (2,))
-  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
-  u = ScalarField(space; name=:u)
-  state = State(FieldLayout((u,)), zeros(scalar_dof_count(space)))
-  refinement = (_state, _field) -> [(0.0,), (1.0,)]
-  smoothness = (_state, _field) -> [(1.0,), (0.0,)]
-  p_coarsening = (_state, _field) -> [(0.0,), (1.0,)]
-
-  plan = hp_adaptivity_plan(state, u; indicator=refinement, smoothness_indicator=smoothness,
-                            smoothness_threshold=0.5, p_coarsening_indicator=p_coarsening,
-                            p_coarsening_threshold=0.1, threshold=1.0)
-  @test h_adaptation_axes(plan, 1) == (false,)
-  @test p_degree_change(plan, 1) == (-1,)
-  @test h_adaptation_axes(plan, 2) == (false,)
-  @test p_degree_change(plan, 2) == (1,)
-
-  precomputed = hp_adaptivity_plan(space, [(1.0,), (0.0,)], [(1.0,), (0.0,)]; threshold=1.0,
-                                   smoothness_threshold=0.5)
-  @test h_adaptation_axes(precomputed, 1) == (true,)
-  @test p_degree_change(precomputed, 1) == (0,)
-  @test h_adaptation_axes(precomputed, 2) == (false,)
-
-  coarse_domain = Domain((0.0,), (1.0,), (1,))
-  coarse_space = HpSpace(coarse_domain,
-                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
-  coarse_u = ScalarField(coarse_space; name=:u)
-  coarse_state = State(FieldLayout((coarse_u,)), [0.2, -0.1, 0.6])
-  refine_plan = AdaptivityPlan(coarse_space)
-  request_h_refinement!(refine_plan, 1, 1)
-  refine_transition = transition(refine_plan)
-  fine_u = adapted_field(refine_transition, coarse_u)
-  fine_state = transfer_state(refine_transition, coarse_state, coarse_u, fine_u)
-  candidates = h_coarsening_candidates(field_space(fine_u))
-  h_coarsening = (_state, _field, _candidates) -> [0.0]
-
-  coarsened = h_adaptivity_plan(fine_state, fine_u; threshold=0.0,
-                                h_coarsening_candidates=candidates,
-                                h_coarsening_indicator=h_coarsening, h_coarsening_threshold=0.1)
-  @test adaptivity_summary(coarsened).h_derefinement_cell_count == 1
-end
-
-@testset "Coefficient Hp Planning" begin
-  domain = Domain((0.0,), (1.0,), (2,))
-  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3)))
-  u = ScalarField(space; name=:u)
-  values = zeros(scalar_dof_count(space))
-
-  for term in mode_terms(space, 1, (2,))
-    values[term.first] = 1 / term.second
-  end
-
-  for term in mode_terms(space, 1, (3,))
-    values[term.first] = 0.1 / term.second
-  end
-
-  for term in mode_terms(space, 2, (2,))
-    values[term.first] = 0.1 / term.second
-  end
-
-  for term in mode_terms(space, 2, (3,))
-    values[term.first] = 1 / term.second
-  end
-
-  state = State(FieldLayout((u,)), values)
-  decay = coefficient_decay_indicators(state, u)
-  @test decay[1][1] < 1
-  @test decay[2][1] > 1
-
-  p_plan = p_adaptivity_plan(state, u; threshold=1.0)
-  @test p_degree_change(p_plan, 1) == (1,)
-  @test p_degree_change(p_plan, 2) == (1,)
-
-  hp_plan = hp_adaptivity_plan(state, u; threshold=1.0, smoothness_threshold=0.5)
-  @test p_degree_change(hp_plan, 1) == (1,)
+  hp_limits = AdaptivityLimits(space; min_h_level=0, max_h_level=1, min_p=2, max_p=4)
+  hp_plan = adaptivity_plan(state, u; tolerance=0.05, limits=hp_limits)
   @test h_adaptation_axes(hp_plan, 1) == (false,)
-  @test p_degree_change(hp_plan, 2) == (0,)
-  @test h_adaptation_axes(hp_plan, 2) == (true,)
-end
+  @test p_degree_change(hp_plan, 1) == (1,)
+  @test h_adaptation_axes(hp_plan, 3) == (true,)
+  @test p_degree_change(hp_plan, 3) == (0,)
 
-@testset "Hp Planning Fallback" begin
-  domain = Domain((0.0,), (1.0,), (2,))
-  refine!(grid(domain), 1, 1)
-  space = HpSpace(domain,
-                  SpaceOptions(basis=FullTensorBasis(),
-                               degree=ByLeafDegrees((_, leaf) -> leaf == 2 ? (3,) : (2,))))
-  limits = AdaptivityLimits(1; max_h_level=1, max_p=3)
-  plan = hp_adaptivity_plan(space, [(1.0,), (1.0,), (0.0,)], [(0.0,), (1.0,), (0.0,)];
-                            threshold=1.0, smoothness_threshold=0.5, limits=limits)
-
-  @test h_adaptation_axes(plan, 2) == (true,)
-  @test p_degree_change(plan, 2) == (0,)
-  @test h_adaptation_axes(plan, 3) == (false,)
-  @test p_degree_change(plan, 3) == (1,)
-  @test h_adaptation_axes(plan, 4) == (false,)
-  @test p_degree_change(plan, 4) == (0,)
+  p_biased_plan = adaptivity_plan(state, u; tolerance=0.05, smoothness_threshold=20.0,
+                                  limits=hp_limits)
+  @test h_adaptation_axes(p_biased_plan, 3) == (false,)
+  @test p_degree_change(p_biased_plan, 3) == (1,)
 end
 
 @testset "Planner Limits And Validation" begin
@@ -815,19 +729,11 @@ end
                      SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
   @test AdaptivityPlan(dg_space, domain, [(0,)]) isa AdaptivityPlan
   @test_throws ArgumentError AdaptivityLimits(space; min_p=0)
-  @test_throws ArgumentError h_adaptivity_plan(space, [(Inf,)])
-  @test_throws ArgumentError h_adaptivity_plan(space, [(0.0,)]; h_coarsening_threshold=0.1)
-  @test_throws ArgumentError p_adaptivity_plan(space, [(NaN,)])
-  @test_throws ArgumentError p_adaptivity_plan(space, [(0.0,)]; p_coarsening_threshold=0.1)
-  @test_throws ArgumentError p_adaptivity_plan(state, u;
-                                               p_coarsening_indicator=(_state, _field) -> [(NaN,)],
-                                               p_coarsening_threshold=0.1)
-  @test_throws ArgumentError hp_adaptivity_plan(state, u; indicator=(_state, _field) -> [(NaN,)])
-  @test_throws ArgumentError hp_adaptivity_plan(state, u;
-                                                smoothness_indicator=(_state, _field) -> [(NaN,)])
-  @test_throws ArgumentError h_adaptivity_plan(state, u;
-                                               h_coarsening_indicator=(_state, _field, _candidates) -> [NaN],
-                                               h_coarsening_threshold=0.1)
+  @test_throws ArgumentError adaptivity_plan(state, u; tolerance=NaN)
+  @test_throws ArgumentError adaptivity_plan(state, u; tolerance=-1.0)
+  @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=NaN)
+  @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=-1.0)
+  @test_throws ArgumentError adaptivity_plan(state, u; limits=AdaptivityLimits(2))
 
   plan = AdaptivityPlan(space)
   request_h_refinement!(plan, 1, 1)

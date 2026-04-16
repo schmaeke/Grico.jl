@@ -175,9 +175,8 @@ export AdditiveSchwarzPreconditioner, FieldSplitSchurPreconditioner, ILUPrecondi
 
 include("adaptivity.jl")
 export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, adapted_field, adapted_fields,
-       derived_adaptivity_plan, h_adaptivity_plan, hp_adaptivity_plan, p_adaptivity_plan,
-       request_h_derefinement!, request_h_refinement!, request_p_derefinement!,
-       request_p_refinement!, transfer_state, transition
+       adaptivity_plan, derived_adaptivity_plan, request_h_derefinement!, request_h_refinement!,
+       request_p_derefinement!, request_p_refinement!, transfer_state, transition
 
 # Part VI. Postprocessing, verification, and output.
 include("verification.jl")

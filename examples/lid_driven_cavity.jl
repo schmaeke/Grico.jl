@@ -53,11 +53,11 @@ import Grico: cell_matrix!, face_matrix!, face_rhs!, interface_matrix!
 # ---------------------------------------------------------------------------
 #
 # Mesh and approximation order. The example starts from a coarse uniform mesh
-# and lets a few DG jump-indicator refinement cycles find the lid singularities
-# automatically.
+# and lets the single-tolerance DG adaptivity planner find the lid
+# singularities automatically while keeping the polynomial degree fixed.
 const ROOT_COUNTS = (16, 16)
 const ADAPTIVE_STEPS = 4
-const ADAPTIVITY_THRESHOLD = 0.9
+const ADAPTIVITY_TOLERANCE = 5.0e-2
 const MAX_H_LEVEL = 3
 const VELOCITY_DEGREE = 2
 const PRESSURE_DEGREE = 1
@@ -692,11 +692,12 @@ end
 # `derived_adaptivity_plan` expresses exactly that relationship at the library
 # level, and `transfer_state((velocity_plan, pressure_plan), ...)` then moves
 # the mixed state to the new pair of spaces in one consistent operation.
-function adapt_lid_driven_cavity_context(context; threshold=ADAPTIVITY_THRESHOLD,
+function adapt_lid_driven_cavity_context(context; tolerance=ADAPTIVITY_TOLERANCE,
                                          max_h_level=MAX_H_LEVEL)
-  limits = AdaptivityLimits(context.velocity_space; max_h_level=max_h_level)
-  velocity_plan = h_adaptivity_plan(context.flow_state, context.velocity; threshold=threshold,
-                                    limits=limits)
+  limits = AdaptivityLimits(context.velocity_space; min_p=VELOCITY_DEGREE, max_p=VELOCITY_DEGREE,
+                            max_h_level=max_h_level)
+  velocity_plan = adaptivity_plan(context.flow_state, context.velocity; tolerance=tolerance,
+                                  limits=limits)
   isempty(velocity_plan) && return context, velocity_plan
   pressure_plan = derived_adaptivity_plan(velocity_plan, context.pressure;
                                           limits=AdaptivityLimits(context.pressure_space;

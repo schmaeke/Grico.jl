@@ -11,8 +11,9 @@ export OperationSpec, PreparedCase, build_phase0_case, phase0_case_ids
 
 const DIRECT_LINEAR_SOLVE = (matrix, rhs) -> matrix \ rhs
 
-const ADAPTIVITY_THRESHOLD = 0.35
-const SMOOTHNESS_THRESHOLD = 0.45
+const ADAPTIVITY_TOLERANCE = 5.0e-2
+const MAX_DEGREE = 4
+const MAX_H_LEVEL = 5
 const SINGULAR_EXPONENT = 0.5
 const SOURCE_FACTOR = -SINGULAR_EXPONENT * (SINGULAR_EXPONENT + 2 - 2)
 
@@ -420,6 +421,7 @@ function _affine_cell_case()
   solution = Grico.solve(system; linear_solve=DIRECT_LINEAR_SOLVE)
   state = Grico.State(plan, solution)
   preconditioner = Grico.AdditiveSchwarzPreconditioner(min_dofs=0)
+  adaptivity_limits = Grico.AdaptivityLimits(space; max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
   metadata = _prepared_metadata(plan; system,
                                 extra=Dict("case_kind" => "affine", "continuity" => "cg",
                                            "degree" => 3, "root_counts" => [40, 40],
@@ -436,10 +438,10 @@ function _affine_cell_case()
                                            () -> Grico.solve(system;
                                                              linear_solve=DIRECT_LINEAR_SOLVE),
                                            () -> nothing),
-                             OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
-                                           () -> Grico.hp_adaptivity_plan(state, u;
-                                                                          threshold=ADAPTIVITY_THRESHOLD,
-                                                                          smoothness_threshold=SMOOTHNESS_THRESHOLD),
+                             OperationSpec("adaptivity_plan", "adaptivity_plan(state, u)",
+                                           () -> Grico.adaptivity_plan(state, u;
+                                                                       tolerance=ADAPTIVITY_TOLERANCE,
+                                                                       limits=adaptivity_limits),
                                            () -> nothing)]
 
   return PreparedCase("affine_cell_diffusion", "Affine Cell-Dominated Diffusion",
@@ -555,11 +557,12 @@ function _adaptive_poisson_case()
                               "root_counts" => [8, 8], "manual_refinement_passes" => 2,
                               "active_leaves" => length(Grico.active_leaves(space)),
                               "full_dofs" => length(Grico.coefficients(state)))
+  adaptivity_limits = Grico.AdaptivityLimits(space; max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
 
-  operations = OperationSpec[OperationSpec("adaptivity_plan", "hp_adaptivity_plan(state, u)",
-                                           () -> Grico.hp_adaptivity_plan(state, u;
-                                                                          threshold=ADAPTIVITY_THRESHOLD,
-                                                                          smoothness_threshold=SMOOTHNESS_THRESHOLD),
+  operations = OperationSpec[OperationSpec("adaptivity_plan", "adaptivity_plan(state, u)",
+                                           () -> Grico.adaptivity_plan(state, u;
+                                                                       tolerance=ADAPTIVITY_TOLERANCE,
+                                                                       limits=adaptivity_limits),
                                            () -> nothing)]
 
   return PreparedCase("adaptive_poisson", "Adaptive Planning On Refined Mesh",

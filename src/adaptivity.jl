@@ -2,8 +2,8 @@
 # The main responsibilities are:
 # 1. describe admissible target discretizations via `AdaptivityPlan`,
 # 2. compile source-to-target transfer data via `SpaceTransition`,
-# 3. derive problem-independent indicators from modal coefficients, and
-# 4. translate indicator fields into concrete `h`, `p`, or mixed `hp` changes.
+# 3. derive problem-independent FE detail indicators, and
+# 4. translate those details into concrete `h`, `p`, or mixed `hp` changes.
 #
 # The guiding design choice is to keep "planning a new space" separate from
 # "building that space". An `AdaptivityPlan` therefore stores only a mutable
@@ -21,15 +21,14 @@
 # `SpaceTransition`, together with state transfer and field recreation on the
 # target space.
 #
-# Third, it introduces problem-independent indicators derived directly from the
-# modal structure of the hp basis. These indicators are intentionally generic:
-# they say something about local resolution and smoothness without assuming a
-# specific PDE residual or estimator. In the DG setting, that story broadens:
-# interior modal decay still matters, but jumps across interfaces also become a
-# natural signal of under-resolution.
+# Third, it introduces problem-independent detail indicators derived from the hp
+# basis and from DG traces. These indicators are intentionally generic: they say
+# something about local resolution without assuming a specific PDE residual or
+# estimator.
 #
-# Fourth, it turns those indicators into concrete `h`, `p`, or mixed `hp`
-# changes through bulk marking, thresholding, and candidate selection.
+# Fourth, it turns those details into concrete `h`, `p`, or mixed `hp` changes
+# through one multiresolution-style tolerance, one optional h/p smoothness
+# threshold, and admissible bounds on h-level and polynomial degree.
 #
 # The file is arranged in that same order, so it can be read from manual plan
 # editing toward fully automatic adaptivity.
@@ -127,6 +126,9 @@ function AdaptivityLimits(dimension::Integer; min_h_level=0, max_h_level=typemax
                              _adaptivity_limit_tuple(max_p, D, "max_p", _checked_nonnegative))
 end
 
+# Continuous axes need at least linear endpoint modes to represent conforming
+# traces, while fully discontinuous axes may use a constant cell mode. This is
+# the continuity-aware default when users do not specify `min_p` explicitly.
 @inline function _default_min_p(continuity_policy::_AxisContinuity{D}) where {D}
   return ntuple(axis -> _is_cg_axis(continuity_policy, axis) ? 1 : 0, D)
 end
@@ -150,6 +152,9 @@ function AdaptivityLimits(space::HpSpace{D}; min_h_level=0, max_h_level=typemax(
   return _checked_limits(limits, space)
 end
 
+# Validate a user-supplied limit object against the concrete space. Most bounds
+# are purely geometric or polynomial, but CG axes have the additional lower
+# degree invariant enforced by the space compiler.
 function _checked_limits(limits::AdaptivityLimits{D}, space::HpSpace{D}) where {D}
   for axis in 1:D
     is_continuous_axis(space, axis) &&
@@ -492,6 +497,9 @@ function _reset_plan_degrees!(plan::AdaptivityPlan{D}, mapping::Dict{Int,NTuple{
   return plan
 end
 
+# Snapshot source degrees before batched topology edits. The dictionary form is
+# temporary and intentionally mirrors the target-grid cell numbers while splits
+# and collapses insert or remove leaves.
 function _source_degree_map(space::HpSpace{D}) where {D}
   mapping = Dict{Int,NTuple{D,Int}}()
   sizehint!(mapping, active_leaf_count(space))
@@ -563,10 +571,10 @@ end
 # This produces the same target configuration that one would obtain by
 # performing the selected changes conceptually "at once", but avoids repeatedly
 # rebuilding plan lookup structures after every individual change.
-function _batched_h_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_refinement_axes,
-                                    h_coarsening_candidates;
-                                    limits::AdaptivityLimits{D}=AdaptivityLimits(space)) where {D,
-                                                                                                T<:AbstractFloat}
+function _batched_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_refinement_axes,
+                                  h_coarsening_candidates;
+                                  limits::AdaptivityLimits{D}=AdaptivityLimits(space)) where {D,
+                                                                                              T<:AbstractFloat}
   length(p_degree_changes) == active_leaf_count(space) ||
     throw(ArgumentError("p degree changes must match the active-leaf count"))
   length(h_refinement_axes) == active_leaf_count(space) ||
@@ -601,6 +609,9 @@ function _batched_h_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_ref
   return AdaptivityPlan(space, target_domain, degrees; limits=limits)
 end
 
+# These predicates encode admissibility against the active limits only. Keeping
+# them separate from indicator logic makes fallback decisions explicit and keeps
+# plan construction from silently exceeding user-specified h/p bounds.
 function _can_h_refine(grid_data::CartesianGrid, leaf::Int, axis::Int, limits::AdaptivityLimits)
   return level(grid_data, leaf, axis) < limits.max_h_level[axis]
 end
@@ -668,6 +679,9 @@ function HCoarseningCandidate(cell::Integer, axis::Integer,
                                  ntuple(index -> Int(target_degrees[index]), D))
 end
 
+# Merged h-coarsening parents inherit the componentwise maximum child degree.
+# This avoids losing polynomial order as a side effect of removing one mesh
+# split; any p-derefinement is planned separately by the modal detail logic.
 function _candidate_target_degrees(space::HpSpace{D},
                                    children::NTuple{_MIDPOINT_CHILD_COUNT,Int}) where {D}
   return ntuple(axis -> maximum(cell_degrees(space, child)[axis] for child in children), D)
@@ -697,6 +711,8 @@ function _checked_h_coarsening_candidate(space::HpSpace{D},
   return HCoarseningCandidate(checked_cell, checked_axis, expected_children, expected_degrees)
 end
 
+# Normalize a user- or planner-provided candidate list before applying it. This
+# keeps the batched plan builder independent of where the candidates came from.
 function _checked_h_coarsening_candidates(space::HpSpace{D}, candidates) where {D}
   checked = Vector{HCoarseningCandidate{D}}(undef, length(candidates))
 
@@ -709,6 +725,9 @@ function _checked_h_coarsening_candidates(space::HpSpace{D}, candidates) where {
   return checked
 end
 
+# Apply the topological inverse of one dyadic split to the transient degree map.
+# The caller is responsible for candidate validation and for rebuilding active
+# leaf lookup data after all batched edits have been applied.
 function _apply_h_derefinement!(grid_data::CartesianGrid{D}, mapping::Dict{Int,NTuple{D,Int}},
                                 candidate::HCoarseningCandidate{D}) where {D}
   for child in candidate.children
@@ -746,10 +765,6 @@ function h_coarsening_candidates(space::HpSpace{D}; limits=AdaptivityLimits(spac
   end
 
   return candidates
-end
-
-function _default_h_coarsening_candidates(space::HpSpace; limits=AdaptivityLimits(space))
-  h_coarsening_candidates(space; limits=limits)
 end
 
 # Apply one possibly anisotropic `h` refinement to an active target leaf while
@@ -1000,6 +1015,9 @@ function _transition_source_leaves(source_grid::CartesianGrid, target_grid::Cart
   return leaves
 end
 
+# A derived plan may use a different source space, but it must live on the same
+# physical geometry and scalar type as the driver plan. Otherwise the copied
+# target topology could not be interpreted as the same adapted domain.
 function _checked_derived_plan_space(driver_plan::AdaptivityPlan, space::HpSpace)
   dimension(space) == dimension(driver_plan) ||
     throw(ArgumentError("derived space must have dimension $(dimension(driver_plan))"))
@@ -1028,6 +1046,9 @@ function _inherited_target_degrees(space::HpSpace{D}, target_domain::AbstractDom
   return degrees
 end
 
+# Degree offsets express compact mixed-space relationships such as pressure
+# following velocity with one lower order. The offset is applied to the target
+# degrees of the already adapted driver plan, not to the original source space.
 function _offset_target_degrees(driver_plan::AdaptivityPlan{D},
                                 degree_offset::NTuple{D,Int}) where {D}
   active = active_leaves(driver_plan)
@@ -1163,7 +1184,7 @@ function adapted_fields(transition::SpaceTransition, first_field::AbstractField,
   return adapted_fields(transition, (first_field, remaining_fields...))
 end
 
-# State transfer is formulated as an `L2` projection on the target space. The
+# State transfer is formulated as an `L²` projection on the target space. The
 # local mass operator below provides the symmetric positive definite block that
 # defines the target inner product for one field.
 struct _TransferMass{F}
@@ -1172,7 +1193,7 @@ end
 
 # The transfer source operator evaluates the old state on target quadrature
 # points and injects those values into the right-hand side of the projection
-# system. Together with `_TransferMass` this yields the Galerkin `L2`
+# system. Together with `_TransferMass` this yields the Galerkin `L²`
 # projection from the source field to the target field.
 struct _TransferSource{F,O,S,TR}
   field::F
@@ -1222,6 +1243,9 @@ function _point_in_cell(domain_data::AbstractDomain{D,T}, leaf::Int, x::NTuple{D
   return all(lower[axis] - tolerance <= x[axis] <= upper[axis] + tolerance for axis in 1:D)
 end
 
+# Locate the source leaf that supplies a value at a target quadrature point.
+# The transition precomputes the small overlap set, so this search is local to
+# one target leaf instead of scanning the full source mesh.
 function _source_leaf_at_point(transition::SpaceTransition{D,T}, target_leaf::Int,
                                x::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
   domain_data = domain(source_space(transition))
@@ -1273,6 +1297,9 @@ end
 # directly than to assemble one global sparse projection problem.
 _is_fully_dg_space(space::HpSpace) = all(kind -> kind === :dg, continuity_policy(space))
 
+# The fast DG transfer path writes local projection coefficients directly into
+# global state storage. That is only valid when every local dof has a unique,
+# unit-coefficient global term, so the invariant is checked explicitly.
 function _checked_cellwise_single_term_mapping(cell::CellValues)
   local_dofs = cell.local_dof_count
   coefficient_tolerance = 1000 * eps(eltype(cell.single_term_coefficients))
@@ -1300,6 +1327,9 @@ end
   return linear_solve(local_matrix, local_rhs)
 end
 
+# Cellwise DG transfer reuses one dense work matrix and right-hand side for all
+# cells. This avoids global sparse assembly in the common fully discontinuous
+# transient examples while preserving the same L² projection semantics.
 function _cellwise_dg_transfer_state(plan, old_fields::Tuple, new_fields::Tuple, state::State,
                                      transition::SpaceTransition; linear_solve=default_linear_solve)
   T = eltype(coefficients(state))
@@ -1341,7 +1371,7 @@ end
     transfer_state(transition, state; linear_solve=default_linear_solve)
 
 Transfer field coefficients from the source space to the target space of
-`transition` by cellwise `L2` projection.
+`transition` by cellwise `L²` projection.
 
 The first forms project explicitly paired old/new fields. The zero-argument
 field form recreates the full field layout on the target space via
@@ -1398,6 +1428,9 @@ function transfer_state(transition::SpaceTransition, state::State;
          transfer_state(transition, state, old_fields, new_fields; linear_solve=linear_solve)
 end
 
+# Mixed-field transfer requires exactly one plan for each source space present
+# in the state layout, and all plans must describe the same target active-leaf
+# topology. These checks keep the later block transfer deterministic.
 function _checked_transition_plans(plans::Tuple, state::State)
   isempty(plans) && throw(ArgumentError("at least one adaptivity plan is required"))
   layout = field_layout(state)
@@ -1504,7 +1537,7 @@ function transfer_state(plans::Tuple, state::State; linear_solve=default_linear_
   return Tuple(new_fields), new_state
 end
 
-# Modal coefficient indicators and smoothness heuristics.
+# Modal and interface detail indicators.
 
 function _local_mode_energy(field::AbstractField, state::State{T}, compiled::_CompiledLeaf,
                             mode_index::Int) where {T<:AbstractFloat}
@@ -1522,11 +1555,11 @@ end
   return ntuple(current_axis -> current_axis == axis ? value : Int(mode[current_axis]), D)
 end
 
-# Degree-zero DG cells only contain a constant mode and therefore have no
-# higher modal layer to inspect. Degree-one cells only contain the two endpoint
-# modes `ψ₀` and `ψ₁` on each axis. Those do not separate constant and linear
-# content by themselves, so for `p = 1` we first transform the endpoint pair
-# into its constant/linear combination before extracting the top layer.
+# Degree-zero DG cells only contain a constant mode and therefore have no modal
+# decay information. Degree-one cells only contain the two endpoint modes `ψ₀`
+# and `ψ₁` on each axis. Those do not separate constant and linear content by
+# themselves, so for `p = 1` we first transform the endpoint pair into its
+# constant/linear combination before extracting layer energies.
 function _axis_layer_energies(field::AbstractField, state::State{T}, compiled::_CompiledLeaf{D},
                               axis::Int) where {D,T<:AbstractFloat}
   degree_value = compiled.degrees[axis]
@@ -1665,11 +1698,11 @@ where `p_a` is the local polynomial degree and `h_a` is the cell size normal to
 the face. The returned per-leaf, per-axis values are the square roots of those
 accumulated contributions.
 
-This is the default problem-independent refinement indicator on DG axes. The
-idea is the standard DG heuristic: if two neighboring leaves represent a smooth
-solution well, then their traces should already agree reasonably closely across
-their common face. Large jumps therefore point to under-resolution normal to
-that interface.
+This is the problem-independent h-refinement signal on DG axes in the compact
+adaptivity planner. The idea is the standard DG heuristic: if two neighboring
+leaves represent a smooth solution well, then their traces should already agree
+reasonably closely across their common face. Large jumps therefore point to
+under-resolution normal to that interface.
 """
 function interface_jump_indicators(state::State{T}, field::AbstractField) where {T<:AbstractFloat}
   field_dof_range(field_layout(state), field)
@@ -1721,320 +1754,99 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
           for leaf_index in 1:active_leaf_total]
 end
 
-function _merge_axis_indicators(space::HpSpace{D}, cg_indicators, dg_indicators) where {D}
-  return [ntuple(axis -> is_continuous_axis(space, axis) ? cg_indicators[leaf_index][axis] :
-                         dg_indicators[leaf_index][axis], D)
-          for leaf_index in 1:active_leaf_count(space)]
-end
-
-function _default_refinement_indicators(state::State{T},
-                                        field::AbstractField) where {T<:AbstractFloat}
-  space = field_space(field)
-  has_cg = any(axis -> is_continuous_axis(space, axis), 1:dimension(space))
-  has_dg = any(axis -> !is_continuous_axis(space, axis), 1:dimension(space))
-  has_cg && !has_dg && return coefficient_indicators(state, field)
-  has_dg && !has_cg && return interface_jump_indicators(state, field)
-  return _merge_axis_indicators(space, coefficient_indicators(state, field),
-                                interface_jump_indicators(state, field))
-end
-
-function _default_smoothness_indicators(state::State{T},
-                                        field::AbstractField) where {T<:AbstractFloat}
-  space = field_space(field)
-  decay = coefficient_decay_indicators(state, field)
-  any(axis -> !is_continuous_axis(space, axis), 1:dimension(space)) || return decay
-  D = dimension(space)
-
-  return [ntuple(axis -> begin
-                   degrees = cell_degrees(space, active_leaf(space, leaf_index))
-                   !is_continuous_axis(space, axis) && degrees[axis] == 0 ? floatmax(T) :
-                   decay[leaf_index][axis]
-                 end, D) for leaf_index in 1:active_leaf_count(space)]
-end
-
-"""
-    coefficient_indicators(state, field)
-
-Per-axis highest-order modal amplitudes on each active leaf. These are the
-default modal refinement indicators and remain the default refinement signal on
-CG axes.
-
-For each active leaf and each axis, the indicator sums the squared amplitudes of
-the local top modal layer and returns the square root of that sum. For
-`p_axis ≥ 2`, this is the usual set of modes whose index on that axis equals
-the local degree `p_axis`. At `p_axis = 1`, the integrated-Legendre endpoint
-pair is first rewritten into constant/linear content and the linear part is
-used as the top layer. Large values therefore signal that the highest resolved
-polynomial content still carries significant energy, which is a classical
-heuristic for requesting further refinement.
-"""
-function coefficient_indicators(state::State{T}, field::AbstractField) where {T<:AbstractFloat}
-  field_dof_range(field_layout(state), field)
-  space = field_space(field)
-  indicators = Vector{NTuple{dimension(space),T}}(undef, active_leaf_count(space))
-  thread_axis_sums = [zeros(T, dimension(space))
-                      for _ in 1:max(1, min(Threads.nthreads(), length(space.active_leaves)))]
-
-  _run_chunks_with_scratch!(thread_axis_sums,
-                            length(space.active_leaves)) do axis_sums, first_leaf, last_leaf
-    for leaf_index in first_leaf:last_leaf
-      compiled = space.compiled_leaves[leaf_index]
-      for axis in 1:dimension(space)
-        top_energy, _ = _axis_layer_energies(field, state, compiled, axis)
-        axis_sums[axis] = top_energy
-      end
-
-      indicators[leaf_index] = ntuple(axis -> sqrt(axis_sums[axis]), dimension(space))
-    end
-  end
-
-  return indicators
-end
-
 """
     coefficient_coarsening_indicators(state, field)
 
-Per-axis normalized top-layer modal energy ratios on each active leaf. Smaller
-values indicate that one `p`-derefinement step is likely to be harmless on that
-axis.
+Per-axis normalized top-layer modal energy ratios on each active leaf.
 
 If the modal energy contained in the highest layer is small relative to the
 total local modal energy, removing that layer should have little effect on the
-local approximation. At `p_axis = 1`, the endpoint pair is interpreted as
-constant versus linear content before the top-layer energy is formed. The
-returned quantity is `√(E_top / E_total)` per axis.
+local approximation. If the ratio is large, the same quantity is a natural
+signal that the current polynomial degree is still carrying resolved detail.
+At `p_axis = 1`, the endpoint pair is interpreted as constant versus linear
+content before the top-layer energy is formed. The returned quantity is
+`√(E_top / E_total)` per axis.
 """
 function coefficient_coarsening_indicators(state::State{T},
                                            field::AbstractField) where {T<:AbstractFloat}
+  return _modal_axis_detail_data(state, field).detail
+end
+
+# One modal pass produces both normalized top-layer detail and top-to-previous
+# decay. Keeping them together avoids re-reading the local modal expansion and
+# makes the planner's "magnitude first, regularity second" policy explicit.
+struct _ModalAxisDetailData{D,T<:AbstractFloat}
+  detail::Vector{NTuple{D,T}}
+  decay::Vector{NTuple{D,T}}
+end
+
+# Thread-local scratch for modal detail evaluation. The arrays are indexed by
+# logical axis and reused across leaf chunks to avoid per-leaf temporary
+# allocation.
+struct _ModalAxisDetailScratch{T<:AbstractFloat}
+  top::Vector{T}
+  previous::Vector{T}
+end
+
+# Convert the two modal layer energies into the decay ratio used by the h/p
+# classifier. A nonzero top layer with vanishing previous layer is treated as
+# rough, because the current polynomial order does not show reliable decay.
+function _modal_decay_value(top_energy::T, previous_energy::T) where {T<:AbstractFloat}
+  top_energy == zero(T) && return zero(T)
+  previous_energy > eps(T) * top_energy || return floatmax(T)
+  ratio = top_energy / previous_energy
+  return isfinite(ratio) ? sqrt(ratio) : floatmax(T)
+end
+
+# Modal detail and modal decay are computed together because both require the
+# same local modal layer energies. The normalized top-layer detail decides
+# whether adaptation is needed; the top-to-previous decay ratio is only an
+# internal h/p classifier for axes where the detail is significant.
+function _modal_axis_detail_data(state::State{T}, field::AbstractField) where {T<:AbstractFloat}
   field_dof_range(field_layout(state), field)
   space = field_space(field)
-  indicators = Vector{NTuple{dimension(space),T}}(undef, active_leaf_count(space))
-  thread_axis_energy = [zeros(T, dimension(space))
-                        for _ in 1:max(1, min(Threads.nthreads(), length(space.active_leaves)))]
+  D = dimension(space)
+  detail = Vector{NTuple{D,T}}(undef, active_leaf_count(space))
+  decay = Vector{NTuple{D,T}}(undef, active_leaf_count(space))
+  thread_scratch = [_ModalAxisDetailScratch(zeros(T, D), zeros(T, D))
+                    for _ in 1:max(1, min(Threads.nthreads(), length(space.active_leaves)))]
 
-  _run_chunks_with_scratch!(thread_axis_energy,
-                            length(space.active_leaves)) do axis_energy, first_leaf, last_leaf
+  _run_chunks_with_scratch!(thread_scratch,
+                            length(space.active_leaves)) do scratch, first_leaf, last_leaf
     for leaf_index in first_leaf:last_leaf
       compiled = space.compiled_leaves[leaf_index]
-      fill!(axis_energy, zero(T))
+      fill!(scratch.top, zero(T))
+      fill!(scratch.previous, zero(T))
       total_energy = zero(T)
 
       for mode_index in eachindex(compiled.local_modes)
-        mode = compiled.local_modes[mode_index]
         amplitude_squared = _local_mode_energy(field, state, compiled, mode_index)
         amplitude_squared == zero(T) && continue
         total_energy += amplitude_squared
       end
 
-      for axis in 1:dimension(space)
-        axis_energy[axis], _ = _axis_layer_energies(field, state, compiled, axis)
+      for axis in 1:D
+        scratch.top[axis], scratch.previous[axis] = _axis_layer_energies(field, state, compiled,
+                                                                         axis)
       end
 
-      indicators[leaf_index] = total_energy == zero(T) ? ntuple(_ -> zero(T), dimension(space)) :
-                               ntuple(axis -> sqrt(axis_energy[axis] / total_energy),
-                                      dimension(space))
+      detail[leaf_index] = total_energy == zero(T) ? ntuple(_ -> zero(T), D) :
+                           ntuple(axis -> sqrt(scratch.top[axis] / total_energy), D)
+      decay[leaf_index] = ntuple(axis -> _modal_decay_value(scratch.top[axis],
+                                                            scratch.previous[axis]), D)
     end
   end
 
-  return indicators
+  return _ModalAxisDetailData{D,T}(detail, decay)
 end
 
-"""
-    coefficient_decay_indicators(state, field)
-
-Per-axis top-to-previous modal layer energy ratios on each active leaf. These
-values serve as smoothness indicators for the `h`/`p` split in mixed
-adaptivity.
-
-The indicator compares the modal energy in the top layer `p_axis` with the
-energy in the preceding layer `p_axis - 1`. At `p_axis = 1`, the endpoint pair
-is interpreted as constant versus linear content before forming that ratio.
-Small ratios suggest rapid modal decay and hence local smoothness, which favors
-`p`-refinement; large ratios suggest slower decay and favor `h`-refinement.
-"""
-function coefficient_decay_indicators(state::State{T},
-                                      field::AbstractField) where {T<:AbstractFloat}
-  field_dof_range(field_layout(state), field)
-  space = field_space(field)
-  decay = Vector{NTuple{dimension(space),T}}(undef, active_leaf_count(space))
-  thread_axis_decay = [zeros(T, dimension(space))
-                       for _ in 1:max(1, min(Threads.nthreads(), length(space.active_leaves)))]
-
-  _run_chunks_with_scratch!(thread_axis_decay,
-                            length(space.active_leaves)) do axis_decay, first_leaf, last_leaf
-    for leaf_index in first_leaf:last_leaf
-      compiled = space.compiled_leaves[leaf_index]
-      fill!(axis_decay, zero(T))
-
-      for axis in 1:dimension(space)
-        top_energy, previous_energy = _axis_layer_energies(field, state, compiled, axis)
-        axis_decay[axis] = if top_energy == zero(T)
-          zero(T)
-        elseif previous_energy == zero(T) || previous_energy <= eps(T) * top_energy
-          floatmax(T)
-        else
-          ratio = top_energy / previous_energy
-          isfinite(ratio) ? sqrt(ratio) : floatmax(T)
-        end
-      end
-
-      decay[leaf_index] = ntuple(axis -> axis_decay[axis], dimension(space))
-    end
-  end
-
-  return decay
-end
-
-function _indicator_values(indicator, state::State, field::AbstractField, name::AbstractString)
-  applicable(indicator, state, field) ||
-    throw(ArgumentError("$name must be callable as $name(state, field)"))
-  return indicator(state, field)
-end
-
-# The generic adaptivity builders accept user-supplied indicator callbacks. The
-# checks here fail early with a descriptive message when a callback has the wrong
-# arity or returns data with the wrong shape.
-function _candidate_indicator_values(indicator, state::State, field::AbstractField, candidates,
-                                     name::AbstractString)
-  applicable(indicator, state, field, candidates) ||
-    throw(ArgumentError("$name must be callable as $name(state, field, candidates)"))
-  return indicator(state, field, candidates)
-end
-
-# State-driven plan builders all share the same "optional indicator" pattern:
-# only evaluate a coarsening indicator when the corresponding threshold is
-# active, so optional features stay dormant without invoking user callbacks.
-function _optional_state_indicator_values(indicator, state::State, field::AbstractField, threshold,
-                                          name::AbstractString)
-  threshold === nothing && return nothing
-  return _indicator_values(indicator, state, field, name)
-end
-
-# Optional `h`-coarsening additionally needs candidate generation. This helper
-# keeps the resolution of default candidates and their indicators consistent
-# between pure `h` and mixed `hp` planning.
-function _state_h_coarsening_data(state::State, field::AbstractField, candidates, indicator,
-                                  threshold, limits)
-  threshold === nothing && return nothing, nothing
-  space = field_space(field)
-  resolved_candidates = isnothing(candidates) ?
-                        _default_h_coarsening_candidates(space; limits=limits) : candidates
-  resolved_indicators = _candidate_indicator_values(indicator, state, field, resolved_candidates,
-                                                    "h_coarsening_indicator")
-  return resolved_candidates, resolved_indicators
-end
-
-# Marking and candidate-selection helpers shared by `h`, `p`, and `hp` planning.
-
-function _checked_axis_indicator_values(space::HpSpace{D}, indicators,
-                                        name::AbstractString) where {D}
-  length(indicators) == active_leaf_count(space) ||
-    throw(ArgumentError("$name count must match the active-leaf count"))
-
-  for axes in indicators
-    axes isa NTuple{D,<:Real} || throw(ArgumentError("$name must be NTuple{$D,<:Real} values"))
-
-    for axis in 1:D
-      isfinite(float(axes[axis])) || throw(ArgumentError("$name must be finite"))
-    end
-  end
-
-  return indicators
-end
-
-# Threshold handling is centralized so all plan builders share the same
-# admissibility and error semantics for optional coarsening thresholds.
+# Threshold handling is centralized so the compact planner and any diagnostic
+# entry points share the same admissibility and error semantics.
 function _checked_nonnegative_threshold(value::Real, name::AbstractString)
   checked = float(value)
   isfinite(checked) || throw(ArgumentError("$name must be finite"))
   checked >= 0 || throw(ArgumentError("$name must be non-negative"))
   return checked
-end
-
-function _checked_optional_threshold(value, name::AbstractString)
-  value === nothing && return nothing
-  return _checked_nonnegative_threshold(value, name)
-end
-
-# Dörfler bulk marking selects the smallest set of leaf-axis pairs whose
-# squared-indicator contributions account for a fraction `θ` of the total
-# indicator mass. Sorting by decreasing contribution implements the standard
-# greedy realization of this criterion.
-function _marked_axes(space::HpSpace{D}, indicators; threshold::Real=0.5,
-                      admissible=(leaf, axis) -> true) where {D}
-  theta = float(threshold)
-  0 <= theta <= 1 || throw(ArgumentError("threshold must lie in [0, 1]"))
-  checked = _checked_axis_indicator_values(space, indicators, "indicators")
-  marked = fill(ntuple(_ -> false, D), active_leaf_count(space))
-  contributions = Tuple{typeof(theta),Int,Int}[]
-  total_indicator = zero(typeof(theta))
-
-  for (leaf_index, axes) in enumerate(checked)
-    leaf = active_leaf(space, leaf_index)
-
-    for axis in 1:D
-      admissible(leaf, axis) || continue
-      contribution = abs2(float(axes[axis]))
-      contribution == 0 && continue
-      total_indicator += contribution
-      push!(contributions, (contribution, leaf_index, axis))
-    end
-  end
-
-  total_indicator == 0 && return marked
-  theta == 0 && return marked
-  sort!(contributions; by=entry -> (-entry[1], entry[2], entry[3]))
-  target = theta * total_indicator
-  accumulated = zero(typeof(theta))
-
-  for (contribution, leaf_index, axis) in contributions
-    current = marked[leaf_index]
-    marked[leaf_index] = ntuple(current_axis -> current_axis == axis ? true : current[current_axis],
-                                D)
-    accumulated += contribution
-    accumulated >= target && break
-  end
-
-  return marked
-end
-
-# Coarsening is threshold based rather than bulk based: every admissible
-# leaf-axis pair with sufficiently small indicator is selected unless another
-# planned modification already blocks that axis or leaf.
-function _coarsened_axes(space::HpSpace{D}, indicators; threshold=nothing,
-                         threshold_name::AbstractString="p_coarsening_threshold",
-                         indicator_name::AbstractString="p coarsening indicators",
-                         admissible=(leaf, axis) -> true, blocked=nothing) where {D}
-  value = _checked_optional_threshold(threshold, threshold_name)
-
-  if value === nothing
-    indicators === nothing ||
-      throw(ArgumentError("$threshold_name must be set when $indicator_name are provided"))
-    return fill(ntuple(_ -> false, D), active_leaf_count(space))
-  end
-
-  indicators === nothing &&
-    throw(ArgumentError("$indicator_name must be provided when $threshold_name is set"))
-  checked = _checked_axis_indicator_values(space, indicators, indicator_name)
-  blocked_axes = isnothing(blocked) ? fill(ntuple(_ -> false, D), active_leaf_count(space)) :
-                 blocked
-  marked = fill(ntuple(_ -> false, D), active_leaf_count(space))
-
-  for (leaf_index, axes) in enumerate(checked)
-    leaf = active_leaf(space, leaf_index)
-    current = marked[leaf_index]
-
-    for axis in 1:D
-      blocked_axes[leaf_index][axis] && continue
-      admissible(leaf, axis) || continue
-      float(axes[axis]) <= value || continue
-      current = ntuple(current_axis -> current_axis == axis ? true : current[current_axis], D)
-    end
-
-    marked[leaf_index] = current
-  end
-
-  return marked
 end
 
 function _active_leaf_index(space::HpSpace, leaf::Integer)
@@ -2067,6 +1879,9 @@ function _child_point_in_parent(space::HpSpace{D,T}, parent::Int, child::Int,
                 end, D)
 end
 
+# Evaluate one tensor-product parent basis mode from per-axis basis tables. The
+# helper is used in the inner projection loops to avoid rebuilding tuple logic
+# at each call site.
 function _projection_shape_value(modes::AbstractVector{<:NTuple{D,Int}},
                                  basis_values::NTuple{D,<:AbstractVector},
                                  mode_index::Int) where {D}
@@ -2125,6 +1940,9 @@ function _reference_projection_data(space::HpSpace{D,T}, degrees::NTuple{D,Int},
   return data
 end
 
+# Build the per-candidate projection references while sharing factorizations for
+# repeated target degree tuples. The returned maximum mode count sizes the
+# thread-local scratch buffers used during candidate scoring.
 function _projection_reference_table(space::HpSpace{D,T},
                                      candidates::AbstractVector{HCoarseningCandidate{D}}) where {D,
                                                                                                  T<:AbstractFloat}
@@ -2151,6 +1969,9 @@ function _projection_quadrature_shape(target_degrees::NTuple{D,Int},
                                                               child_degrees[axis])), D)
 end
 
+# Thread-local projection buffers. Columns correspond to field components and
+# rows to parent modes; each candidate uses leading subviews sized by its target
+# basis, so the buffers can be reused without allocation across chunks.
 struct _ProjectionIndicatorScratch{T<:AbstractFloat}
   rhs::Matrix{T}
   coefficients::Matrix{T}
@@ -2159,12 +1980,12 @@ end
 """
     projection_coarsening_indicators(state, field, candidates)
 
-Relative local `L2` projection defects for immediate `h`-coarsening candidates.
+Relative local `L²` projection defects for immediate `h`-coarsening candidates.
 Smaller values indicate that derefining the candidate parent cell is likely to
 be harmless.
 
 The indicator compares the fine representation on the two child leaves with its
-`L2` projection onto the candidate parent space and returns the relative defect
+`L²` projection onto the candidate parent space and returns the relative defect
 
 `‖u_fine - Π_parent u_fine‖ₗ₂ / ‖u_fine‖ₗ₂`.
 
@@ -2269,65 +2090,427 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
   return indicators
 end
 
-# Mixed `hp` adaptation must avoid selecting derefinement on leaves that are
-# already scheduled for any other change. This helper condenses the various
-# change markers into one per-leaf "blocked" flag.
-function _leaf_change_flags(marked_h, refined_p, coarsened_p)
-  return [any(marked_h[index]) || any(refined_p[index]) || any(coarsened_p[index])
-          for index in eachindex(marked_h)]
+# Single-tolerance multiresolution adaptivity.
+
+# Cellwise L² energies provide the physical normalization used by the
+# multiresolution planner. Modal coefficient ratios and projection defects are
+# already relative quantities, but DG jump indicators are trace quantities and
+# must be scaled by the local volume energy before the same tolerance can be
+# used on CG and DG axes.
+function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T<:AbstractFloat}
+  field_dof_range(field_layout(state), field)
+  space = field_space(field)
+  energies = zeros(T, active_leaf_count(space))
+  components = component_count(field)
+
+  for (leaf_index, leaf) in enumerate(active_leaves(space))
+    compiled = space.compiled_leaves[leaf_index]
+    quadrature = TensorQuadrature(T, compiled.quadrature_shape)
+    jacobian = jacobian_determinant_from_biunit_cube(domain(space), leaf)
+    energy = zero(T)
+
+    for point_index in 1:point_count(quadrature)
+      ξ = point(quadrature, point_index)
+      weighted = weight(quadrature, point_index) * jacobian
+      local_value = _field_value_on_leaf(field, state, leaf, ξ)
+
+      if components == 1
+        energy += local_value * local_value * weighted
+      else
+        for component in 1:components
+          value = local_value[component]
+          energy += value * value * weighted
+        end
+      end
+    end
+
+    energies[leaf_index] = energy
+  end
+
+  return energies
 end
 
-# Candidate selection for `h`-derefinement is independent of bulk marking. The
-# candidates have already been structurally validated; the remaining logic only
-# filters by threshold, user limits, and conflicts with other requested changes.
-function _selected_h_coarsening_candidates(space::HpSpace{D}, candidates, indicators;
-                                           threshold=nothing, limits=AdaptivityLimits(space),
-                                           blocked=falses(active_leaf_count(space))) where {D}
-  value = _checked_optional_threshold(threshold, "h_coarsening_threshold")
+# Convert cell energies into robust normalization denominators. The global
+# floor prevents zero-state cells from producing infinite normalized DG jumps
+# while still scaling with the magnitude of the represented field.
+function _cell_l2_denominators(energies::AbstractVector{T}) where {T<:AbstractFloat}
+  global_energy = sum(energies)
+  floor_energy = max(global_energy * eps(T), eps(T)^2)
+  return [sqrt(max(energy, floor_energy)) for energy in energies]
+end
 
-  if value === nothing
-    (candidates === nothing && indicators === nothing) ||
-      throw(ArgumentError("h_coarsening_threshold must be set when h coarsening candidates are provided"))
-    return HCoarseningCandidate{D}[]
+# Normalize face-jump indicators by a cellwise L² scale and by the normal cell
+# size so DG jump detail can share the same threshold as modal cell detail.
+function _normalized_interface_jump_indicators(state::State{T}, field::AbstractField,
+                                               cell_energies::AbstractVector{T}) where {T<:AbstractFloat}
+  space = field_space(field)
+  raw = interface_jump_indicators(state, field)
+  denominators = _cell_l2_denominators(cell_energies)
+  result = Vector{NTuple{dimension(space),T}}(undef, active_leaf_count(space))
+
+  for (leaf_index, leaf) in enumerate(active_leaves(space))
+    result[leaf_index] = ntuple(axis -> raw[leaf_index][axis] *
+                                        cell_size(domain(space), leaf, axis) /
+                                        denominators[leaf_index], dimension(space))
   end
 
-  candidates === nothing &&
-    throw(ArgumentError("h coarsening candidates must be provided when h_coarsening_threshold is set"))
-  indicators === nothing &&
-    throw(ArgumentError("h coarsening indicators must be provided when h_coarsening_threshold is set"))
+  return result
+end
+
+# The refinement signal follows the axis continuity. On CG axes the modal
+# top-layer ratio is the natural local detail. On DG axes the face jump is the
+# more robust h-refinement signal, because a discontinuity may be invisible to a
+# purely cell-local modal indicator.
+function _continuity_refinement_detail(state::State{T}, field::AbstractField,
+                                       p_detail) where {T<:AbstractFloat}
+  space = field_space(field)
+  D = dimension(space)
+  any(axis -> !is_continuous_axis(space, axis), 1:D) || return p_detail
+  jump_detail = _normalized_interface_jump_indicators(state, field,
+                                                      _field_cell_l2_energies(state, field))
+
+  return [ntuple(axis -> is_continuous_axis(space, axis) ? p_detail[leaf_index][axis] :
+                         jump_detail[leaf_index][axis], D)
+          for leaf_index in 1:active_leaf_count(space)]
+end
+
+# The combined detail is the pointwise maximum of the h- and p-refinement
+# details. It is useful for diagnostics and for retaining resolution around
+# significant cells; the actual h/p decision still uses the two detail families
+# separately.
+function _combined_refinement_detail(space::HpSpace{D}, p_detail, h_refinement_detail) where {D}
+  return [ntuple(axis -> max(p_detail[leaf_index][axis], h_refinement_detail[leaf_index][axis]), D)
+          for leaf_index in 1:active_leaf_count(space)]
+end
+
+# Planning needs both the refinement mask data and the candidate-wise
+# h-coarsening defects. Keeping them in one object makes the later selection
+# stages explicit: per-leaf details decide retention/refinement, while
+# candidate details decide whether a parent reconstruction is accurate enough
+# to remove its children.
+struct _MultiresolutionIndicatorData{D,T<:AbstractFloat,C,V}
+  p_detail::Vector{NTuple{D,T}}
+  modal_decay::Vector{NTuple{D,T}}
+  h_refinement_detail::Vector{NTuple{D,T}}
+  refinement_detail::Vector{NTuple{D,T}}
+  h_coarsening_candidates::C
+  h_coarsening_detail::V
+end
+
+# Build only the per-leaf refinement details. This path is used by diagnostics
+# and VTK output as well as by the planner, so it deliberately avoids evaluating
+# projection defects for h-coarsening candidates.
+function _multiresolution_refinement_data(state::State{T},
+                                          field::AbstractField) where {T<:AbstractFloat}
+  space = field_space(field)
+  modal = _modal_axis_detail_data(state, field)
+  p_detail = modal.detail
+  h_refinement_detail = _continuity_refinement_detail(state, field, p_detail)
+  refinement_detail = _combined_refinement_detail(space, p_detail, h_refinement_detail)
+  return (; p_detail, modal_decay=modal.decay, h_refinement_detail, refinement_detail)
+end
+
+# Full planning data extends diagnostic refinement details with the projection
+# defects needed for h-coarsening. This is intentionally separate from
+# `multiresolution_indicators`, because VTK output should not pay for candidate
+# projection solves.
+function _multiresolution_indicator_data(state::State{T}, field::AbstractField,
+                                         limits::AdaptivityLimits) where {T<:AbstractFloat}
+  space = field_space(field)
+  refinement = _multiresolution_refinement_data(state, field)
+  candidates = h_coarsening_candidates(space; limits=limits)
+  h_coarsening_detail = projection_coarsening_indicators(state, field, candidates)
+  return _MultiresolutionIndicatorData(refinement.p_detail, refinement.modal_decay,
+                                       refinement.h_refinement_detail, refinement.refinement_detail,
+                                       candidates, h_coarsening_detail)
+end
+
+"""
+    multiresolution_indicators(state, field; limits=AdaptivityLimits(field_space(field)))
+
+Return the normalized per-leaf, per-axis detail indicators used by
+[`adaptivity_plan`](@ref).
+
+The returned field is the union of the normalized h- and p-refinement details.
+The p detail is the relative modal energy in the highest polynomial layer. The
+h detail follows the continuity of each axis: CG axes use the same modal detail,
+while DG axes use normalized interface jumps. Immediate `h`-coarsening
+candidates are still checked by local `L²` projection defects inside
+[`adaptivity_plan`](@ref), but those removal defects are not part of this
+refinement diagnostic.
+"""
+function multiresolution_indicators(state::State, field::AbstractField;
+                                    limits=AdaptivityLimits(field_space(field)))
+  space = field_space(field)
+  _checked_limits(limits, space)
+  return _multiresolution_refinement_data(state, field).refinement_detail
+end
+
+# The h/p choice is fallback-based: try the preferred operation first, then the
+# other admissible operation before leaving a marked axis unchanged.
+function _axis_refinement_choice(space::HpSpace, leaf::Int, axis::Int, prefer_p::Bool,
+                                 limits::AdaptivityLimits)
+  if prefer_p
+    _can_p_refine(space, leaf, axis, limits) && return 1
+    _can_h_refine(space, leaf, axis, limits) && return -1
+  else
+    _can_h_refine(space, leaf, axis, limits) && return -1
+    _can_p_refine(space, leaf, axis, limits) && return 1
+  end
+
+  return 0
+end
+
+# At degree one, top-to-previous modal decay is not a stable regularity
+# classifier: a pure linear mode with zero mean would look rough although it is
+# smooth. The hp split therefore uses decay only once at least two non-constant
+# modal layers are available on that axis.
+function _prefer_modal_p_refinement(space::HpSpace, leaf::Int, axis::Int, modal_decay,
+                                    smoothness_threshold)
+  cell_degrees(space, leaf)[axis] <= 1 && return true
+  return modal_decay <= smoothness_threshold
+end
+
+# The tolerance marks axes that still carry detail. Modal decay then classifies
+# marked modal axes: fast decay prefers p-enrichment, while stalled decay
+# prefers h-refinement. DG jumps above tolerance override that classifier and
+# remain h-first because discontinuities are primarily geometric
+# under-resolution rather than missing polynomial order.
+function _multiresolution_refinement_axes(space::HpSpace{D}, data::_MultiresolutionIndicatorData,
+                                          tolerance, smoothness_threshold,
+                                          limits::AdaptivityLimits{D}) where {D}
+  h_refined = _empty_axis_flags(space)
+  p_refined = _empty_axis_flags(space)
+
+  for (leaf_index, leaf) in enumerate(active_leaves(space))
+    h_current = h_refined[leaf_index]
+    p_current = p_refined[leaf_index]
+
+    for axis in 1:D
+      h_value = data.h_refinement_detail[leaf_index][axis]
+      p_value = data.p_detail[leaf_index][axis]
+      h_significant = h_value > tolerance
+      p_significant = p_value > tolerance
+      h_significant || p_significant || continue
+      choice = if !is_continuous_axis(space, axis) && h_significant
+        _axis_refinement_choice(space, leaf, axis, false, limits)
+      elseif p_significant
+        prefer_p = _prefer_modal_p_refinement(space, leaf, axis, data.modal_decay[leaf_index][axis],
+                                              smoothness_threshold)
+        _axis_refinement_choice(space, leaf, axis, prefer_p, limits)
+      else
+        _axis_refinement_choice(space, leaf, axis, false, limits)
+      end
+
+      choice < 0 &&
+        (h_current = ntuple(current_axis -> current_axis == axis ? true : h_current[current_axis],
+                            D))
+      choice > 0 &&
+        (p_current = ntuple(current_axis -> current_axis == axis ? true : p_current[current_axis],
+                            D))
+    end
+
+    h_refined[leaf_index] = h_current
+    p_refined[leaf_index] = p_current
+  end
+
+  return h_refined, p_refined
+end
+
+# Extend h-refinement requests by one face-neighbor ring in the same marked axes.
+# This fixed buffer keeps moving transient features from immediately outrunning
+# the adapted mesh and reduces isolated refinement/coarsening oscillations.
+function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
+                                          limits::AdaptivityLimits{D}) where {D}
+  expanded = copy(h_refined)
+  grid_data = grid(space)
+
+  for (leaf_index, axes) in enumerate(h_refined)
+    any(axes) || continue
+    leaf = active_leaf(space, leaf_index)
+    leaf_levels = level(grid_data, leaf)
+
+    for face_axis in 1:D
+      for side in (LOWER, UPPER)
+        for neighbor_leaf in opposite_active_leaves(grid_data, leaf, face_axis, side)
+          neighbor_index = _active_leaf_index(space, neighbor_leaf)
+          neighbor_levels = level(grid_data, neighbor_leaf)
+          current = expanded[neighbor_index]
+
+          for axis in 1:D
+            axes[axis] || continue
+            neighbor_levels[axis] <= leaf_levels[axis] || continue
+            _can_h_refine(space, neighbor_leaf, axis, limits) || continue
+            current = ntuple(current_axis -> current_axis == axis ? true : current[current_axis], D)
+          end
+
+          expanded[neighbor_index] = current
+        end
+      end
+    end
+  end
+
+  return expanded
+end
+
+# Significant leaves are retained even if they are not themselves modified by the
+# fallback h/p decision, because they still contain resolved detail above the
+# global tolerance.
+function _significant_multiresolution_leaves(space::HpSpace, data::_MultiresolutionIndicatorData,
+                                             tolerance)
+  significant = falses(active_leaf_count(space))
+
+  for leaf_index in 1:active_leaf_count(space)
+    significant[leaf_index] = any(axis -> data.refinement_detail[leaf_index][axis] > tolerance,
+                                  1:dimension(space))
+  end
+
+  return significant
+end
+
+# Coarsening is blocked on changed/significant leaves and on their one-ring face
+# neighbors. The neighbor retention mirrors the h-refinement buffer and prevents
+# deleting support immediately next to currently resolved detail.
+function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
+                                        significant) where {D}
+  length(significant) == active_leaf_count(space) ||
+    throw(ArgumentError("significant leaf flags must match the active-leaf count"))
+  blocked = [any(h_refined[index]) || any(p_refined[index]) || significant[index]
+             for index in eachindex(h_refined)]
+  grid_data = grid(space)
+
+  for (leaf_index, is_blocked) in enumerate(copy(blocked))
+    is_blocked || continue
+    leaf = active_leaf(space, leaf_index)
+
+    for axis in 1:D
+      for side in (LOWER, UPPER)
+        for neighbor_leaf in opposite_active_leaves(grid_data, leaf, axis, side)
+          blocked[_active_leaf_index(space, neighbor_leaf)] = true
+        end
+      end
+    end
+  end
+
+  return blocked
+end
+
+# Select immediate h-coarsening moves whose projection defect is below the same
+# tolerance used for refinement, excluding all candidates touching blocked
+# children. The returned leaf flags prevent p-coarsening on children that are
+# about to disappear.
+function _multiresolution_h_coarsening_candidates(space::HpSpace{D}, candidates, indicators,
+                                                  tolerance, blocked) where {D}
   length(blocked) == active_leaf_count(space) ||
     throw(ArgumentError("blocked leaf flags must match the active-leaf count"))
-  checked_limits = _checked_limits(limits, space)
-  checked_candidates = _checked_h_coarsening_candidates(space, candidates)
-  length(indicators) == length(checked_candidates) ||
-    throw(ArgumentError("h coarsening indicator count must match the candidate count"))
   selected = HCoarseningCandidate{D}[]
+  h_coarsened = falses(active_leaf_count(space))
 
-  for index in eachindex(checked_candidates)
-    candidate = checked_candidates[index]
-    level(grid(space), candidate.cell, candidate.axis) >=
-    checked_limits.min_h_level[candidate.axis] ||
-      throw(ArgumentError("candidate cell $(candidate.cell) violates min_h_level[$(candidate.axis)]"))
-    indicator_value = float(indicators[index])
-    isfinite(indicator_value) || throw(ArgumentError("h coarsening indicators must be finite"))
-    indicator_value <= value || continue
+  for candidate_index in eachindex(candidates)
+    candidate = candidates[candidate_index]
+    value = float(indicators[candidate_index])
+    isfinite(value) || throw(ArgumentError("h coarsening indicators must be finite"))
+    value <= tolerance || continue
     any(blocked[_active_leaf_index(space, child)] for child in candidate.children) && continue
     push!(selected, candidate)
+
+    for child in candidate.children
+      h_coarsened[_active_leaf_index(space, child)] = true
+    end
   end
 
-  return selected
+  return selected, h_coarsened
+end
+
+# On leaves not protected by refinement, significance, or h-coarsening, remove
+# one polynomial layer on axes whose modal top-layer detail is below tolerance.
+function _multiresolution_p_coarsening_axes(space::HpSpace{D}, data::_MultiresolutionIndicatorData,
+                                            tolerance, limits::AdaptivityLimits{D},
+                                            blocked) where {D}
+  p_coarsened = _empty_axis_flags(space)
+
+  for (leaf_index, leaf) in enumerate(active_leaves(space))
+    blocked[leaf_index] && continue
+    current = p_coarsened[leaf_index]
+
+    for axis in 1:D
+      data.p_detail[leaf_index][axis] <= tolerance || continue
+      _can_p_derefine(space, leaf, axis, limits) || continue
+      current = ntuple(current_axis -> current_axis == axis ? true : current[current_axis], D)
+    end
+
+    p_coarsened[leaf_index] = current
+  end
+
+  return p_coarsened
+end
+
+"""
+    adaptivity_plan(state, field; tolerance=1.0e-3,
+                    smoothness_threshold=0.5,
+                    limits=AdaptivityLimits(field_space(field)))
+
+Build an `h`, `p`, or mixed `hp` adaptivity plan from one multiresolution
+tolerance and compact h/p policy.
+
+The planner treats adaptivity as coefficient thresholding rather than bulk
+marking. It forms normalized FE details with fixed roles: modal top-layer energy
+marks resolved detail, modal top-to-previous decay chooses the h/p split for
+modal refinement, normalized DG interface jumps override this with h-first
+refinement on discontinuous axes, and local `L²` projection defects decide
+whether an immediate h-coarsening candidate may be removed. Details above
+`tolerance` are retained by refining in `h` or `p`, depending on axis
+continuity, modal decay, and admissible limits. Details below `tolerance` may be
+removed by derefining in `h` or `p`. The same tolerance is therefore used for
+refinement and coarsening.
+
+`smoothness_threshold` is the optional advanced control for the h/p classifier.
+On marked modal axes, decay values at or below this threshold are considered
+smooth and prefer p-refinement; larger values prefer h-refinement. The default
+keeps this regularity heuristic internal for typical use while still allowing
+expert adjustment. Degree-one axes do not contain enough modal history for a
+stable decay estimate, so they prefer p-refinement unless the active limits force
+h-refinement.
+
+The public policy controls remain compact: `tolerance`, `smoothness_threshold`,
+and admissible `h`/`p` limits. Pure `h` adaptation is obtained by fixing
+`min_p == max_p`; pure `p` adaptation is obtained by fixing
+`min_h_level == max_h_level`. The planner also applies a fixed one-ring
+retention zone around significant details, following the second-generation
+wavelet idea that significant details should keep enough nearby resolution for
+transient motion.
+"""
+function adaptivity_plan(state::State, field::AbstractField; tolerance::Real=1.0e-3,
+                         smoothness_threshold::Real=0.5,
+                         limits=AdaptivityLimits(field_space(field)))
+  space = field_space(field)
+  checked_limits = _checked_limits(limits, space)
+  checked_tolerance = _checked_nonnegative_threshold(tolerance, "tolerance")
+  checked_smoothness = _checked_nonnegative_threshold(smoothness_threshold, "smoothness_threshold")
+  data = _multiresolution_indicator_data(state, field, checked_limits)
+  h_refined, p_refined = _multiresolution_refinement_axes(space, data, checked_tolerance,
+                                                          checked_smoothness, checked_limits)
+  h_refined = _expanded_multiresolution_h_zone(space, h_refined, checked_limits)
+  significant = _significant_multiresolution_leaves(space, data, checked_tolerance)
+  blocked = _multiresolution_h_block_flags(space, h_refined, p_refined, significant)
+  selected_h, h_coarsened = _multiresolution_h_coarsening_candidates(space,
+                                                                     data.h_coarsening_candidates,
+                                                                     data.h_coarsening_detail,
+                                                                     checked_tolerance, blocked)
+  p_blocked = [blocked[index] || h_coarsened[index] for index in eachindex(blocked)]
+  p_coarsened = _multiresolution_p_coarsening_axes(space, data, checked_tolerance, checked_limits,
+                                                   p_blocked)
+  return _adaptivity_plan_from_selections(space, h_refined, p_refined, p_coarsened, selected_h;
+                                          limits=checked_limits)
 end
 
 function _empty_axis_flags(space::HpSpace{D}) where {D}
   return fill(ntuple(_ -> false, D), active_leaf_count(space))
 end
 
-_empty_h_coarsening_candidates(::HpSpace{D}) where {D} = HCoarseningCandidate{D}[]
-
-# Plan construction is factored out so the state-driven builders can refine
-# their tentative move sets before committing to one target space. This helper
-# keeps the public space-driven overloads as the raw "selection -> plan" path,
-# while the state-driven overloads may insert an extra stabilization pass.
+# Convert selected h/p edits into one batched target-space plan. The helper is
+# shared by the compact automatic planner and by tests that need to inspect the
+# same plan construction path without duplicating degree-change bookkeeping.
 function _adaptivity_plan_from_selections(space::HpSpace{D}, h_refinement_axes, p_refinement_axes,
                                           p_coarsening_axes, h_coarsening_candidates;
                                           limits::AdaptivityLimits{D}=AdaptivityLimits(space)) where {D}
@@ -2344,477 +2527,11 @@ function _adaptivity_plan_from_selections(space::HpSpace{D}, h_refinement_axes, 
                                                   (coarsened[axis] ? 1 : 0), D)
   end
 
-  return _batched_h_adaptivity_plan(space, p_degree_changes, h_refinement_axes,
-                                    h_coarsening_candidates; limits=limits)
+  return _batched_adaptivity_plan(space, p_degree_changes, h_refinement_axes,
+                                  h_coarsening_candidates; limits=limits)
 end
 
-function _h_adaptivity_selection(space::HpSpace, indicators, h_coarsening_candidates,
-                                 h_coarsening_indicators, limits::AdaptivityLimits;
-                                 threshold::Real=0.5, h_coarsening_threshold=nothing)
-  marked = _marked_axes(space, indicators; threshold=threshold,
-                        admissible=(leaf, axis) -> _can_h_refine(space, leaf, axis, limits))
-  blocked = [any(marked[index]) for index in eachindex(marked)]
-  selected = _selected_h_coarsening_candidates(space, h_coarsening_candidates,
-                                               h_coarsening_indicators;
-                                               threshold=h_coarsening_threshold, limits=limits,
-                                               blocked=blocked)
-  return marked, selected
-end
-
-function _p_adaptivity_selection(space::HpSpace, indicators, p_coarsening_indicators,
-                                 limits::AdaptivityLimits; threshold::Real=0.5,
-                                 p_coarsening_threshold=nothing)
-  refined = _marked_axes(space, indicators; threshold=threshold,
-                         admissible=(leaf, axis) -> _can_p_refine(space, leaf, axis, limits))
-  coarsened = _coarsened_axes(space, p_coarsening_indicators; threshold=p_coarsening_threshold,
-                              admissible=(leaf, axis) -> _can_p_derefine(space, leaf, axis, limits),
-                              blocked=refined)
-  return refined, coarsened
-end
-
-# Mixed `hp` planning first decides which marked axes want `h` and which want
-# `p` refinement. The final `p` degree changes are assembled later, once
-# tentative `p` coarsening has been stabilized against the same refinement
-# signal.
-function _hp_leaf_refinements(space::HpSpace{D}, leaf::Int, marked_axes, smoothness_axes,
-                              smoothness_threshold::Real, limits::AdaptivityLimits{D}) where {D}
-  choices = ntuple(axis -> marked_axes[axis] ?
-                           _hp_axis_refinement(space, leaf, axis,
-                                               float(smoothness_axes[axis]) <= smoothness_threshold,
-                                               limits) : 0, D)
-  h_axes = ntuple(axis -> choices[axis] < 0, D)
-  p_axes = ntuple(axis -> choices[axis] > 0, D)
-  return h_axes, p_axes
-end
-
-function _hp_adaptivity_selection(space::HpSpace{D}, indicators, smoothness,
-                                  p_coarsening_indicators, h_coarsening_candidates,
-                                  h_coarsening_indicators, limits::AdaptivityLimits{D};
-                                  threshold::Real=0.5, smoothness_threshold::Real=0.5,
-                                  p_coarsening_threshold=nothing,
-                                  h_coarsening_threshold=nothing) where {D}
-  marked = _marked_axes(space, indicators; threshold=threshold,
-                        admissible=(leaf, axis) -> _can_h_refine(space, leaf, axis, limits) ||
-                                                   _can_p_refine(space, leaf, axis, limits))
-  checked_smoothness = _checked_axis_indicator_values(space, smoothness, "smoothness indicators")
-  checked_smoothness_threshold = _checked_nonnegative_threshold(smoothness_threshold,
-                                                                "smoothness_threshold")
-  coarsened = _coarsened_axes(space, p_coarsening_indicators; threshold=p_coarsening_threshold,
-                              admissible=(leaf, axis) -> _can_p_derefine(space, leaf, axis, limits),
-                              blocked=marked)
-  planned_h = fill(ntuple(_ -> false, dimension(space)), active_leaf_count(space))
-  refined_p = fill(ntuple(_ -> false, dimension(space)), active_leaf_count(space))
-
-  for leaf_index in eachindex(space.active_leaves)
-    leaf = space.active_leaves[leaf_index]
-    planned_h[leaf_index], refined_p[leaf_index] = _hp_leaf_refinements(space, leaf,
-                                                                        marked[leaf_index],
-                                                                        checked_smoothness[leaf_index],
-                                                                        checked_smoothness_threshold,
-                                                                        limits)
-  end
-
-  blocked = _leaf_change_flags(planned_h, refined_p, coarsened)
-  selected = _selected_h_coarsening_candidates(space, h_coarsening_candidates,
-                                               h_coarsening_indicators;
-                                               threshold=h_coarsening_threshold, limits=limits,
-                                               blocked=blocked)
-  return planned_h, refined_p, coarsened, selected
-end
-
-# Stabilization evaluates the refinement indicator on a tentative target space.
-# Because user indicators receive the full `State`, the transfer must preserve
-# every field in the original layout, including companion fields on distinct but
-# topology-compatible spaces. The main field follows the tentative plan, while
-# all other spaces inherit the same target topology through derived plans.
-function _indicator_transfer_plans(tentative::AdaptivityPlan, layout::FieldLayout)
-  source = source_space(tentative)
-  plans = AdaptivityPlan[]
-  seen_spaces = IdDict{Any,Bool}()
-  found_source = false
-
-  for current in fields(layout)
-    current_space = field_space(current)
-    haskey(seen_spaces, current_space) && continue
-    seen_spaces[current_space] = true
-
-    if current_space === source
-      push!(plans, tentative)
-      found_source = true
-    else
-      push!(plans, derived_adaptivity_plan(tentative, current_space))
-    end
-  end
-
-  found_source ||
-    throw(ArgumentError("field layout does not contain the tentative plan source space"))
-  return Tuple(plans)
-end
-
-# Transfer the complete indicator layout for one stabilization attempt and return
-# the adapted field that corresponds to the originally requested field position.
-function _transferred_indicator_state(tentative::AdaptivityPlan, state::State, field::AbstractField)
-  layout = field_layout(state)
-  requested_index = _field_slot_index(layout, field)
-  layout_field = fields(layout)[requested_index]
-  field_space(layout_field) === source_space(tentative) ||
-    throw(ArgumentError("field $(field_name(field)) is not present on the tentative plan source space"))
-  new_fields, new_state = transfer_state(_indicator_transfer_plans(tentative, layout), state)
-  return transition(tentative), new_state, new_fields[requested_index]
-end
-
-function _transition_target_leaf_lookup(transition::SpaceTransition)
-  lookup = Dict{Tuple,Vector{Int}}()
-
-  for leaf in active_leaves(target_space(transition))
-    signature = Tuple(source_leaves(transition, leaf))
-    push!(get!(lookup, signature, Int[]), leaf)
-  end
-
-  return lookup
-end
-
-function _checked_target_leaf_for_signature(lookup::Dict{Tuple,Vector{Int}}, signature::Tuple,
-                                            context::AbstractString)
-  haskey(lookup, signature) || throw(ArgumentError("$context has no corresponding target leaf"))
-  leaves = lookup[signature]
-  length(leaves) == 1 || throw(ArgumentError("$context must correspond to exactly one target leaf"))
-  return leaves[1]
-end
-
-function _refinement_stabilization_admissible(::Val{:h}, space::HpSpace, leaf::Int, axis::Int,
-                                              limits::AdaptivityLimits)
-  return _can_h_refine(space, leaf, axis, limits)
-end
-
-function _refinement_stabilization_admissible(::Val{:p}, space::HpSpace, leaf::Int, axis::Int,
-                                              limits::AdaptivityLimits)
-  return _can_p_refine(space, leaf, axis, limits)
-end
-
-function _refinement_stabilization_admissible(::Val{:hp}, space::HpSpace, leaf::Int, axis::Int,
-                                              limits::AdaptivityLimits)
-  return _can_h_refine(space, leaf, axis, limits) || _can_p_refine(space, leaf, axis, limits)
-end
-
-function _has_selected_coarsening(p_coarsening_axes, h_coarsening_candidates)
-  return any(axes -> any(axes), p_coarsening_axes) || !isempty(h_coarsening_candidates)
-end
-
-function _reject_retriggered_p_coarsening(space::HpSpace{D}, p_coarsening_axes,
-                                          target_space::HpSpace{D}, target_marked,
-                                          lookup::Dict{Tuple,Vector{Int}}) where {D}
-  filtered = Vector{NTuple{D,Bool}}(undef, length(p_coarsening_axes))
-  changed = false
-
-  for leaf_index in eachindex(p_coarsening_axes)
-    axes = p_coarsening_axes[leaf_index]
-    if any(axes)
-      source_leaf = active_leaf(space, leaf_index)
-      target_leaf = _checked_target_leaf_for_signature(lookup, (source_leaf,),
-                                                       "source leaf $source_leaf")
-      marked_axes = target_marked[_active_leaf_index(target_space, target_leaf)]
-      filtered_axes = ntuple(axis -> axes[axis] && !marked_axes[axis], D)
-      changed |= filtered_axes != axes
-      filtered[leaf_index] = filtered_axes
-    else
-      filtered[leaf_index] = axes
-    end
-  end
-
-  return filtered, changed
-end
-
-function _reject_retriggered_h_coarsening(candidates::AbstractVector{HCoarseningCandidate{D}},
-                                          target_space::HpSpace{D}, target_marked,
-                                          lookup::Dict{Tuple,Vector{Int}}) where {D}
-  filtered = HCoarseningCandidate{D}[]
-  changed = false
-
-  for candidate in candidates
-    target_leaf = _checked_target_leaf_for_signature(lookup, Tuple(candidate.children),
-                                                     "h coarsening candidate $(candidate.cell)")
-    marked_axes = target_marked[_active_leaf_index(target_space, target_leaf)]
-
-    if marked_axes[candidate.axis]
-      changed = true
-    else
-      push!(filtered, candidate)
-    end
-  end
-
-  return filtered, changed
-end
-
-# State-driven coarsening first uses the inexpensive normalized coarsening
-# indicators to preselect admissible candidates. Those tentative derefinements
-# are then stabilized against the actual refinement signal on the transferred
-# target state so that a selected coarsening is not immediately re-marked by the
-# same planner logic on the next step.
-function _stabilize_state_coarsening(::Val{mode}, state::State, field::AbstractField, indicator,
-                                     threshold::Real, h_refinement_axes, p_refinement_axes,
-                                     p_coarsening_axes, h_coarsening_candidates,
-                                     limits::AdaptivityLimits) where {mode}
-  _has_selected_coarsening(p_coarsening_axes, h_coarsening_candidates) ||
-    return p_coarsening_axes, h_coarsening_candidates
-  source = field_space(field)
-  stabilized_p = p_coarsening_axes
-  stabilized_h = h_coarsening_candidates
-
-  while true
-    tentative = _adaptivity_plan_from_selections(source, h_refinement_axes, p_refinement_axes,
-                                                 stabilized_p, stabilized_h; limits=limits)
-    transition_data, target_state, target_field = _transferred_indicator_state(tentative, state,
-                                                                               field)
-    target_space = field_space(target_field)
-    target_marked = _marked_axes(target_space,
-                                 _indicator_values(indicator, target_state, target_field,
-                                                   "indicator"); threshold=threshold,
-                                 admissible=(leaf, axis) -> _refinement_stabilization_admissible(Val(mode),
-                                                                                                 target_space,
-                                                                                                 leaf,
-                                                                                                 axis,
-                                                                                                 limits))
-    lookup = _transition_target_leaf_lookup(transition_data)
-    next_p, p_changed = _reject_retriggered_p_coarsening(source, stabilized_p, target_space,
-                                                         target_marked, lookup)
-    next_h, h_changed = _reject_retriggered_h_coarsening(stabilized_h, target_space, target_marked,
-                                                         lookup)
-    (p_changed || h_changed) || return next_p, next_h
-    stabilized_p = next_p
-    stabilized_h = next_h
-    _has_selected_coarsening(stabilized_p, stabilized_h) || return stabilized_p, stabilized_h
-  end
-end
-
-# Automatic `h`, `p`, and mixed `hp` plan construction from indicators.
-
-"""
-    h_adaptivity_plan(space, indicators; threshold=0.5,
-                      h_coarsening_candidates=nothing,
-                      h_coarsening_indicators=nothing,
-                      h_coarsening_threshold=nothing,
-                      limits=AdaptivityLimits(space))
-    h_adaptivity_plan(state, field; threshold=0.5, indicator=nothing,
-                      h_coarsening_candidates=nothing,
-                      h_coarsening_indicator=projection_coarsening_indicators,
-                      h_coarsening_threshold=nothing,
-                      limits=AdaptivityLimits(field_space(field)))
-
-Build a pure `h`-adaptivity plan with Dörfler bulk refinement marking and
-optional projection-based `h`-derefinement on admissible parent cells.
-
-The refinement side marks leaf-axis pairs whose indicator contributions account
-for a fraction `threshold` of the total indicator mass. Optional derefinement is
-handled separately via explicit parent-cell candidates and projection-defect
-indicators. When no custom `indicator` is supplied, the state-based overload
-uses modal indicators on CG axes and interface-jump indicators on DG axes, so
-the default refinement signal follows the continuity model of the space rather
-than forcing one indicator family everywhere. In that state-based overload,
-tentative `h`-coarsening moves are additionally stabilized against the resolved
-refinement indicator on the transferred target state, so a selected
-derefinement is not immediately re-marked by the same `h` planner logic.
-"""
-function h_adaptivity_plan(space::HpSpace{D}, indicators; threshold::Real=0.5,
-                           h_coarsening_candidates=nothing, h_coarsening_indicators=nothing,
-                           h_coarsening_threshold=nothing, limits=AdaptivityLimits(space)) where {D}
-  checked_limits = _checked_limits(limits, space)
-  marked, selected = _h_adaptivity_selection(space, indicators, h_coarsening_candidates,
-                                             h_coarsening_indicators, checked_limits;
-                                             threshold=threshold,
-                                             h_coarsening_threshold=h_coarsening_threshold)
-  empty = _empty_axis_flags(space)
-  return _adaptivity_plan_from_selections(space, marked, empty, empty, selected;
-                                          limits=checked_limits)
-end
-
-function h_adaptivity_plan(state::State, field::AbstractField; threshold::Real=0.5,
-                           indicator=nothing, h_coarsening_candidates=nothing,
-                           h_coarsening_indicator=projection_coarsening_indicators,
-                           h_coarsening_threshold=nothing,
-                           limits=AdaptivityLimits(field_space(field)))
-  space = field_space(field)
-  checked_limits = _checked_limits(limits, space)
-  resolved_indicator = isnothing(indicator) ? _default_refinement_indicators : indicator
-  candidates, coarsening = _state_h_coarsening_data(state, field, h_coarsening_candidates,
-                                                    h_coarsening_indicator, h_coarsening_threshold,
-                                                    checked_limits)
-  refinement = _indicator_values(resolved_indicator, state, field, "indicator")
-  marked, selected = _h_adaptivity_selection(space, refinement, candidates, coarsening,
-                                             checked_limits; threshold=threshold,
-                                             h_coarsening_threshold=h_coarsening_threshold)
-  empty = _empty_axis_flags(space)
-  _, stabilized_h = _stabilize_state_coarsening(Val(:h), state, field, resolved_indicator,
-                                                threshold, marked, empty, empty, selected,
-                                                checked_limits)
-  return _adaptivity_plan_from_selections(space, marked, empty, empty, stabilized_h;
-                                          limits=checked_limits)
-end
-
-"""
-    p_adaptivity_plan(space, indicators, p_coarsening_indicators=nothing;
-                      threshold=0.5, p_coarsening_threshold=nothing,
-                      limits=AdaptivityLimits(space))
-    p_adaptivity_plan(state, field; threshold=0.5, indicator=coefficient_indicators,
-                      p_coarsening_indicator=coefficient_coarsening_indicators,
-                      p_coarsening_threshold=nothing,
-                      limits=AdaptivityLimits(field_space(field)))
-
-Build a pure `p`-adaptivity plan with Dörfler bulk refinement marking and
-optional modal `p`-derefinement on axes whose coarsening indicator falls below
-`p_coarsening_threshold`.
-
-Refinement and derefinement are both axiswise. A leaf may therefore be refined
-in one coordinate direction of polynomial degree while being left unchanged in
-another. In the state-based overload, tentative `p`-coarsening moves are
-additionally stabilized against the resolved refinement indicator on the
-transferred target state, so a selected derefinement is not immediately
-re-marked by the same `p` planner logic.
-"""
-function p_adaptivity_plan(space::HpSpace{D}, indicators, p_coarsening_indicators=nothing;
-                           threshold::Real=0.5, p_coarsening_threshold=nothing,
-                           limits=AdaptivityLimits(space)) where {D}
-  checked_limits = _checked_limits(limits, space)
-  refined, coarsened = _p_adaptivity_selection(space, indicators, p_coarsening_indicators,
-                                               checked_limits; threshold=threshold,
-                                               p_coarsening_threshold=p_coarsening_threshold)
-  empty = _empty_axis_flags(space)
-  return _adaptivity_plan_from_selections(space, empty, refined, coarsened,
-                                          _empty_h_coarsening_candidates(space);
-                                          limits=checked_limits)
-end
-
-function p_adaptivity_plan(state::State, field::AbstractField; threshold::Real=0.5,
-                           indicator=coefficient_indicators,
-                           p_coarsening_indicator=coefficient_coarsening_indicators,
-                           p_coarsening_threshold=nothing,
-                           limits=AdaptivityLimits(field_space(field)))
-  space = field_space(field)
-  checked_limits = _checked_limits(limits, space)
-  resolved_indicator = indicator
-  coarsening = _optional_state_indicator_values(p_coarsening_indicator, state, field,
-                                                p_coarsening_threshold, "p_coarsening_indicator")
-  refinement = _indicator_values(resolved_indicator, state, field, "indicator")
-  refined, selected_coarsening = _p_adaptivity_selection(space, refinement, coarsening,
-                                                         checked_limits; threshold=threshold,
-                                                         p_coarsening_threshold=p_coarsening_threshold)
-  empty = _empty_axis_flags(space)
-  stabilized_p, _ = _stabilize_state_coarsening(Val(:p), state, field, resolved_indicator,
-                                                threshold, empty, refined, selected_coarsening,
-                                                _empty_h_coarsening_candidates(space),
-                                                checked_limits)
-  return _adaptivity_plan_from_selections(space, empty, refined, stabilized_p,
-                                          _empty_h_coarsening_candidates(space);
-                                          limits=checked_limits)
-end
-
-# Mixed `hp` planning decides one marked axis at a time. Smooth axes prefer
-# `p` enrichment, rough axes prefer `h` refinement, and active limits trigger a
-# fallback to the other option before leaving the axis unchanged.
-function _hp_axis_refinement(space::HpSpace, leaf::Int, axis::Int, prefer_p::Bool,
-                             limits::AdaptivityLimits)
-  if prefer_p
-    _can_p_refine(space, leaf, axis, limits) && return 1
-    _can_h_refine(space, leaf, axis, limits) && return -1
-    return 0
-  end
-
-  _can_h_refine(space, leaf, axis, limits) && return -1
-  _can_p_refine(space, leaf, axis, limits) && return 1
-  return 0
-end
-
-"""
-    hp_adaptivity_plan(space, indicators, smoothness, p_coarsening_indicators=nothing;
-                       threshold=0.5, smoothness_threshold=0.5,
-                       p_coarsening_threshold=nothing,
-                       h_coarsening_candidates=nothing,
-                       h_coarsening_indicators=nothing,
-                       h_coarsening_threshold=nothing,
-                       limits=AdaptivityLimits(space))
-    hp_adaptivity_plan(state, field; threshold=0.5, indicator=nothing,
-                       smoothness_indicator=nothing,
-                       smoothness_threshold=0.5,
-                       p_coarsening_indicator=coefficient_coarsening_indicators,
-                       p_coarsening_threshold=nothing,
-                       h_coarsening_candidates=nothing,
-                       h_coarsening_indicator=projection_coarsening_indicators,
-                       h_coarsening_threshold=nothing,
-                       limits=AdaptivityLimits(field_space(field)))
-
-Build a mixed `hp`-adaptivity plan. Dörfler marking selects candidate axes, the
-smoothness indicator chooses between `p`- and `h`-adaptation, and the optional
-coarsening indicators enable modal `p`-derefinement on unmarked leaves and
-projection-based `h`-derefinement on unchanged parent cells.
-
-The decision logic is local and fallback-based: when the preferred adaptation
-type violates the active limits on an axis, the other type is attempted before
-the axis is left unchanged. When no custom refinement indicator is supplied,
-the state-based overload uses modal indicators on CG axes and interface-jump
-indicators on DG axes. Its default smoothness indicator remains modal but
-treats DG `p = 0` axes as rough so mixed `hp` planning prefers `h` there. As
-for the pure `h` and `p` builders, the state-based overload stabilizes
-tentative coarsening moves against the resolved refinement indicator on the
-transferred target state before finalizing the mixed plan.
-"""
-function hp_adaptivity_plan(space::HpSpace{D}, indicators, smoothness,
-                            p_coarsening_indicators=nothing; threshold::Real=0.5,
-                            smoothness_threshold::Real=0.5, p_coarsening_threshold=nothing,
-                            h_coarsening_candidates=nothing, h_coarsening_indicators=nothing,
-                            h_coarsening_threshold=nothing,
-                            limits=AdaptivityLimits(space)) where {D}
-  checked_limits = _checked_limits(limits, space)
-  planned_h, refined_p, coarsened_p, selected_h = _hp_adaptivity_selection(space, indicators,
-                                                                           smoothness,
-                                                                           p_coarsening_indicators,
-                                                                           h_coarsening_candidates,
-                                                                           h_coarsening_indicators,
-                                                                           checked_limits;
-                                                                           threshold=threshold,
-                                                                           smoothness_threshold=smoothness_threshold,
-                                                                           p_coarsening_threshold=p_coarsening_threshold,
-                                                                           h_coarsening_threshold=h_coarsening_threshold)
-  return _adaptivity_plan_from_selections(space, planned_h, refined_p, coarsened_p, selected_h;
-                                          limits=checked_limits)
-end
-
-function hp_adaptivity_plan(state::State, field::AbstractField; threshold::Real=0.5,
-                            indicator=nothing, smoothness_indicator=nothing,
-                            smoothness_threshold::Real=0.5,
-                            p_coarsening_indicator=coefficient_coarsening_indicators,
-                            p_coarsening_threshold=nothing, h_coarsening_candidates=nothing,
-                            h_coarsening_indicator=projection_coarsening_indicators,
-                            h_coarsening_threshold=nothing,
-                            limits=AdaptivityLimits(field_space(field)))
-  space = field_space(field)
-  checked_limits = _checked_limits(limits, space)
-  resolved_indicator = isnothing(indicator) ? _default_refinement_indicators : indicator
-  resolved_smoothness = isnothing(smoothness_indicator) ? _default_smoothness_indicators :
-                        smoothness_indicator
-  p_coarsening = _optional_state_indicator_values(p_coarsening_indicator, state, field,
-                                                  p_coarsening_threshold, "p_coarsening_indicator")
-  candidates, h_coarsening = _state_h_coarsening_data(state, field, h_coarsening_candidates,
-                                                      h_coarsening_indicator,
-                                                      h_coarsening_threshold, checked_limits)
-  refinement = _indicator_values(resolved_indicator, state, field, "indicator")
-  smoothness = _indicator_values(resolved_smoothness, state, field, "smoothness_indicator")
-  planned_h, refined_p, coarsened_p, selected_h = _hp_adaptivity_selection(space, refinement,
-                                                                           smoothness, p_coarsening,
-                                                                           candidates, h_coarsening,
-                                                                           checked_limits;
-                                                                           threshold=threshold,
-                                                                           smoothness_threshold=smoothness_threshold,
-                                                                           p_coarsening_threshold=p_coarsening_threshold,
-                                                                           h_coarsening_threshold=h_coarsening_threshold)
-  stabilized_p, stabilized_h = _stabilize_state_coarsening(Val(:hp), state, field,
-                                                           resolved_indicator, threshold, planned_h,
-                                                           refined_p, coarsened_p, selected_h,
-                                                           checked_limits)
-  return _adaptivity_plan_from_selections(space, planned_h, refined_p, stabilized_p, stabilized_h;
-                                          limits=checked_limits)
-end
-
-# Source-space reporting helpers and direct leaf evaluation utilities.
+# Source-space reporting helpers.
 
 # One internal change summary per source leaf keeps the public query helpers and
 # summary reporting consistent while avoiding repeated descendant scans.

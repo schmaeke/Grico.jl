@@ -37,22 +37,15 @@ include("../examples/blast_wave_euler.jl")
   @test all(isfinite, du)
   @test any(!iszero, du)
 
-  adapted_context, plan = adapt_blast_wave_context(context; threshold=1.0, max_h_level=3)
+  adapted_context, plan = adapt_blast_wave_context(context; tolerance=0.0, max_h_level=3)
   plan_summary = adaptivity_summary(plan)
   @test plan_summary.h_refinement_leaf_count > 0
   @test active_leaf_count(adapted_context.space) > active_leaf_count(context.space)
   @test length(coefficients(adapted_context.state)) > length(coefficients(context.state))
   @test adapted_context.dt > 0.0
-
-  relative_context, relative_plan = adapt_blast_wave_context(context; strategy=:relative_max,
-                                                             relative_refinement_fraction=1.0,
-                                                             relative_coarsening_fraction=0.0,
-                                                             max_h_level=3)
-  relative_summary = adaptivity_summary(relative_plan)
-  @test relative_summary.h_refinement_leaf_count > 0
-  @test active_leaf_count(relative_context.space) > active_leaf_count(context.space)
-  @test length(coefficients(relative_context.state)) > length(coefficients(context.state))
-  @test relative_context.dt > 0.0
+  adaptivity_entry = blast_wave_adaptivity_entry(1, 0.0, context, adapted_context, plan)
+  @test adaptivity_entry.after_active_leaves > adaptivity_entry.before_active_leaves
+  @test adaptivity_entry.h_refinement_leaf_count == plan_summary.h_refinement_leaf_count
 
   entry = blast_wave_history_entry(0, 0.0, context, context.diagnostics)
   mktempdir() do directory
@@ -63,22 +56,14 @@ include("../examples/blast_wave_euler.jl")
   if ORDINARYDIFFEQ_AVAILABLE
     result = run_blast_wave_euler_example(; root_counts=(2, 2), degree=1, quadrature_extra_points=1,
                                           cfl=0.08, final_time=0.01, save_interval=0.01,
-                                          initial_refinement_layers=2, adapt_interval=0.01,
+                                          initial_refinement_layers=2, adapt_interval=0.005,
                                           write_vtk=false, print_summary=false,
-                                          adaptivity_threshold=1.0, max_h_level=3)
+                                          adaptivity_tolerance=0.0, max_h_level=3)
     @test !isempty(result.history)
+    @test !isempty(result.adaptivity_history)
+    @test result.adaptivity_history[1].after_active_leaves >
+          result.adaptivity_history[1].before_active_leaves
     @test result.segment_solutions === nothing
     @test last(result.history).time ≈ 0.01 atol = 1.0e-12
-
-    relative_result = run_blast_wave_euler_example(; root_counts=(2, 2), degree=1,
-                                                   quadrature_extra_points=1, cfl=0.08,
-                                                   final_time=0.01, save_interval=0.01,
-                                                   initial_refinement_layers=2, adapt_interval=0.01,
-                                                   write_vtk=false, print_summary=false,
-                                                   adaptivity_strategy=:relative_max,
-                                                   relative_refinement_fraction=1.0,
-                                                   relative_coarsening_fraction=0.0, max_h_level=3)
-    @test !isempty(relative_result.history)
-    @test last(relative_result.history).time ≈ 0.01 atol = 1.0e-12
   end
 end

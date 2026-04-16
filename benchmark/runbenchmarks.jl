@@ -16,8 +16,9 @@ const INITIAL_DEGREE = 2
 const SMALL_STEP = 2
 const LARGE_STEP = 6
 const STRESS_STEP = 8
-const MARK_THRESHOLD = 0.35
-const SMOOTHNESS_THRESHOLD = 0.45
+const ADAPTIVITY_TOLERANCE = 5.0e-2
+const MAX_DEGREE = 4
+const MAX_H_LEVEL = 5
 const SINGULAR_EXPONENT = 0.5
 const VERIFICATION_EXTRA_POINTS = 2
 const STRESS_ROOT_COUNTS = ntuple(_ -> 8, DIMENSION)
@@ -114,10 +115,10 @@ function workflow_case(step_target::Int)
     state = State(plan, solve(system))
     step == step_target && return (; field=u, problem, plan, system, state)
 
-    adaptivity_plan = hp_adaptivity_plan(state, u; threshold=MARK_THRESHOLD,
-                                         smoothness_threshold=SMOOTHNESS_THRESHOLD)
-    isempty(adaptivity_plan) && return (; field=u, problem, plan, system, state)
-    u = adapted_field(transition(adaptivity_plan), u)
+    limits = AdaptivityLimits(field_space(u); max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
+    next_plan = adaptivity_plan(state, u; tolerance=ADAPTIVITY_TOLERANCE, limits=limits)
+    isempty(next_plan) && return (; field=u, problem, plan, system, state)
+    u = adapted_field(transition(next_plan), u)
   end
 
   error("unreachable")
@@ -131,9 +132,9 @@ end
 
 function transition_case(step_target::Int)
   case = workflow_case(step_target)
-  adaptivity_plan = hp_adaptivity_plan(case.state, case.field; threshold=MARK_THRESHOLD,
-                                       smoothness_threshold=SMOOTHNESS_THRESHOLD)
-  return (; case..., adaptivity_plan)
+  limits = AdaptivityLimits(field_space(case.field); max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
+  next_plan = adaptivity_plan(case.state, case.field; tolerance=ADAPTIVITY_TOLERANCE, limits=limits)
+  return (; case..., adaptivity_plan=next_plan)
 end
 
 function _uniform_refine!(grid::CartesianGrid{D}, refinement_passes::Int) where {D}
@@ -227,6 +228,12 @@ function build_suite()
   segment_large = segment_surface_case((20, 20), 96; point_count=5)
   segment_stress = segment_surface_case(STRESS_SEGMENT_ROOT_COUNTS, STRESS_SEGMENT_COUNT;
                                         point_count=7)
+  small_adaptivity_limits = AdaptivityLimits(field_space(small.field); max_p=MAX_DEGREE,
+                                             max_h_level=MAX_H_LEVEL)
+  large_adaptivity_limits = AdaptivityLimits(field_space(large.field); max_p=MAX_DEGREE,
+                                             max_h_level=MAX_H_LEVEL)
+  stress_adaptivity_limits = AdaptivityLimits(field_space(stress.field); max_p=MAX_DEGREE,
+                                              max_h_level=MAX_H_LEVEL)
 
   suite["workflow"] = BenchmarkGroup()
   suite["workflow"]["small"] = BenchmarkGroup()
@@ -238,10 +245,10 @@ function build_suite()
                                                                           exact_solution;
                                                                           plan=($(small.plan)),
                                                                           extra_points=VERIFICATION_EXTRA_POINTS)
-  suite["workflow"]["small"]["refine"] = @benchmarkable hp_adaptivity_plan($(small.state),
-                                                                           $(small.field);
-                                                                           threshold=MARK_THRESHOLD,
-                                                                           smoothness_threshold=SMOOTHNESS_THRESHOLD)
+  suite["workflow"]["small"]["refine"] = @benchmarkable adaptivity_plan($(small.state),
+                                                                        $(small.field);
+                                                                        tolerance=ADAPTIVITY_TOLERANCE,
+                                                                        limits=($small_adaptivity_limits))
   suite["workflow"]["large"] = BenchmarkGroup()
   suite["workflow"]["large"]["compile"] = @benchmarkable compile($(large.problem))
   suite["workflow"]["large"]["assemble"] = @benchmarkable assemble($(large.plan))
@@ -251,10 +258,10 @@ function build_suite()
                                                                           exact_solution;
                                                                           plan=($(large.plan)),
                                                                           extra_points=VERIFICATION_EXTRA_POINTS)
-  suite["workflow"]["large"]["refine"] = @benchmarkable hp_adaptivity_plan($(large.state),
-                                                                           $(large.field);
-                                                                           threshold=MARK_THRESHOLD,
-                                                                           smoothness_threshold=SMOOTHNESS_THRESHOLD)
+  suite["workflow"]["large"]["refine"] = @benchmarkable adaptivity_plan($(large.state),
+                                                                        $(large.field);
+                                                                        tolerance=ADAPTIVITY_TOLERANCE,
+                                                                        limits=($large_adaptivity_limits))
   suite["workflow"]["stress"] = BenchmarkGroup()
   suite["workflow"]["stress"]["compile"] = @benchmarkable compile($(stress.problem))
   suite["workflow"]["stress"]["assemble"] = @benchmarkable assemble($(stress.plan))
@@ -264,10 +271,10 @@ function build_suite()
                                                                            exact_solution;
                                                                            plan=($(stress.plan)),
                                                                            extra_points=VERIFICATION_EXTRA_POINTS)
-  suite["workflow"]["stress"]["refine"] = @benchmarkable hp_adaptivity_plan($(stress.state),
-                                                                            $(stress.field);
-                                                                            threshold=MARK_THRESHOLD,
-                                                                            smoothness_threshold=SMOOTHNESS_THRESHOLD)
+  suite["workflow"]["stress"]["refine"] = @benchmarkable adaptivity_plan($(stress.state),
+                                                                         $(stress.field);
+                                                                         tolerance=ADAPTIVITY_TOLERANCE,
+                                                                         limits=($stress_adaptivity_limits))
 
   suite["setup"] = BenchmarkGroup()
   suite["setup"]["small"] = BenchmarkGroup()

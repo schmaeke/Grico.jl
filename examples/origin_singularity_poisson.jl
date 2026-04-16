@@ -3,7 +3,7 @@ using Grico
 import Grico: cell_matrix!, cell_rhs!
 
 # This example is meant to be the simplest "read it from top to bottom" tour of
-# adaptive `hp` finite elements in Grico.
+# adaptive finite elements in Grico.
 #
 # We solve a Poisson problem on the unit hypercube,
 #
@@ -21,8 +21,8 @@ import Grico: cell_matrix!, cell_rhs!
 # - but near the origin the singular corner is better resolved by local mesh
 #   refinement.
 #
-# This combination makes the problem a classical benchmark for adaptive `hp`
-# methods.
+# This combination makes the problem a classical benchmark for adaptive
+# h/p finite-element methods.
 #
 # The source term is chosen so that
 #
@@ -54,11 +54,12 @@ const DIMENSION = 2
 const INITIAL_DEGREE = 2
 const ADAPTIVE_STEPS = 20
 
-# Dörfler bulk-marking parameter for refinement and the modal smoothness
-# threshold that decides whether a marked axis should prefer `p`- or
-# `h`-adaptation.
-const MARK_THRESHOLD = 0.9
-const SMOOTHNESS_THRESHOLD = 0.3
+# Single-tolerance adaptivity controls. The planner marks modal detail with one
+# tolerance, uses its internal modal-decay classifier for the h/p split, and
+# respects the explicit degree and h-level limits below.
+const ADAPTIVITY_TOLERANCE = 5.0e-2
+const MAX_DEGREE = 4
+const MAX_H_LEVEL = 5
 
 # With the default 2D configuration, VTK output is produced after every solve.
 # The guard remains dimension-aware so the same file still works if one changes
@@ -196,8 +197,8 @@ function build_origin_singularity_problem(u, context)
 end
 
 function origin_adaptivity_plan(state, u)
-  return hp_adaptivity_plan(state, u; threshold=MARK_THRESHOLD,
-                            smoothness_threshold=SMOOTHNESS_THRESHOLD)
+  limits = AdaptivityLimits(field_space(u); max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
+  return adaptivity_plan(state, u; tolerance=ADAPTIVITY_TOLERANCE, limits=limits)
 end
 
 # Human-facing adaptive driver used both when the example is run directly and
