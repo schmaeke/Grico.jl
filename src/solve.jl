@@ -429,8 +429,32 @@ function _call_linear_solve(linear_solve, matrix_data, rhs_data, initial_solutio
   return linear_solve(matrix_data, rhs_data)
 end
 
+# Initial guesses may use adapted fields with the same semantic ids as the
+# assembled system, so field identity alone is not enough to prove coefficient
+# compatibility. This helper compares the discrete layout invariants that define
+# the meaning and ordering of scalar coefficients.
+function _matching_space_layout(first::HpSpace, second::HpSpace)
+  first === second && return true
+  dimension(first) == dimension(second) || return false
+  eltype(origin(first)) == eltype(origin(second)) || return false
+  origin(first) == origin(second) && extent(first) == extent(second) || return false
+  periodic_axes(first) == periodic_axes(second) || return false
+  active_leaves(first) == active_leaves(second) || return false
+  basis_family(first) == basis_family(second) || return false
+  continuity_policy(first) == continuity_policy(second) || return false
+
+  for leaf in active_leaves(first)
+    cell_degrees(first, leaf) == cell_degrees(second, leaf) || return false
+  end
+
+  return true
+end
+
 # Layout equivalence test used when interpreting `State` objects as initial
-# guesses for an assembled system.
+# guesses for an assembled system. Field ids identify the semantic unknown, but
+# the discrete space layout must also match because adapted versions of the same
+# field can have incompatible coefficient meanings even when the vector length is
+# unchanged.
 function _matching_layout(first::FieldLayout, second::FieldLayout)
   dof_count(first) == dof_count(second) || return false
   field_count(first) == field_count(second) || return false
@@ -439,6 +463,7 @@ function _matching_layout(first::FieldLayout, second::FieldLayout)
     first_slot = first.slots[index]
     second_slot = second.slots[index]
     _field_id(first_slot.field) == _field_id(second_slot.field) || return false
+    _matching_space_layout(first_slot.space, second_slot.space) || return false
     first_slot.offset == second_slot.offset || return false
     first_slot.scalar_dof_count == second_slot.scalar_dof_count || return false
     first_slot.dof_count == second_slot.dof_count || return false

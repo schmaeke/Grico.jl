@@ -1072,6 +1072,30 @@ end
                                              end))
   @test seen[] ≈ expected atol = ASSEMBLY_TOL
   @test Grico.coefficients(state_from_state) ≈ Grico.coefficients(state) atol = ASSEMBLY_TOL
+
+  compact_domain = Grico.Domain((0.0,), (1.0,), (1,))
+  compact_space = Grico.HpSpace(compact_domain,
+                                Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                   degree=Grico.UniformDegree(2)))
+  w = Grico.ScalarField(compact_space; name=:w)
+  compact_problem = Grico.AffineProblem(w)
+  Grico.add_cell!(compact_problem, Diffusion(w, 1.0))
+  Grico.add_constraint!(compact_problem,
+                        Grico.Dirichlet(w, Grico.BoundaryFace(1, Grico.LOWER), 0.0))
+  Grico.add_constraint!(compact_problem,
+                        Grico.Dirichlet(w, Grico.BoundaryFace(1, Grico.UPPER), 0.0))
+  compact_plan = Grico.compile(compact_problem)
+  compact_system = Grico.assemble(compact_plan)
+  incompatible_plan = Grico.AdaptivityPlan(compact_space)
+  Grico.request_p_derefinement!(incompatible_plan, 1, 1)
+  Grico.request_h_refinement!(incompatible_plan, 1, 1)
+  incompatible_transition = Grico.transition(incompatible_plan)
+  incompatible_w = Grico.adapted_field(incompatible_transition, w)
+  incompatible_state = Grico.State(Grico.FieldLayout((incompatible_w,)),
+                                   zeros(Grico.scalar_dof_count(Grico.field_space(incompatible_w))))
+
+  @test Grico.dof_count(Grico.field_layout(incompatible_state)) == Grico.dof_count(compact_plan)
+  @test_throws ArgumentError Grico.solve(compact_system; initial_solution=incompatible_state)
 end
 
 @testset "Default Symmetric AMG Solve" begin

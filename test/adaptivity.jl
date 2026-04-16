@@ -115,6 +115,9 @@ end
   transferred = transfer_state(space_transition, state, u, new_u)
 
   @test field_space(new_u) === target_space(space_transition)
+  @test field_dof_range(field_layout(transferred), u) ==
+        field_dof_range(field_layout(transferred), new_u)
+  @test field_values(transferred, u) == field_values(transferred, new_u)
 
   for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
     @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = ADAPTIVITY_TOL
@@ -172,6 +175,59 @@ end
   summary = adaptivity_summary(plan)
   @test summary.h_derefinement_cell_count == 1
   @test active_leaf_count(target_space(transition(plan))) == 1
+end
+
+@testset "State H Coarsening Stabilization" begin
+  coarse_domain = Domain((0.0,), (1.0,), (1,))
+  coarse_space = HpSpace(coarse_domain,
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  refine_plan = AdaptivityPlan(coarse_space)
+  request_h_refinement!(refine_plan, 1, 1)
+  fine_space = target_space(transition(refine_plan))
+  v = ScalarField(fine_space; name=:v)
+  u = ScalarField(fine_space; name=:u)
+  state = State(FieldLayout((v, u)))
+  candidates = h_coarsening_candidates(fine_space)
+  refinement = (current_state, current_field) -> begin
+    @test field_count(field_layout(current_state)) == 2
+    @test length(field_values(current_state, v)) > 0
+    active_leaf_count(field_space(current_field)) == 2 ? [(0.0,), (0.0,)] : [(1.0,)]
+  end
+  h_coarsening = (_state, _field, checked_candidates) -> fill(0.0, length(checked_candidates))
+
+  raw = h_adaptivity_plan(fine_space, [(0.0,), (0.0,)]; threshold=1.0,
+                          h_coarsening_candidates=candidates, h_coarsening_indicators=[0.0],
+                          h_coarsening_threshold=0.1)
+  @test adaptivity_summary(raw).h_derefinement_cell_count == 1
+
+  stabilized = h_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
+                                 h_coarsening_indicator=h_coarsening, h_coarsening_threshold=0.1)
+  @test isempty(stabilized)
+end
+
+@testset "State Coarsening Stabilization Transfers Companion Spaces" begin
+  coarse_domain = Domain((0.0,), (1.0,), (1,))
+  coarse_space = HpSpace(coarse_domain,
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  refine_plan = AdaptivityPlan(coarse_space)
+  request_h_refinement!(refine_plan, 1, 1)
+  fine_space = target_space(transition(refine_plan))
+  companion_space = HpSpace(Grico.domain(fine_space),
+                            SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  v = ScalarField(companion_space; name=:v)
+  u = ScalarField(fine_space; name=:u)
+  state = State(FieldLayout((v, u)))
+  candidates = h_coarsening_candidates(fine_space)
+  refinement = (current_state, current_field) -> begin
+    @test field_count(field_layout(current_state)) == 2
+    @test length(field_values(current_state, v)) > 0
+    active_leaf_count(field_space(current_field)) == 2 ? [(0.0,), (0.0,)] : [(1.0,)]
+  end
+  h_coarsening = (_state, _field, checked_candidates) -> fill(0.0, length(checked_candidates))
+
+  stabilized = h_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
+                                 h_coarsening_indicator=h_coarsening, h_coarsening_threshold=0.1)
+  @test isempty(stabilized)
 end
 
 @testset "Transfer State Linear Solve Hook" begin
@@ -533,6 +589,33 @@ end
   @test p_degree_change(default_hp, 2) == (0,)
 end
 
+@testset "DG Jump Indicators On Hanging Interface" begin
+  mesh_domain = Domain((0.0,), (1.0,), (2,))
+  coarse = HpSpace(mesh_domain,
+                   SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
+  base_u = ScalarField(coarse; name=:u)
+  refine_plan = AdaptivityPlan(coarse)
+  request_h_refinement!(refine_plan, 1, 1)
+  refine_transition = transition(refine_plan)
+  refined = target_space(refine_transition)
+  u = adapted_field(refine_transition, base_u)
+  refined_domain = field_space(u).domain
+  values = Vector{Float64}(undef, active_leaf_count(refined))
+
+  for (leaf_index, leaf) in enumerate(active_leaves(refined))
+    values[leaf_index] = cell_upper(refined_domain, leaf, 1) <= 0.5 ? 1.0 : 3.0
+  end
+
+  state = State(FieldLayout((u,)), values)
+  jumps = interface_jump_indicators(state, u)
+
+  for (leaf_index, leaf) in enumerate(active_leaves(refined))
+    cell_upper(refined_domain, leaf, 1) <= 0.25 &&
+      (@test jumps[leaf_index][1] ≈ 0.0 atol = ADAPTIVITY_TOL)
+    cell_upper(refined_domain, leaf, 1) > 0.25 && (@test jumps[leaf_index][1] > 0.0)
+  end
+end
+
 @testset "Mixed Continuity Adaptivity Defaults" begin
   domain = Domain((0.0, 0.0), (2.0, 2.0), (2, 2))
   space = HpSpace(domain,
@@ -596,6 +679,27 @@ end
                            p_coarsening_threshold=0.2)
   @test p_degree_change(plan, 1) == (-1,)
   @test p_degree_change(plan, 2) == (0,)
+end
+
+@testset "State P Coarsening Stabilization" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  v = ScalarField(space; name=:v)
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((v, u)))
+  refinement = (current_state, current_field) -> begin
+    @test field_count(field_layout(current_state)) == 2
+    @test length(field_values(current_state, v)) > 0
+    cell_degrees(field_space(current_field), 1)[1] == 2 ? [(0.0,)] : [(1.0,)]
+  end
+  p_coarsening = (_state, _field) -> [(0.0,)]
+
+  raw = p_adaptivity_plan(space, [(0.0,)], [(0.0,)]; threshold=1.0, p_coarsening_threshold=0.1)
+  @test p_degree_change(raw, 1) == (-1,)
+
+  stabilized = p_adaptivity_plan(state, u; threshold=1.0, indicator=refinement,
+                                 p_coarsening_indicator=p_coarsening, p_coarsening_threshold=0.1)
+  @test isempty(stabilized)
 end
 
 @testset "Custom Indicator Hooks" begin
