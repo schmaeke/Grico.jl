@@ -125,8 +125,9 @@ mean-value constraints. It is the reusable object that separates the expensive
 setup phase from repeated assembly or nonlinear evaluations.
 
 For affine problems, `assemble(plan)` turns the plan into an [`AffineSystem`](@ref).
-For nonlinear problems, the same plan supplies the local data needed by
-[`residual`](@ref) and [`tangent`](@ref).
+For nonlinear problems, the plan initially stores only the residual traversal
+data; tangent structures are compiled on first use by [`tangent`](@ref) or
+[`tangent!`](@ref).
 
 The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
@@ -164,18 +165,23 @@ selected field. This is what allows the later assembly layer to eliminate
 strong boundary data in a basis-agnostic way, even on hanging interfaces and
 high-order trace spaces.
 
-The returned plan is immutable in the sense that later assembly reads from it
-but does not rewrite its structural data. Recompilation is therefore the
-boundary between the editable setup phase and the repeated runtime phase.
+The returned plan is immutable in the sense that its mesh, fields, operators,
+constraints, and traversal data are fixed. Some operation-specific symbolic
+runtime structures may be compiled lazily and cached inside the plan when an
+operation such as tangent assembly is first requested.
 """
-function compile(problem::_AbstractProblem)
+compile(problem::AffineProblem) = _compile_problem_description(problem, Val(:affine))
+
+compile(problem::ResidualProblem) = _compile_problem_description(problem, Val(:residual))
+
+function _compile_problem_description(problem::_AbstractProblem, assembly_kind)
   return _with_internal_blas_threads() do
     _validate_problem_data(problem)
     data = _problem_data(problem)
     _compile_problem(data.fields, Tuple(data.cell_operators), Tuple(data.boundary_operators),
                      Tuple(data.interface_operators), Tuple(data.surface_operators),
                      data.cell_quadratures, data.embedded_surfaces, data.dirichlet_constraints,
-                     data.mean_constraints)
+                     data.mean_constraints, assembly_kind)
   end
 end
 
@@ -206,7 +212,7 @@ end
 # callbacks are used.
 function _compile_problem(fields, cell_operators, boundary_operators, interface_operators,
                           surface_operators, cell_quadratures, embedded_surfaces,
-                          dirichlet_constraints, mean_constraints)
+                          dirichlet_constraints, mean_constraints, assembly_kind)
   layout = _field_layout(fields)
   integration = _compile_integration(layout, cell_quadratures, embedded_surfaces;
                                      include_interfaces=(!isempty(interface_operators)))
@@ -219,10 +225,11 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
   traversal_plan = _compile_traversal_plan(dimension(layout), integration, boundary_operators,
                                            interface_operators, surface_operators)
   T = eltype(origin(field_space(layout.slots[1].field)))
-  assembly_structure = _compile_assembly_structure(layout, cell_operators, boundary_operators,
-                                                   interface_operators, surface_operators,
-                                                   integration, compiled_dirichlet,
-                                                   compiled_mean_constraints, constraint_masks)
+  assembly_structure = _compile_assembly_structure(assembly_kind, layout, cell_operators,
+                                                   boundary_operators, interface_operators,
+                                                   surface_operators, integration,
+                                                   compiled_dirichlet, compiled_mean_constraints,
+                                                   constraint_masks)
   return AssemblyPlan{dimension(layout),T,typeof(assembly_structure)}(layout, cell_operators,
                                                                       boundary_operators,
                                                                       interface_operators,
@@ -439,7 +446,7 @@ function _compile_filtered_batches(items, signature_fn, operators_fn)
 end
 
 @inline function _field_kernel_signature(data::_FieldValues)
-  return (data.field_id, data.component_count, data.scalar_dof_count, data.local_mode_count,
+  return (data.field_id, _field_component_count(data), data.scalar_dof_count, data.local_mode_count,
           length(data.term_indices), length(data.term_offsets))
 end
 
@@ -758,7 +765,7 @@ function face_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
 
     for component in operator.components
       target = _dirichlet_component_value(operator.data, point_data, component, operator.components,
-                                          data.component_count, value_type)
+                                          _field_component_count(data), value_type)
       offset = _field_component_offset(data, component)
 
       for mode_index in 1:mode_count
@@ -897,7 +904,7 @@ function _field_mean_rows(slot::_FieldSlot{D,T}, cells) where {D,T<:AbstractFloa
   for cell in cells
     data = _field_values(cell, slot.field)
 
-    for component in 1:data.component_count
+    for component in 1:_field_component_count(data)
       row = rows[component]
       local_offset = _field_component_offset(data, component)
 

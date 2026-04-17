@@ -148,10 +148,12 @@ struct _AffineAssemblyStructure{T<:AbstractFloat}
   reconstruction::_SparseMatrixTemplate{T}
 end
 
-# Combined symbolic data reused by affine assembly and nonlinear tangent fill.
-struct _AssemblyStructure{T<:AbstractFloat}
-  affine::_AffineAssemblyStructure{T}
-  tangent::_SparseMatrixTemplate{T}
+# Optional symbolic data compiled for operations that are not needed by every
+# plan. Residual-only plans intentionally keep `affine === nothing` and compile
+# the tangent template only when `tangent`/`tangent!` is first requested.
+mutable struct _AssemblyStructure{T<:AbstractFloat,A}
+  affine::A
+  tangent::Union{Nothing,_SparseMatrixTemplate{T}}
 end
 
 """
@@ -220,6 +222,22 @@ struct _OwnedRowPartition
   ranges::Vector{UnitRange{Int}}
 end
 
+"""
+    ResidualWorkspace(plan)
+
+Reusable runtime storage for nonlinear residual evaluations on `plan`.
+
+Create one workspace for each compiled residual plan that is evaluated
+repeatedly, then pass it to [`residual!`](@ref). A workspace is tied to the
+exact plan used to create it and is not safe to use concurrently from multiple
+outer tasks.
+"""
+struct ResidualWorkspace{T<:AbstractFloat,P<:AssemblyPlan}
+  plan::P
+  scratch::Vector{_ThreadScratch{T}}
+  row_partition::_OwnedRowPartition
+end
+
 struct _OwnedSlotPartition
   owner_of_slot::Vector{Int}
   local_slot_index::Vector{Int}
@@ -227,9 +245,15 @@ struct _OwnedSlotPartition
   slots_by_owner::Vector{Vector{Int}}
 end
 
-struct _OwnedVectorAccumulator{T<:AbstractFloat}
-  target::Vector{T}
+struct _OwnedVectorAccumulator{T<:AbstractFloat,V<:AbstractVector{T}}
+  target::V
   partition::_OwnedRowPartition
+end
+
+function _OwnedVectorAccumulator{T}(target::V,
+                                    partition::_OwnedRowPartition) where {T<:AbstractFloat,
+                                                                          V<:AbstractVector{T}}
+  return _OwnedVectorAccumulator{T,V}(target, partition)
 end
 
 struct _OwnedSparseAccumulator{T<:AbstractFloat}
@@ -319,6 +343,7 @@ function _sparse_matrix_pattern(nrows::Int, ncols::Int, rows::Vector{Int}, cols:
   matrix_data = isempty(rows) ? spzeros(Int, nrows, ncols) :
                 sparse(rows, cols, ones(Int, length(rows)), nrows, ncols)
   slot_lookup = Dict{Tuple{Int,Int},Int}()
+  sizehint!(slot_lookup, length(matrix_data.rowval))
 
   for column in 1:ncols
     for pointer in matrix_data.colptr[column]:(matrix_data.colptr[column+1]-1)
@@ -371,8 +396,25 @@ end
   return nothing
 end
 
-function _compile_assembly_structure(layout::FieldLayout{D,T}, cell_operators, boundary_operators,
-                                     interface_operators, surface_operators,
+# Residual plans need only traversal, constraints, and local integration data.
+# They deliberately skip sparse affine structures so repeated residual-context
+# rebuilds do not pay setup costs for operations they never use.
+function _compile_assembly_structure(::Val{:residual}, layout::FieldLayout{D,T}, cell_operators,
+                                     boundary_operators, interface_operators, surface_operators,
+                                     integration::_CompiledIntegration,
+                                     dirichlet::_CompiledDirichlet{T},
+                                     mean_constraints::Vector{_CompiledLinearConstraint{T}},
+                                     constraint_masks::_ConstraintMasks{T}) where {D,
+                                                                                   T<:AbstractFloat}
+  return _AssemblyStructure{T,Nothing}(nothing, nothing)
+end
+
+# Affine plans compile the global sparse structures used by `assemble` and
+# `solve`. The tangent template is still left empty here because it is an
+# operation-specific structure and can be compiled by `_tangent_template!` on
+# first use.
+function _compile_assembly_structure(::Val{:affine}, layout::FieldLayout{D,T}, cell_operators,
+                                     boundary_operators, interface_operators, surface_operators,
                                      integration::_CompiledIntegration,
                                      dirichlet::_CompiledDirichlet{T},
                                      mean_constraints::Vector{_CompiledLinearConstraint{T}},
@@ -399,23 +441,24 @@ function _compile_assembly_structure(layout::FieldLayout{D,T}, cell_operators, b
                                                    solve_dofs)
   reconstruction = _compile_reconstruction_template(T, length(fixed), solve_dofs, dirichlet_affine,
                                                     reconstruction_rows)
-  tangent = _compile_tangent_template(T, length(fixed), integration, cell_operators,
-                                      boundary_operators, interface_operators, surface_operators,
-                                      fixed, constraint_masks.blocked_rows, dirichlet,
-                                      mean_constraints)
   affine = _AffineAssemblyStructure(condensed, condensation, reduced_index, solve_dofs,
                                     dirichlet_affine, solve_topology, reduced_matrix,
                                     reconstruction)
-  return _AssemblyStructure(affine, tangent)
+  return _AssemblyStructure{T,typeof(affine)}(affine, nothing)
 end
 
 @inline function _local_term_range(item::_AssemblyValues, local_dof::Int)
   return item.term_offsets[local_dof]:(item.term_offsets[local_dof+1]-1)
 end
 
+@inline function _local_term_count(item::_AssemblyValues, local_dof::Int)
+  return item.term_offsets[local_dof+1] - item.term_offsets[local_dof]
+end
+
 function _structural_full_row_targets(item::_AssemblyValues, local_dof::Int, fixed::BitVector,
                                       pivot_rows::BitVector)
   targets = Int[]
+  sizehint!(targets, _local_term_count(item, local_dof))
 
   for term_index in _local_term_range(item, local_dof)
     global_dof = item.term_indices[term_index]
@@ -429,6 +472,7 @@ end
 
 function _structural_full_column_targets(item::_AssemblyValues, local_dof::Int)
   targets = Int[]
+  sizehint!(targets, _local_term_count(item, local_dof))
 
   for term_index in _local_term_range(item, local_dof)
     push!(targets, item.term_indices[term_index])
@@ -462,6 +506,7 @@ function _structural_reduced_row_targets(item::_AssemblyValues, local_dof::Int,
                                          constraint_rows::BitVector,
                                          dirichlet_affine::_ReducedAffineRows)
   targets = Int[]
+  sizehint!(targets, _local_term_count(item, local_dof))
 
   for term_index in _local_term_range(item, local_dof)
     global_dof = item.term_indices[term_index]
@@ -486,6 +531,7 @@ function _structural_reduced_column_targets(item::_AssemblyValues, local_dof::In
                                             reduced_index::Vector{Int}, fixed::BitVector,
                                             dirichlet_affine::_ReducedAffineRows)
   targets = Int[]
+  sizehint!(targets, _local_term_count(item, local_dof))
 
   for term_index in _local_term_range(item, local_dof)
     _append_reduced_targets!(targets, item.term_indices[term_index], reduced_index, fixed,
@@ -499,6 +545,7 @@ function _structural_reconstruction_targets(item::CellValues, local_dof::Int,
                                             reduced_index::Vector{Int}, fixed::BitVector,
                                             dirichlet_affine::_ReducedAffineRows)
   targets = Int[]
+  sizehint!(targets, _local_term_count(item, local_dof))
 
   for term_index in _local_term_range(item, local_dof)
     _append_reduced_targets!(targets, item.term_indices[term_index], reduced_index, fixed,
@@ -541,6 +588,14 @@ function _structural_reconstruction_rows(cells, condensation, reduced_index::Vec
   return rows
 end
 
+function _has_structural_targets(target_table)
+  for targets in target_table
+    isempty(targets) || return true
+  end
+
+  return false
+end
+
 function _append_target_pairs!(rows::Vector{Int}, cols::Vector{Int}, row_targets, col_targets)
   for row in row_targets
     for col in col_targets
@@ -550,6 +605,48 @@ function _append_target_pairs!(rows::Vector{Int}, cols::Vector{Int}, row_targets
   end
 
   return nothing
+end
+
+# Append the Cartesian product of per-local-row and per-local-column target
+# tables. Symbolic assembly uses this instead of recomputing column targets for
+# every local row, which keeps sparse-pattern construction proportional to the
+# local dof count rather than to the local matrix entry count.
+function _append_target_table_pairs!(rows::Vector{Int}, cols::Vector{Int}, row_targets, col_targets)
+  (_has_structural_targets(row_targets) && _has_structural_targets(col_targets)) || return nothing
+
+  for row_group in row_targets
+    isempty(row_group) && continue
+
+    for col_group in col_targets
+      isempty(col_group) && continue
+      _append_target_pairs!(rows, cols, row_group, col_group)
+    end
+  end
+
+  return nothing
+end
+
+function _reduced_row_target_table(item::_AssemblyValues, local_dofs, reduced_index::Vector{Int},
+                                   fixed::BitVector, constraint_rows::BitVector,
+                                   dirichlet_affine::_ReducedAffineRows)
+  return [_structural_reduced_row_targets(item, local_dof, reduced_index, fixed, constraint_rows,
+                                          dirichlet_affine) for local_dof in local_dofs]
+end
+
+function _reduced_column_target_table(item::_AssemblyValues, local_dofs, reduced_index::Vector{Int},
+                                      fixed::BitVector, dirichlet_affine::_ReducedAffineRows)
+  return [_structural_reduced_column_targets(item, local_dof, reduced_index, fixed,
+                                             dirichlet_affine) for local_dof in local_dofs]
+end
+
+function _full_row_target_table(item::_AssemblyValues, local_dofs, fixed::BitVector,
+                                pivot_rows::BitVector)
+  return [_structural_full_row_targets(item, local_dof, fixed, pivot_rows)
+          for local_dof in local_dofs]
+end
+
+function _full_column_target_table(item::_AssemblyValues, local_dofs)
+  return [_structural_full_column_targets(item, local_dof) for local_dof in local_dofs]
 end
 
 function _leaf_has_affine_contributions(leaf::_LeafIntegration, boundary_faces, embedded_surfaces,
@@ -595,35 +692,21 @@ function _compile_affine_matrix_template(::Type{T}, integration::_CompiledIntegr
                                     boundary_operators, surface_operators)) || continue
     cell = cells[cell_index]
     kept_local_dofs = condensation[cell_index].kept_local_dofs
-
-    for local_row in kept_local_dofs
-      row_targets = _structural_reduced_row_targets(cell, local_row, reduced_index, fixed,
-                                                    constraint_rows, dirichlet_affine)
-      isempty(row_targets) && continue
-
-      for local_col in kept_local_dofs
-        col_targets = _structural_reduced_column_targets(cell, local_col, reduced_index, fixed,
-                                                         dirichlet_affine)
-        isempty(col_targets) && continue
-        _append_target_pairs!(rows, cols, row_targets, col_targets)
-      end
-    end
+    row_targets = _reduced_row_target_table(cell, kept_local_dofs, reduced_index, fixed,
+                                            constraint_rows, dirichlet_affine)
+    col_targets = _reduced_column_target_table(cell, kept_local_dofs, reduced_index, fixed,
+                                               dirichlet_affine)
+    _append_target_table_pairs!(rows, cols, row_targets, col_targets)
   end
 
   if !isempty(interface_operators)
     for item in integration.interfaces
-      for local_row in 1:item.local_dof_count
-        row_targets = _structural_reduced_row_targets(item, local_row, reduced_index, fixed,
-                                                      constraint_rows, dirichlet_affine)
-        isempty(row_targets) && continue
-
-        for local_col in 1:item.local_dof_count
-          col_targets = _structural_reduced_column_targets(item, local_col, reduced_index, fixed,
-                                                           dirichlet_affine)
-          isempty(col_targets) && continue
-          _append_target_pairs!(rows, cols, row_targets, col_targets)
-        end
-      end
+      local_dofs = Base.OneTo(item.local_dof_count)
+      row_targets = _reduced_row_target_table(item, local_dofs, reduced_index, fixed,
+                                              constraint_rows, dirichlet_affine)
+      col_targets = _reduced_column_target_table(item, local_dofs, reduced_index, fixed,
+                                                 dirichlet_affine)
+      _append_target_table_pairs!(rows, cols, row_targets, col_targets)
     end
   end
 
@@ -656,6 +739,10 @@ function _compile_reconstruction_template(::Type{T}, ndofs::Int, solve_dofs::Vec
                                           reconstruction_rows::Dict{Int,Vector{Int}}) where {T<:AbstractFloat}
   rows = Int[]
   cols = Int[]
+  entry_count = length(solve_dofs) +
+                sum(length(targets) for targets in Base.values(reconstruction_rows); init=0)
+  sizehint!(rows, entry_count)
+  sizehint!(cols, entry_count)
 
   for reduced_dof in eachindex(solve_dofs)
     push!(rows, solve_dofs[reduced_dof])
@@ -696,16 +783,10 @@ function _compile_tangent_template(::Type{T}, ndofs::Int, integration::_Compiled
 
   if !isempty(cell_operators)
     for cell in integration.cells
-      for local_row in 1:cell.local_dof_count
-        row_targets = _structural_full_row_targets(cell, local_row, fixed, pivot_rows)
-        isempty(row_targets) && continue
-
-        for local_col in 1:cell.local_dof_count
-          col_targets = _structural_full_column_targets(cell, local_col)
-          isempty(col_targets) && continue
-          _append_target_pairs!(rows, cols, row_targets, col_targets)
-        end
-      end
+      local_dofs = Base.OneTo(cell.local_dof_count)
+      row_targets = _full_row_target_table(cell, local_dofs, fixed, pivot_rows)
+      col_targets = _full_column_target_table(cell, local_dofs)
+      _append_target_table_pairs!(rows, cols, row_targets, col_targets)
     end
   end
 
@@ -713,32 +794,19 @@ function _compile_tangent_template(::Type{T}, ndofs::Int, integration::_Compiled
     for face in integration.boundary_faces
       matched = any(_matches(face, wrapped.boundary) for wrapped in boundary_operators)
       matched || continue
-
-      for local_row in 1:face.local_dof_count
-        row_targets = _structural_full_row_targets(face, local_row, fixed, pivot_rows)
-        isempty(row_targets) && continue
-
-        for local_col in 1:face.local_dof_count
-          col_targets = _structural_full_column_targets(face, local_col)
-          isempty(col_targets) && continue
-          _append_target_pairs!(rows, cols, row_targets, col_targets)
-        end
-      end
+      local_dofs = Base.OneTo(face.local_dof_count)
+      row_targets = _full_row_target_table(face, local_dofs, fixed, pivot_rows)
+      col_targets = _full_column_target_table(face, local_dofs)
+      _append_target_table_pairs!(rows, cols, row_targets, col_targets)
     end
   end
 
   if !isempty(interface_operators)
     for item in integration.interfaces
-      for local_row in 1:item.local_dof_count
-        row_targets = _structural_full_row_targets(item, local_row, fixed, pivot_rows)
-        isempty(row_targets) && continue
-
-        for local_col in 1:item.local_dof_count
-          col_targets = _structural_full_column_targets(item, local_col)
-          isempty(col_targets) && continue
-          _append_target_pairs!(rows, cols, row_targets, col_targets)
-        end
-      end
+      local_dofs = Base.OneTo(item.local_dof_count)
+      row_targets = _full_row_target_table(item, local_dofs, fixed, pivot_rows)
+      col_targets = _full_column_target_table(item, local_dofs)
+      _append_target_table_pairs!(rows, cols, row_targets, col_targets)
     end
   end
 
@@ -746,17 +814,10 @@ function _compile_tangent_template(::Type{T}, ndofs::Int, integration::_Compiled
     for surface in integration.embedded_surfaces
       matched = any(_matches(surface, wrapped.tag) for wrapped in surface_operators)
       matched || continue
-
-      for local_row in 1:surface.local_dof_count
-        row_targets = _structural_full_row_targets(surface, local_row, fixed, pivot_rows)
-        isempty(row_targets) && continue
-
-        for local_col in 1:surface.local_dof_count
-          col_targets = _structural_full_column_targets(surface, local_col)
-          isempty(col_targets) && continue
-          _append_target_pairs!(rows, cols, row_targets, col_targets)
-        end
-      end
+      local_dofs = Base.OneTo(surface.local_dof_count)
+      row_targets = _full_row_target_table(surface, local_dofs, fixed, pivot_rows)
+      col_targets = _full_column_target_table(surface, local_dofs)
+      _append_target_table_pairs!(rows, cols, row_targets, col_targets)
     end
   end
 
@@ -815,17 +876,10 @@ function _compile_boundary_projection_template(::Type{T}, ndofs::Int, faces,
   for face in faces
     matched = any(_matches(face, wrapped.boundary) for wrapped in operators)
     matched || continue
-
-    for local_row in 1:face.local_dof_count
-      row_targets = _structural_full_row_targets(face, local_row, fixed, pivot_rows)
-      isempty(row_targets) && continue
-
-      for local_col in 1:face.local_dof_count
-        col_targets = _structural_full_column_targets(face, local_col)
-        isempty(col_targets) && continue
-        _append_target_pairs!(rows, cols, row_targets, col_targets)
-      end
-    end
+    local_dofs = Base.OneTo(face.local_dof_count)
+    row_targets = _full_row_target_table(face, local_dofs, fixed, pivot_rows)
+    col_targets = _full_column_target_table(face, local_dofs)
+    _append_target_table_pairs!(rows, cols, row_targets, col_targets)
   end
 
   return _sparse_matrix_template(T, ndofs, ndofs, rows, cols)
@@ -892,10 +946,18 @@ the reconstruction map of the returned [`AffineSystem`](@ref).
 """
 assemble(problem::AffineProblem) = assemble(compile(problem))
 
+# Keep unsupported operations on residual-only plans failing at the public
+# operation boundary rather than through a later `nothing` field access.
+function _affine_structure(plan::AssemblyPlan)
+  affine = plan.assembly_structure.affine
+  affine === nothing && throw(ArgumentError("assemble requires a plan compiled from AffineProblem"))
+  return affine
+end
+
 function assemble(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
   return _with_internal_blas_threads() do
     ndofs = dof_count(plan)
-    structure = plan.assembly_structure.affine
+    structure = _affine_structure(plan)
     masks = plan.constraint_masks
     fixed = masks.fixed
     fixed_values = masks.fixed_values
@@ -1002,6 +1064,7 @@ end
 """
     residual(plan, state)
     residual!(result, plan, state)
+    residual!(result, plan, state, workspace)
 
 Assemble the nonlinear residual associated with `plan` at the given `state`.
 
@@ -1009,8 +1072,10 @@ The residual is formed on the full field layout, not on the reduced affine
 solve space. In addition to the operator contributions, it includes explicit
 equations enforcing compiled Dirichlet and mean-value constraints.
 
-The mutating form writes into `result`; the allocating form returns a newly
-allocated vector.
+The allocating form returns a newly allocated vector. The three-argument
+mutating form writes into `result` and builds temporary runtime storage for the
+call. Repeated evaluations should create `workspace = ResidualWorkspace(plan)`
+once and use the four-argument mutating form.
 """
 function residual(plan::AssemblyPlan{D,T}, state::State{T}) where {D,T<:AbstractFloat}
   result = zeros(T, dof_count(plan))
@@ -1020,24 +1085,30 @@ end
 
 """
     residual!(result, plan, state)
+    residual!(result, plan, state, workspace)
 
 Overwrite `result` with the nonlinear residual associated with `plan` at
 `state`.
 """
 function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                    state::State{T}) where {D,T<:AbstractFloat}
+  return residual!(result, plan, state, ResidualWorkspace(plan))
+end
+
+function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, state::State{T},
+                   workspace::ResidualWorkspace{T}) where {D,T<:AbstractFloat}
   _with_internal_blas_threads() do
     _check_state(plan, state)
+    _check_residual_workspace(plan, workspace)
     _require_length(result, dof_count(plan), "result")
     fill!(result, zero(T))
     masks = plan.constraint_masks
     fixed = masks.fixed
     skipped_rows = masks.blocked_rows
-    scratch = _scratch_buffers(T, plan.integration)
+    scratch = workspace.scratch
     traversal = plan.traversal_plan
     _reset_scratch!(scratch)
-    row_partition = _OwnedRowPartition(length(result), length(scratch))
-    rhs_accumulator = _OwnedVectorAccumulator(result, row_partition)
+    rhs_accumulator = _OwnedVectorAccumulator(result, workspace.row_partition)
     _prepare_vector_accumulator!(rhs_accumulator, scratch)
     _residual_pass!(scratch, rhs_accumulator, traversal.cell_batches, plan.integration.cells,
                     plan.cell_operators, state, fixed, skipped_rows, cell_residual!)
@@ -1095,7 +1166,7 @@ mutating form overwrites an existing sparse matrix with the newly assembled
 tangent.
 """
 function tangent(plan::AssemblyPlan{D,T}, state::State{T}) where {D,T<:AbstractFloat}
-  matrix_data = _instantiate_sparse(T, plan.assembly_structure.tangent)
+  matrix_data = _instantiate_sparse(T, _tangent_template!(plan))
   _assemble_tangent!(matrix_data, plan, state)
   return matrix_data
 end
@@ -1111,11 +1182,26 @@ function tangent!(matrix_data::SparseMatrixCSC{T,Int}, plan::AssemblyPlan{D,T},
   return matrix_data
 end
 
+# Compile and cache the tangent sparsity template on first use. This keeps
+# residual-only plan construction cheap while preserving the same tangent API for
+# nonlinear problems that actually need Jacobian assembly.
+function _tangent_template!(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  template = plan.assembly_structure.tangent
+  template !== nothing && return template
+  masks = plan.constraint_masks
+  compiled = _compile_tangent_template(T, dof_count(plan), plan.integration, plan.cell_operators,
+                                       plan.boundary_operators, plan.interface_operators,
+                                       plan.surface_operators, masks.fixed, masks.blocked_rows,
+                                       plan.dirichlet, plan.mean_constraints)
+  plan.assembly_structure.tangent = compiled
+  return compiled
+end
+
 function _assemble_tangent!(matrix_data::SparseMatrixCSC{T,Int}, plan::AssemblyPlan{D,T},
                             state::State{T}) where {D,T<:AbstractFloat}
   return _with_internal_blas_threads() do
     _check_state(plan, state)
-    template = plan.assembly_structure.tangent
+    template = _tangent_template!(plan)
     _prepare_sparse!(matrix_data, template)
     masks = plan.constraint_masks
     fixed = masks.fixed
@@ -1533,6 +1619,21 @@ function _scratch_buffers(::Type{T}, integration::_CompiledIntegration) where {T
           for worker_id in 1:worker_count]
 end
 
+# Build the reusable storage owned by a residual plan evaluation loop. The row
+# partition is fixed by the plan's dof count and worker count, so it can be
+# reused across calls together with the thread-local scratch buffers.
+function ResidualWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  scratch = _scratch_buffers(T, plan.integration)
+  row_partition = _OwnedRowPartition(dof_count(plan), length(scratch))
+  return ResidualWorkspace{T,typeof(plan)}(plan, scratch, row_partition)
+end
+
+function _check_residual_workspace(plan::AssemblyPlan, workspace::ResidualWorkspace)
+  workspace.plan === plan ||
+    throw(ArgumentError("residual workspace belongs to a different AssemblyPlan"))
+  return nothing
+end
+
 # Choose how many worker-local scratch bundles to allocate.
 function _worker_count(cell_count::Int, face_count::Int, interface_count::Int, surface_count::Int)
   total = max(cell_count, face_count, interface_count, surface_count, 1)
@@ -1564,6 +1665,9 @@ function _reset_owner_buffers!(indices, values)
   return nothing
 end
 
+# Prepare the per-owner RHS buffers used by the row-partitioned vector
+# accumulator. The buffers live in thread scratch so repeated residual passes
+# resize only when the partition shape changes.
 function _prepare_vector_accumulator!(accumulator::_OwnedVectorAccumulator{T},
                                       scratch) where {T<:AbstractFloat}
   for cache in scratch
@@ -1674,11 +1778,11 @@ function _finalize_vector_accumulator!(accumulator::_OwnedVectorAccumulator{T},
 
   for cache in scratch
     range = accumulator.partition.ranges[cache.worker_id]
-    target = view(accumulator.target, range)
 
-    @inbounds for index in eachindex(target)
-      target[index] += cache.owned_rhs_buffer[index]
-      cache.owned_rhs_buffer[index] = zero(T)
+    @inbounds for local_index in eachindex(cache.owned_rhs_buffer)
+      row = first(range) + local_index - 1
+      accumulator.target[row] += cache.owned_rhs_buffer[local_index]
+      cache.owned_rhs_buffer[local_index] = zero(T)
     end
   end
 
@@ -1769,7 +1873,9 @@ function _normalize_scheduler_kind(kind::_SchedulerKind, item_count::Int, worker
 end
 
 function _scheduler_override_kind()
-  raw = strip(lowercase(get(ENV, _SCHEDULER_OVERRIDE_ENV, "")))
+  raw_env = get(ENV, _SCHEDULER_OVERRIDE_ENV, "")
+  isempty(raw_env) && return nothing
+  raw = lowercase(strip(raw_env))
   isempty(raw) && return nothing
   raw in ("default", "auto") && return nothing
   raw in ("dynamic", "atomic") && return _SCHEDULE_DYNAMIC

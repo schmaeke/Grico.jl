@@ -4,15 +4,16 @@ using Grico
 import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!,
               interface_residual!
 
-const ORDINARYDIFFEQ_AVAILABLE = let
+const ORDINARYDIFFEQ_IMPORT_ERROR = let
   try
     @eval import OrdinaryDiffEq
-    true
+    nothing
   catch err
-    err isa ArgumentError || rethrow()
-    false
+    sprint(showerror, err)
   end
 end
+
+const ORDINARYDIFFEQ_AVAILABLE = ORDINARYDIFFEQ_IMPORT_ERROR === nothing
 
 # This example solves the compressible Euler equations
 #
@@ -103,9 +104,12 @@ const RUN_BLAST_WAVE_EULER = get(ENV, "GRICO_BLAST_WAVE_EULER_AUTORUN", "1") == 
 
 function require_ordinarydiffeq()
   ORDINARYDIFFEQ_AVAILABLE && return nothing
-  throw(ArgumentError("This example requires OrdinaryDiffEq.jl on the current Julia LOAD_PATH. " *
-                      "Install it in your user environment with `julia -e 'using Pkg; " *
-                      "Pkg.add(\"OrdinaryDiffEq\")'` and rerun the example."))
+  message = "This example requires OrdinaryDiffEq.jl on the current Julia LOAD_PATH. " *
+            "Install it in your user environment with `julia -e 'using Pkg; " *
+            "Pkg.add(\"OrdinaryDiffEq\")'` and rerun the example."
+  ORDINARYDIFFEQ_IMPORT_ERROR === nothing ||
+    (message *= " OrdinaryDiffEq could not be loaded: $(ORDINARYDIFFEQ_IMPORT_ERROR)")
+  throw(ArgumentError(message))
 end
 
 # Recover `(ρ, u, v, p)` from the conservative state while applying the small
@@ -707,25 +711,28 @@ end
 
 # `EulerSemidiscretization` is the object handed to `OrdinaryDiffEq.jl`. It owns
 # the reusable work arrays needed to evaluate `du = M⁻¹ R(u)`.
-struct EulerSemidiscretization{P,F,S,V,M}
+struct EulerSemidiscretization{P,F,S,V,W,M}
   plan::P
   field::F
   state::S
   residual_vector::V
+  residual_workspace::W
   mass_inverse::M
 end
 
 function EulerSemidiscretization(plan, field, initial_state, mass_inverse)
   runtime_state = State(plan, copy(coefficients(initial_state)))
   residual_vector = similar(coefficients(initial_state))
-  return EulerSemidiscretization(plan, field, runtime_state, residual_vector, mass_inverse)
+  residual_workspace = ResidualWorkspace(plan)
+  return EulerSemidiscretization(plan, field, runtime_state, residual_vector, residual_workspace,
+                                 mass_inverse)
 end
 
 # Copy the ODE state into the reusable `State`, assemble the DG residual, and
 # apply the cellwise inverse mass matrix.
 function euler_rhs!(du, u, semi::EulerSemidiscretization, t)
   semi.state.coefficients .= u
-  residual!(semi.residual_vector, semi.plan, semi.state)
+  residual!(semi.residual_vector, semi.plan, semi.state, semi.residual_workspace)
   apply_mass_inverse!(du, semi.mass_inverse, semi.residual_vector)
   return nothing
 end

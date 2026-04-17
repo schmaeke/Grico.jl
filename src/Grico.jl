@@ -168,7 +168,8 @@ include("plans.jl")
 export AssemblyPlan, compile
 
 include("assembly.jl")
-export AffineSystem, assemble, matrix, residual, residual!, rhs, tangent, tangent!
+export AffineSystem, ResidualWorkspace, assemble, matrix, residual, residual!, rhs, tangent,
+       tangent!
 
 include("solve.jl")
 export AdditiveSchwarzPreconditioner, FieldSplitSchurPreconditioner, ILUPreconditioner,

@@ -364,16 +364,32 @@ end
 # Field sampling evaluates the hp expansion directly at the exported reference
 # points associated with each VTK node. For vector fields the sampled array is
 # stored in VTK's expected component-major matrix layout.
+struct _VtkFieldSampleScratch{D,T<:AbstractFloat}
+  basis::_LeafBasisScratch{D,T}
+  component_values::Vector{T}
+end
+
+function _VtkFieldSampleScratch(::Type{T}, ::Val{D}, components::Int) where {D,T<:AbstractFloat}
+  return _VtkFieldSampleScratch{D,T}(_LeafBasisScratch(T, Val(D)), Vector{T}(undef, components))
+end
+
 function _sample_vtk_field(field::AbstractField, state::State{T}, mesh::_VtkMesh{D,T},
                            ::Type{T}) where {D,T<:AbstractFloat}
   point_total = length(mesh.point_leaves)
-  sampled = _vtk_field_samples(T, component_count(field), point_total)
+  components = component_count(field)
+  sampled = _vtk_field_samples(T, components, point_total)
+  component_coefficients = _component_coefficient_views(state, field)
+  worker_count = max(1, min(Threads.nthreads(), point_total))
+  scratch = [_VtkFieldSampleScratch(T, Val(D), components) for _ in 1:worker_count]
 
-  _run_chunks!(point_total) do first_point, last_point
+  _run_chunks_with_scratch!(scratch, point_total) do cache, first_point, last_point
     for point_index in first_point:last_point
       ξ = _vtk_column_tuple(mesh.point_references, point_index, Val(D))
-      value = _field_value_on_leaf(field, state, mesh.point_leaves[point_index], ξ)
-      _vtk_store_field_sample!(sampled, value, point_index)
+      compiled = _compiled_leaf(field_space(field), mesh.point_leaves[point_index])
+      _fill_leaf_basis!(cache.basis.values, compiled.degrees, ξ)
+      _leaf_component_values!(cache.component_values, compiled, component_coefficients,
+                              cache.basis.values)
+      _vtk_store_field_sample!(sampled, cache.component_values, point_index)
     end
   end
 
@@ -386,14 +402,16 @@ function _vtk_field_samples(::Type{T}, component_total::Int,
          Matrix{T}(undef, component_total, point_total)
 end
 
-@inline function _vtk_store_field_sample!(sampled::AbstractVector, value, point_index::Int)
-  sampled[point_index] = value
+@inline function _vtk_store_field_sample!(sampled::AbstractVector{T}, values::AbstractVector{T},
+                                          point_index::Int) where {T<:AbstractFloat}
+  sampled[point_index] = values[1]
   return sampled
 end
 
-function _vtk_store_field_sample!(sampled::AbstractMatrix, value, point_index::Int)
+function _vtk_store_field_sample!(sampled::AbstractMatrix{T}, values::AbstractVector{T},
+                                  point_index::Int) where {T<:AbstractFloat}
   @inbounds for component in axes(sampled, 1)
-    sampled[component, point_index] = value[component]
+    sampled[component, point_index] = values[component]
   end
 
   return sampled

@@ -43,10 +43,11 @@
 # Internal field-specific payload stored inside each local integration item.
 # Besides the basis tables `values` and `gradients`, this stores the sparse
 # local-to-global coefficient map for all local dofs of the field so that local
-# function values can be reconstructed directly from a global `State`.
-struct _FieldValues{D,T<:AbstractFloat}
+# function values can be reconstructed directly from a global `State`. The
+# component count is a type parameter because component-free vector evaluation
+# returns tuples whose length should be known to inference.
+struct _FieldValues{D,T<:AbstractFloat,C}
   field_id::UInt64
-  component_count::Int
   scalar_dof_count::Int
   local_mode_count::Int
   block::UnitRange{Int}
@@ -58,6 +59,8 @@ struct _FieldValues{D,T<:AbstractFloat}
   single_term_indices::Vector{Int}
   single_term_coefficients::Vector{T}
 end
+
+@inline _field_component_count(::_FieldValues{D,T,C}) where {D,T,C} = C
 
 """
     CellValues
@@ -370,6 +373,73 @@ function normal_component(value::NTuple{N,<:NTuple{D,<:Number}},
   return ntuple(component -> normal_component(value[component], normal_value), N)
 end
 
+# Direct compiled-leaf evaluation.
+#
+# Some library subsystems need point samples on a compiled leaf without building
+# full `CellValues`: adaptivity indicators, state transfer, and VTK export all
+# evaluate modal expansions at many reference points. The helpers below share
+# one allocation-conscious path for that work. Callers prepare component
+# coefficient views once, reuse one basis-vector scratch per worker, and then
+# evaluate scalar components from the compiled local-to-global mode expansion.
+function _component_coefficient_views(state::State, field::AbstractField)
+  return [field_component_values(state, field, component) for component in 1:component_count(field)]
+end
+
+struct _LeafBasisScratch{D,T<:AbstractFloat}
+  values::NTuple{D,Vector{T}}
+end
+
+function _LeafBasisScratch(::Type{T}, ::Val{D}) where {D,T<:AbstractFloat}
+  return _LeafBasisScratch{D,T}(ntuple(_ -> T[], D))
+end
+
+function _fill_leaf_basis!(basis_values::NTuple{D,Vector{T}}, degrees::NTuple{D,Int},
+                           ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
+  for axis in 1:D
+    axis_values = basis_values[axis]
+    resize!(axis_values, degrees[axis] + 1)
+    _fe_basis_values_and_derivatives!(T(ξ[axis]), degrees[axis], axis_values, nothing)
+  end
+
+  return basis_values
+end
+
+function _leaf_component_value(compiled::_CompiledLeaf{D,T}, coefficients::AbstractVector{T},
+                               basis_values::NTuple{D,Vector{T}}) where {D,T<:AbstractFloat}
+  result = zero(T)
+
+  for mode_index in eachindex(compiled.local_modes)
+    mode = compiled.local_modes[mode_index]
+    shape = one(T)
+
+    for axis in 1:D
+      shape *= basis_values[axis][mode[axis]+1]
+    end
+
+    shape == zero(T) && continue
+    amplitude = _term_amplitude(compiled.term_offsets, compiled.term_indices,
+                                compiled.term_coefficients, compiled.single_term_indices,
+                                compiled.single_term_coefficients, coefficients, mode_index)
+    result += shape * amplitude
+  end
+
+  return result
+end
+
+function _leaf_component_values!(result::AbstractVector{T}, compiled::_CompiledLeaf{D,T},
+                                 component_coefficients,
+                                 basis_values::NTuple{D,Vector{T}}) where {D,T<:AbstractFloat}
+  length(result) >= length(component_coefficients) ||
+    throw(ArgumentError("leaf component value buffer is too small"))
+
+  for component in eachindex(component_coefficients)
+    result[component] = _leaf_component_value(compiled, component_coefficients[component],
+                                              basis_values)
+  end
+
+  return result
+end
+
 # Field-local numbering and basis-table queries.
 
 # Resolve one field descriptor to the precomputed local basis tables and local-
@@ -401,7 +471,7 @@ end
 end
 
 @inline function _checked_field_component(data::_FieldValues, component::Integer)
-  return _checked_index(component, data.component_count, "field component")
+  return _checked_index(component, _field_component_count(data), "field component")
 end
 
 @inline _point_normal(values::FaceValues, point_index::Int) = values.normal
@@ -644,9 +714,8 @@ axes and direct leaf-local dofs on DG axes.
 function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
                point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
-  data.component_count == 1 && return value(values, state, field, 1, point_index)
-  return ntuple(component -> value(values, state, field, component, point_index),
-                data.component_count)
+  checked_point = _checked_point_index(values, point_index)
+  return _field_value(data, coefficients(state), checked_point)
 end
 
 # Evaluate one scalar component by combining the precomputed shape table with
@@ -658,13 +727,31 @@ function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractF
   data = _field_values(values, field)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
-  state_coefficients = coefficients(state)
+  return _field_value_component(data, coefficients(state), checked_component, checked_point)
+end
+
+@inline function _field_value(data::_FieldValues{D,T,1}, state_coefficients::AbstractVector{T},
+                              point_index::Int) where {D,T<:AbstractFloat}
+  return _field_value_component(data, state_coefficients, 1, point_index)
+end
+
+# These component-free evaluators dispatch on the encoded component count so
+# vector fields return statically sized tuples rather than runtime-sized tuples.
+@inline function _field_value(data::_FieldValues{D,T,C}, state_coefficients::AbstractVector{T},
+                              point_index::Int) where {D,T<:AbstractFloat,C}
+  return ntuple(component -> _field_value_component(data, state_coefficients, component,
+                                                    point_index), Val(C))
+end
+
+@inline function _field_value_component(data::_FieldValues{D,T},
+                                        state_coefficients::AbstractVector{T}, component::Int,
+                                        point_index::Int) where {D,T<:AbstractFloat}
   result = zero(T)
 
   for mode_index in 1:data.local_mode_count
-    shape = data.values[mode_index, checked_point]
+    shape = data.values[mode_index, point_index]
     shape == zero(T) && continue
-    local_dof = _field_local_dof(data, checked_component, mode_index)
+    local_dof = _field_local_dof(data, component, mode_index)
     amplitude = _term_amplitude(data.term_offsets, data.term_indices, data.term_coefficients,
                                 data.single_term_indices, data.single_term_coefficients,
                                 state_coefficients, local_dof)
@@ -691,10 +778,7 @@ computes
                           point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
-  state_coefficients = coefficients(state)
-  data.component_count == 1 && return _field_gradient(data, state_coefficients, 1, checked_point)
-  return ntuple(component -> _field_gradient(data, state_coefficients, component, checked_point),
-                data.component_count)
+  return _field_gradient(data, coefficients(state), checked_point)
 end
 
 @inline function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
@@ -703,6 +787,17 @@ end
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
   return _field_gradient(data, coefficients(state), checked_component, checked_point)
+end
+
+@inline function _field_gradient(data::_FieldValues{D,T,1}, state_coefficients::AbstractVector{T},
+                                 point_index::Int) where {D,T<:AbstractFloat}
+  return _field_gradient(data, state_coefficients, 1, point_index)
+end
+
+@inline function _field_gradient(data::_FieldValues{D,T,C}, state_coefficients::AbstractVector{T},
+                                 point_index::Int) where {D,T<:AbstractFloat,C}
+  return ntuple(component -> _field_gradient(data, state_coefficients, component, point_index),
+                Val(C))
 end
 
 """
@@ -722,12 +817,20 @@ the other on the reconstructed discrete field itself.
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   normal_value = _point_normal(values, checked_point)
-  state_coefficients = coefficients(state)
-  data.component_count == 1 &&
-    return _field_normal_gradient(data, state_coefficients, 1, checked_point, normal_value)
+  return _field_normal_gradient(data, coefficients(state), checked_point, normal_value)
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{D,T,1},
+                                        state_coefficients::AbstractVector{T}, point_index::Int,
+                                        normal_value::NTuple{D,T}) where {D,T<:AbstractFloat}
+  return _field_normal_gradient(data, state_coefficients, 1, point_index, normal_value)
+end
+
+@inline function _field_normal_gradient(data::_FieldValues{D,T,C},
+                                        state_coefficients::AbstractVector{T}, point_index::Int,
+                                        normal_value::NTuple{D,T}) where {D,T<:AbstractFloat,C}
   return ntuple(component -> _field_normal_gradient(data, state_coefficients, component,
-                                                    checked_point, normal_value),
-                data.component_count)
+                                                    point_index, normal_value), Val(C))
 end
 
 # Low-level gradient evaluator shared by the scalar and vector-field interfaces.
@@ -1370,16 +1473,17 @@ function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
   _fill_basis_tables!(values, gradients, compiled_leaf.local_modes, compiled_leaf.degrees,
                       reference_points, inverse_jacobian)
 
-  local_dof_count = mode_count * component_count(slot.field)
+  components = component_count(slot.field)
+  local_dof_count = mode_count * components
   scalar_term_count = length(compiled_leaf.term_indices)
-  total_term_count = scalar_term_count * component_count(slot.field)
+  total_term_count = scalar_term_count * components
   term_offsets = Vector{Int}(undef, local_dof_count + 1)
   term_indices = Vector{Int}(undef, total_term_count)
   term_coefficients = Vector{T}(undef, total_term_count)
   term_offsets[1] = 1
   next_term = 1
 
-  for component in 1:component_count(slot.field)
+  for component in 1:components
     component_offset = slot.offset + (component - 1) * slot.scalar_dof_count
 
     for mode_index in 1:mode_count
@@ -1398,10 +1502,10 @@ function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
   block = local_offset:(local_offset+local_dof_count-1)
   single_term_indices, single_term_coefficients = _single_term_metadata(term_offsets, term_indices,
                                                                         term_coefficients)
-  return _FieldValues{D,T}(_field_id(slot.field), component_count(slot.field),
-                           slot.scalar_dof_count, mode_count, block, values, gradients,
-                           term_offsets, term_indices, term_coefficients, single_term_indices,
-                           single_term_coefficients)
+  return _FieldValues{D,T,components}(_field_id(slot.field), slot.scalar_dof_count, mode_count,
+                                      block, values, gradients, term_offsets, term_indices,
+                                      term_coefficients, single_term_indices,
+                                      single_term_coefficients)
 end
 
 # Merge the field-local sparse term maps into one contiguous local numbering for
@@ -1457,7 +1561,7 @@ function _interior_local_dofs(field_data::Tuple, local_modes)
   dofs = Int[]
 
   for data in field_data
-    for component in 1:data.component_count
+    for component in 1:_field_component_count(data)
       offset = first(data.block) + (component - 1) * data.local_mode_count - 1
 
       for mode_index in 1:data.local_mode_count
@@ -1557,7 +1661,7 @@ function _interface_face_points(::Type{T}, domain_data::AbstractDomain{D,T}, min
                              lower = tangential_lower[index]
                              upper = min(minus_upper[axis], plus_upper[axis])
                              upper > lower ||
-                               throw(ArgumentError("leafs $minus_leaf and $plus_leaf do not share an interface face patch"))
+                               throw(ArgumentError("leaves $minus_leaf and $plus_leaf do not share an interface face patch"))
                              (upper - lower) / 2
                            end, D - 1)
   tangential_points, weights = _face_tangential_quadrature(T, shape, face_axis,

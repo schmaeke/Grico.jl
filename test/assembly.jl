@@ -933,6 +933,17 @@ end
                                            degree=Grico.UniformDegree(2)))
   velocity = Grico.VectorField(space, 2; name=:velocity)
   pressure = Grico.ScalarField(space; name=:pressure)
+  vector_plan = Grico.compile(Grico.AffineProblem(velocity))
+  vector_state = Grico.State(vector_plan, collect(1.0:Grico.dof_count(vector_plan)))
+  vector_cell = only(vector_plan.integration.cells)
+  vector_face = first(vector_plan.integration.boundary_faces)
+
+  @test @inferred(Grico.value(vector_cell, vector_state, velocity, 1)) isa NTuple{2,Float64}
+  @test @inferred(Grico.gradient(vector_cell, vector_state, velocity, 1)) isa
+        NTuple{2,NTuple{1,Float64}}
+  @test @inferred(Grico.normal_gradient(vector_face, vector_state, velocity, 1)) isa
+        NTuple{2,Float64}
+
   plan = Grico.compile(Grico.AffineProblem(velocity, pressure))
   state = Grico.State(plan, collect(1.0:Grico.dof_count(plan)))
   cell = only(plan.integration.cells)
@@ -1269,16 +1280,28 @@ end
   Grico.add_constraint!(problem, Grico.MeanValue(u, 2.0))
 
   plan = Grico.compile(problem)
+  @test plan.assembly_structure.affine === nothing
+  @test plan.assembly_structure.tangent === nothing
+  @test_throws ArgumentError Grico.assemble(plan)
   state = Grico.State(plan)
   fill!(Grico.coefficients(state), 1.5)
+  residual_workspace = Grico.ResidualWorkspace(plan)
+  workspace_residual = zeros(Float64, Grico.dof_count(plan))
+  Grico.residual!(workspace_residual, plan, state, residual_workspace)
+  @test workspace_residual ≈ Grico.residual(plan, state)
+
+  other_plan = Grico.compile(problem)
+  other_workspace = Grico.ResidualWorkspace(other_plan)
+  @test_throws ArgumentError Grico.residual!(workspace_residual, plan, state, other_workspace)
 
   for _ in 1:5
-    r = Grico.residual(plan, state)
+    r = Grico.residual!(workspace_residual, plan, state, residual_workspace)
     K = Grico.tangent(plan, state)
+    @test plan.assembly_structure.tangent !== nothing
     Grico.coefficients(state) .+= K \ (-r)
   end
 
-  @test norm(Grico.residual(plan, state)) <= 1.0e-11
+  @test norm(Grico.residual!(workspace_residual, plan, state, residual_workspace)) <= 1.0e-11
 
   for leaf in Grico.active_leaves(space), ξ in (-1.0, 0.0, 1.0)
     @test _field_value(u, state, leaf, (ξ,)) ≈ 2.0 atol = ASSEMBLY_TOL

@@ -458,10 +458,10 @@ end
   refine_transition = transition(refine_plan)
   refined = target_space(refine_transition)
   refined_u = adapted_field(refine_transition, u)
-  calls = Ref(0)
+  calls = Threads.Atomic{Int}(0)
   refined_state = transfer_state(refine_transition, state, u, refined_u;
                                  linear_solve=(A, b) -> begin
-                                   calls[] += 1
+                                   Threads.atomic_add!(calls, 1)
                                    return A \ b
                                  end)
 

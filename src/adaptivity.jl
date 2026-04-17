@@ -1195,41 +1195,70 @@ end
 # points and injects those values into the right-hand side of the projection
 # system. Together with `_TransferMass` this yields the Galerkin `L²`
 # projection from the source field to the target field.
-struct _TransferSource{F,O,S,TR}
+struct _TransferSource{F,C,TR}
   field::F
-  old_field::O
-  old_state::S
+  old_coefficients::C
   transition::TR
+end
+
+# Compiled setup for the fully-DG transfer path. It mirrors the affine fallback
+# inputs but keeps only target-cell integration data and the maximum dense block
+# size needed for per-worker scratch storage.
+struct _CellwiseDGTransferPlan{D,T<:AbstractFloat,L,C,O,N,TR}
+  layout::L
+  cells::C
+  old_fields::O
+  new_fields::N
+  transition::TR
+  max_local_dofs::Int
+end
+
+# Dense local buffers are reused by one worker at a time while solving cellwise
+# projection systems. Fully-DG cells have disjoint global dofs, so the final
+# coefficient writes do not need an accumulator.
+mutable struct _CellwiseDGTransferScratch{D,T<:AbstractFloat}
+  matrix::Matrix{T}
+  rhs::Vector{T}
+  source_basis::NTuple{D,Vector{T}}
+end
+
+function _CellwiseDGTransferScratch(::Type{T}, ::Val{D},
+                                    local_dof_count::Int) where {D,T<:AbstractFloat}
+  return _CellwiseDGTransferScratch{D,T}(Matrix{T}(undef, local_dof_count, local_dof_count),
+                                         Vector{T}(undef, local_dof_count), ntuple(_ -> T[], D))
 end
 
 # Assemble the element-local mass matrix
 #   M_ij = ∫_K φ_i φ_j dΩ
 # for the target field, duplicated componentwise for vector-valued fields.
-function cell_matrix!(local_matrix, operator::_TransferMass, values::CellValues)
-  mode_count = local_mode_count(values, operator.field)
-  components = component_count(operator.field)
+function _assemble_transfer_mass!(local_matrix, values::CellValues, field::AbstractField)
+  mode_count = local_mode_count(values, field)
+  components = component_count(field)
 
   for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
     for row_mode in 1:mode_count
-      value_row = shape_value(values, operator.field, point_index, row_mode)
+      value_row = shape_value(values, field, point_index, row_mode)
 
       for col_mode in 1:mode_count
-        contribution = value_row *
-                       shape_value(values, operator.field, point_index, col_mode) *
-                       weighted
+        contribution = value_row * shape_value(values, field, point_index, col_mode) * weighted
         contribution == 0 && continue
 
         for component in 1:components
-          row = local_dof_index(values, operator.field, component, row_mode)
-          col = local_dof_index(values, operator.field, component, col_mode)
+          row = local_dof_index(values, field, component, row_mode)
+          col = local_dof_index(values, field, component, col_mode)
           local_matrix[row, col] += contribution
         end
       end
     end
   end
 
+  return local_matrix
+end
+
+function cell_matrix!(local_matrix, operator::_TransferMass, values::CellValues)
+  _assemble_transfer_mass!(local_matrix, values, operator.field)
   return nothing
 end
 
@@ -1260,34 +1289,51 @@ end
 # Evaluate the projection right-hand side
 #   b_i = ∫_K u_old φ_i dΩ
 # by sampling the old state at the physical target quadrature points.
-function cell_rhs!(local_rhs, operator::_TransferSource, values::CellValues)
-  mode_count = local_mode_count(values, operator.field)
-  components = component_count(operator.field)
+function _add_transfer_rhs_at_point!(local_rhs, values::CellValues, old_coefficients,
+                                     new_field::AbstractField, source_compiled::_CompiledLeaf{D,T},
+                                     source_basis::NTuple{D,Vector{T}}, point_index::Int,
+                                     weighted) where {D,T<:AbstractFloat}
+  mode_count = local_mode_count(values, new_field)
 
-  for point_index in 1:point_count(values)
-    x = point(values, point_index)
-    weighted = weight(values, point_index)
-    old_value = _transition_value(operator.transition, operator.old_field, operator.old_state,
-                                  values.leaf, x)
+  for component in 1:component_count(new_field)
+    old_value = _leaf_component_value(source_compiled, old_coefficients[component], source_basis)
+    weighted_value = old_value * weighted
 
     for mode_index in 1:mode_count
-      shape = shape_value(values, operator.field, point_index, mode_index)
+      shape = shape_value(values, new_field, point_index, mode_index)
       shape == 0 && continue
-
-      if components == 1
-        local_rhs[local_dof_index(values, operator.field, 1, mode_index)] += old_value *
-                                                                             shape *
-                                                                             weighted
-      else
-        for component in 1:components
-          local_rhs[local_dof_index(values, operator.field, component, mode_index)] += old_value[component] *
-                                                                                       shape *
-                                                                                       weighted
-        end
-      end
+      row = local_dof_index(values, new_field, component, mode_index)
+      local_rhs[row] += weighted_value * shape
     end
   end
 
+  return local_rhs
+end
+
+function _assemble_transfer_rhs!(local_rhs, values::CellValues, transition::SpaceTransition{D,T},
+                                 new_field::AbstractField,
+                                 old_coefficients) where {D,T<:AbstractFloat}
+  source_space_data = source_space(transition)
+  source_domain = domain(source_space_data)
+  source_basis = _LeafBasisScratch(T, Val(D)).values
+
+  for point_index in 1:point_count(values)
+    x = point(values, point_index)
+    source_leaf = _source_leaf_at_point(transition, values.leaf, x)
+    ξ = map_to_biunit_cube(source_domain, source_leaf, x)
+    source_compiled = _compiled_leaf(source_space_data, source_leaf)
+    _fill_leaf_basis!(source_basis, source_compiled.degrees, ξ)
+    weighted = weight(values, point_index)
+    _add_transfer_rhs_at_point!(local_rhs, values, old_coefficients, new_field, source_compiled,
+                                source_basis, point_index, weighted)
+  end
+
+  return local_rhs
+end
+
+function cell_rhs!(local_rhs, operator::_TransferSource, values::CellValues)
+  _assemble_transfer_rhs!(local_rhs, values, operator.transition, operator.field,
+                          operator.old_coefficients)
   return nothing
 end
 
@@ -1327,42 +1373,118 @@ end
   return linear_solve(local_matrix, local_rhs)
 end
 
-# Cellwise DG transfer reuses one dense work matrix and right-hand side for all
-# cells. This avoids global sparse assembly in the common fully discontinuous
-# transient examples while preserving the same L² projection semantics.
-function _cellwise_dg_transfer_state(plan, old_fields::Tuple, new_fields::Tuple, state::State,
-                                     transition::SpaceTransition; linear_solve=default_linear_solve)
-  T = eltype(coefficients(state))
-  state_coefficients = zeros(T, dof_count(field_layout(plan)))
-  operators = ntuple(index -> (_TransferMass(new_fields[index]),
-                               _TransferSource(new_fields[index], old_fields[index], state,
-                                               transition)), length(old_fields))
-  max_local_dofs = isempty(plan.integration.cells) ? 0 :
-                   maximum(cell.local_dof_count for cell in plan.integration.cells)
-  local_matrix = zeros(T, max_local_dofs, max_local_dofs)
-  local_rhs = zeros(T, max_local_dofs)
+# Check the field pairs once before choosing a transfer implementation. The
+# state layout check also gives a targeted error for missing source fields
+# instead of failing later during coefficient evaluation.
+function _checked_transfer_fields(transition::SpaceTransition, state::State, old_fields::Tuple,
+                                  new_fields::Tuple)
+  length(old_fields) == length(new_fields) ||
+    throw(ArgumentError("old and new field tuples must have the same length"))
+  state_layout = field_layout(state)
 
-  for cell in plan.integration.cells
+  for index in eachindex(old_fields)
+    old_field = old_fields[index]
+    new_field = new_fields[index]
+    field_space(old_field) === source_space(transition) ||
+      throw(ArgumentError("old fields must belong to the transition source space"))
+    field_space(new_field) === target_space(transition) ||
+      throw(ArgumentError("new fields must belong to the transition target space"))
+    component_count(old_field) == component_count(new_field) ||
+      throw(ArgumentError("field component counts must match during transfer"))
+    field_dof_range(state_layout, old_field)
+  end
+
+  return nothing
+end
+
+# Compile the target cells used by the direct fully-DG projection and verify
+# that each local dof maps to exactly one global coefficient.
+function _compile_cellwise_dg_transfer_plan(transition::SpaceTransition{D,T}, old_fields::Tuple,
+                                            new_fields::Tuple) where {D,T<:AbstractFloat}
+  layout = FieldLayout(new_fields)
+  overrides = _cell_quadrature_overrides(layout, ())
+  cells = _compile_cells(layout, overrides)
+  max_local_dofs = 0
+
+  for cell in cells
     _checked_cellwise_single_term_mapping(cell)
-    local_dofs = cell.local_dof_count
-    matrix_view = view(local_matrix, 1:local_dofs, 1:local_dofs)
-    rhs_view = view(local_rhs, 1:local_dofs)
-    fill!(matrix_view, zero(T))
-    fill!(rhs_view, zero(T))
+    max_local_dofs = max(max_local_dofs, cell.local_dof_count)
+  end
 
-    for (mass, source) in operators
-      cell_matrix!(matrix_view, mass, cell)
-      cell_rhs!(rhs_view, source, cell)
-    end
+  return _CellwiseDGTransferPlan{D,T,typeof(layout),typeof(cells),typeof(old_fields),
+                                 typeof(new_fields),typeof(transition)}(layout, cells, old_fields,
+                                                                        new_fields, transition,
+                                                                        max_local_dofs)
+end
 
-    local_solution = _cellwise_transfer_linear_solve(matrix_view, rhs_view, linear_solve)
+function _assemble_cellwise_transfer_matrix!(local_matrix, cell::CellValues, new_fields::Tuple)
+  for field in new_fields
+    _assemble_transfer_mass!(local_matrix, cell, field)
+  end
 
-    for local_dof in 1:local_dofs
-      state_coefficients[cell.single_term_indices[local_dof]] = local_solution[local_dof]
+  return local_matrix
+end
+
+# Assemble all target-field RHS blocks for one DG cell. The source leaf lookup
+# is shared across field components at a quadrature point; the per-field kernel
+# is the same one used by the affine transfer fallback.
+function _assemble_cellwise_transfer_rhs!(local_rhs, cell::CellValues,
+                                          plan::_CellwiseDGTransferPlan{D,T}, source_coefficients,
+                                          source_basis::NTuple{D,Vector{T}}) where {D,
+                                                                                    T<:AbstractFloat}
+  transition = plan.transition
+  source_space_data = source_space(transition)
+  source_domain = domain(source_space_data)
+
+  for point_index in 1:point_count(cell)
+    x = point(cell, point_index)
+    source_leaf = _source_leaf_at_point(transition, cell.leaf, x)
+    ξ = map_to_biunit_cube(source_domain, source_leaf, x)
+    source_compiled = _compiled_leaf(source_space_data, source_leaf)
+    _fill_leaf_basis!(source_basis, source_compiled.degrees, ξ)
+    weighted = weight(cell, point_index)
+
+    for field_index in eachindex(plan.old_fields)
+      new_field = plan.new_fields[field_index]
+      _add_transfer_rhs_at_point!(local_rhs, cell, source_coefficients[field_index], new_field,
+                                  source_compiled, source_basis, point_index, weighted)
     end
   end
 
-  return State(plan, state_coefficients)
+  return local_rhs
+end
+
+# Solve one independent dense projection system per target DG cell and scatter
+# the local coefficients directly into the new state vector.
+function _transfer_cellwise_dg_state(plan::_CellwiseDGTransferPlan{D,T}, state::State{T};
+                                     linear_solve=default_linear_solve) where {D,T<:AbstractFloat}
+  state_coefficients = zeros(T, dof_count(plan.layout))
+  isempty(plan.cells) && return State(plan.layout, state_coefficients)
+  worker_count = _worker_count(length(plan.cells), 0, 0, 0)
+  scratch = [_CellwiseDGTransferScratch(T, Val(D), plan.max_local_dofs) for _ in 1:worker_count]
+  source_coefficients = ntuple(index -> _component_coefficient_views(state, plan.old_fields[index]),
+                               length(plan.old_fields))
+
+  _run_chunks!(scratch, length(plan.cells), _WORKLOAD_REGULAR) do cache, first_cell, last_cell
+    for cell_index in first_cell:last_cell
+      cell = @inbounds plan.cells[cell_index]
+      local_dofs = cell.local_dof_count
+      matrix_view = view(cache.matrix, 1:local_dofs, 1:local_dofs)
+      rhs_view = view(cache.rhs, 1:local_dofs)
+      fill!(matrix_view, zero(T))
+      fill!(rhs_view, zero(T))
+      _assemble_cellwise_transfer_matrix!(matrix_view, cell, plan.new_fields)
+      _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients,
+                                       cache.source_basis)
+      local_solution = _cellwise_transfer_linear_solve(matrix_view, rhs_view, linear_solve)
+
+      for local_dof in 1:local_dofs
+        state_coefficients[cell.single_term_indices[local_dof]] = local_solution[local_dof]
+      end
+    end
+  end
+
+  return State(plan.layout, state_coefficients)
 end
 
 """
@@ -1387,31 +1509,24 @@ problem.
 """
 function transfer_state(transition::SpaceTransition, state::State, old_fields::Tuple,
                         new_fields::Tuple; linear_solve=default_linear_solve)
-  length(old_fields) == length(new_fields) ||
-    throw(ArgumentError("old and new field tuples must have the same length"))
+  _checked_transfer_fields(transition, state, old_fields, new_fields)
+
+  if _is_fully_dg_space(target_space(transition))
+    plan = _compile_cellwise_dg_transfer_plan(transition, old_fields, new_fields)
+    return _transfer_cellwise_dg_state(plan, state; linear_solve=linear_solve)
+  end
+
   problem = AffineProblem(new_fields...)
 
   for index in eachindex(old_fields)
-    old_field = old_fields[index]
     new_field = new_fields[index]
-    field_space(old_field) === source_space(transition) ||
-      throw(ArgumentError("old fields must belong to the transition source space"))
-    field_space(new_field) === target_space(transition) ||
-      throw(ArgumentError("new fields must belong to the transition target space"))
-    component_count(old_field) == component_count(new_field) ||
-      throw(ArgumentError("field component counts must match during transfer"))
-    field_dof_range(field_layout(state), old_field)
     add_cell!(problem, _TransferMass(new_field))
-    add_cell!(problem, _TransferSource(new_field, old_field, state, transition))
+    add_cell!(problem,
+              _TransferSource(new_field, _component_coefficient_views(state, old_fields[index]),
+                              transition))
   end
 
   plan = compile(problem)
-
-  if _is_fully_dg_space(target_space(transition))
-    return _cellwise_dg_transfer_state(plan, old_fields, new_fields, state, transition;
-                                       linear_solve=linear_solve)
-  end
-
   return State(plan, solve(assemble(plan); linear_solve=linear_solve))
 end
 
@@ -1537,14 +1652,21 @@ function transfer_state(plans::Tuple, state::State; linear_solve=default_linear_
   return Tuple(new_fields), new_state
 end
 
-# Modal and interface detail indicators.
+# Modal, trace, and projection detail indicators.
 
-function _local_mode_energy(field::AbstractField, state::State{T}, compiled::_CompiledLeaf,
-                            mode_index::Int) where {T<:AbstractFloat}
+function _local_mode_amplitude(compiled::_CompiledLeaf, coefficients::AbstractVector,
+                               mode_index::Int)
+  return _term_amplitude(compiled.term_offsets, compiled.term_indices, compiled.term_coefficients,
+                         compiled.single_term_indices, compiled.single_term_coefficients,
+                         coefficients, mode_index)
+end
+
+function _local_mode_energy(component_coefficients, compiled::_CompiledLeaf{D,T},
+                            mode_index::Int) where {D,T<:AbstractFloat}
   energy = zero(T)
 
-  for component in 1:component_count(field)
-    amplitude = _local_mode_amplitude(field, state, compiled, component, mode_index)
+  for component in eachindex(component_coefficients)
+    amplitude = _local_mode_amplitude(compiled, component_coefficients[component], mode_index)
     energy += amplitude * amplitude
   end
 
@@ -1560,7 +1682,7 @@ end
 # and `ψ₁` on each axis. Those do not separate constant and linear content by
 # themselves, so for `p = 1` we first transform the endpoint pair into its
 # constant/linear combination before extracting layer energies.
-function _axis_layer_energies(field::AbstractField, state::State{T}, compiled::_CompiledLeaf{D},
+function _axis_layer_energies(component_coefficients, compiled::_CompiledLeaf{D,T},
                               axis::Int) where {D,T<:AbstractFloat}
   degree_value = compiled.degrees[axis]
   top_energy = zero(T)
@@ -1577,9 +1699,9 @@ function _axis_layer_energies(field::AbstractField, state::State{T}, compiled::_
       upper_index = _mode_lookup(compiled, _mode_with_axis_value(lower_mode, axis, 1))
       upper_index != 0 || continue
 
-      for component in 1:component_count(field)
-        lower = _local_mode_amplitude(field, state, compiled, component, lower_index)
-        upper = _local_mode_amplitude(field, state, compiled, component, upper_index)
+      for component in eachindex(component_coefficients)
+        lower = _local_mode_amplitude(compiled, component_coefficients[component], lower_index)
+        upper = _local_mode_amplitude(compiled, component_coefficients[component], upper_index)
         constant = half * (lower + upper)
         linear = half * (upper - lower)
         previous_energy += constant * constant
@@ -1594,7 +1716,7 @@ function _axis_layer_energies(field::AbstractField, state::State{T}, compiled::_
     mode = compiled.local_modes[mode_index]
     layer = mode[axis]
     layer == degree_value || layer == degree_value - 1 || continue
-    amplitude_squared = _local_mode_energy(field, state, compiled, mode_index)
+    amplitude_squared = _local_mode_energy(component_coefficients, compiled, mode_index)
 
     if layer == degree_value
       top_energy += amplitude_squared
@@ -1619,9 +1741,7 @@ end
 
 function _trace_component_value(compiled::_CompiledLeaf{D,T}, coefficients::AbstractVector{T},
                                 axis::Int, side::Int,
-                                ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  basis_values = ntuple(current_axis -> _fe_basis_values(T(ξ[current_axis]),
-                                                         compiled.degrees[current_axis]), D)
+                                basis_values::NTuple{D,Vector{T}}) where {D,T<:AbstractFloat}
   boundary_value = _trace_mode_axis_value(compiled.degrees[axis], side)
   result = zero(T)
 
@@ -1645,27 +1765,112 @@ function _trace_component_value(compiled::_CompiledLeaf{D,T}, coefficients::Abst
   return result
 end
 
+# Interface-jump evaluation keeps one indicator table per worker plus reusable
+# basis buffers for both traces of the current face patch. The accumulated
+# tables are merged after the parallel pass, so no atomics are needed in the
+# inner quadrature loop.
+struct _InterfaceJumpScratch{D,T<:AbstractFloat}
+  indicators::Matrix{T}
+  minus_basis::NTuple{D,Vector{T}}
+  plus_basis::NTuple{D,Vector{T}}
+end
+
+function _InterfaceJumpScratch(::Type{T}, ::Val{D},
+                               active_leaf_total::Int) where {D,T<:AbstractFloat}
+  return _InterfaceJumpScratch{D,T}(zeros(T, active_leaf_total, D), ntuple(_ -> T[], D),
+                                    ntuple(_ -> T[], D))
+end
+
+@inline function _interface_jump_shape(minus_compiled::_CompiledLeaf{D},
+                                       plus_compiled::_CompiledLeaf{D}, axis::Int) where {D}
+  return ntuple(current_axis -> current_axis == axis ? 1 :
+                                max(minus_compiled.quadrature_shape[current_axis],
+                                    plus_compiled.quadrature_shape[current_axis]), D)
+end
+
+function _interface_jump_quadrature_table(::Type{T}, space::HpSpace{D},
+                                          specs) where {D,T<:AbstractFloat}
+  cache = Dict{Tuple{Int,NTuple{D-1,Int}},TensorQuadrature{D-1,T}}()
+
+  for spec in specs
+    minus_leaf, axis, plus_leaf = spec
+    minus_compiled = @inbounds space.compiled_leaves[space.leaf_to_index[minus_leaf]]
+    plus_compiled = @inbounds space.compiled_leaves[space.leaf_to_index[plus_leaf]]
+    shape = _interface_jump_shape(minus_compiled, plus_compiled, axis)
+    key = (axis, _face_tangential_shape(shape, axis))
+    haskey(cache, key) || (cache[key] = TensorQuadrature(T, key[2]))
+  end
+
+  return cache
+end
+
+@inline _face_tangential_index(axis::Int, face_axis::Int) = axis < face_axis ? axis : axis - 1
+
+@inline function _reference_coordinate(lower::T, upper::T, coordinate::T) where {T<:AbstractFloat}
+  return (T(2) * coordinate - lower - upper) / (upper - lower)
+end
+
+function _reference_face_point(lower::NTuple{D,T}, upper::NTuple{D,T}, face_axis::Int, side::Int,
+                               tangential_coordinates::NTuple{D1,T}) where {D,D1,T<:AbstractFloat}
+  fixed_coordinate = side == LOWER ? -one(T) : one(T)
+  return ntuple(axis -> axis == face_axis ? fixed_coordinate :
+                        _reference_coordinate(lower[axis], upper[axis],
+                                              tangential_coordinates[_face_tangential_index(axis,
+                                                                                            face_axis)]),
+                D)
+end
+
 function _interface_jump_energy(component_coefficients, minus_compiled::_CompiledLeaf{D,T},
-                                plus_compiled::_CompiledLeaf{D,T}, axis::Int,
-                                minus_reference_points::Vector{NTuple{D,T}},
-                                plus_reference_points::Vector{NTuple{D,T}},
-                                weights::Vector{T}) where {D,T<:AbstractFloat}
+                                plus_compiled::_CompiledLeaf{D,T}, domain_data::AbstractDomain{D,T},
+                                minus_leaf::Int, plus_leaf::Int, axis::Int,
+                                quadrature::TensorQuadrature{D1,T},
+                                scratch::_InterfaceJumpScratch{D,T}) where {D,D1,T<:AbstractFloat}
+  minus_lower = cell_lower(domain_data, minus_leaf)
+  minus_upper = cell_upper(domain_data, minus_leaf)
+  plus_lower = cell_lower(domain_data, plus_leaf)
+  plus_upper = cell_upper(domain_data, plus_leaf)
+  tangential_lower = ntuple(index -> begin
+                              current_axis = _face_tangential_axis(index, axis)
+                              max(minus_lower[current_axis], plus_lower[current_axis])
+                            end, D - 1)
+  tangential_half = ntuple(index -> begin
+                             current_axis = _face_tangential_axis(index, axis)
+                             lower = tangential_lower[index]
+                             upper = min(minus_upper[current_axis], plus_upper[current_axis])
+                             upper > lower ||
+                               throw(ArgumentError("leaves $minus_leaf and $plus_leaf do not share an interface face patch"))
+                             (upper - lower) / 2
+                           end, D - 1)
+  weight_scale = one(T)
+
+  for half_width in tangential_half
+    weight_scale *= half_width
+  end
+
   jump_energy = zero(T)
   component_total = length(component_coefficients)
 
-  @inbounds for point_index in eachindex(weights)
+  @inbounds for point_index in 1:point_count(quadrature)
+    tangential_coordinates = _mapped_face_tangential_coordinates(tangential_lower, tangential_half,
+                                                                 point(quadrature, point_index), T)
+    minus_reference_point = _reference_face_point(minus_lower, minus_upper, axis, UPPER,
+                                                  tangential_coordinates)
+    plus_reference_point = _reference_face_point(plus_lower, plus_upper, axis, LOWER,
+                                                 tangential_coordinates)
+    _fill_leaf_basis!(scratch.minus_basis, minus_compiled.degrees, minus_reference_point)
+    _fill_leaf_basis!(scratch.plus_basis, plus_compiled.degrees, plus_reference_point)
     point_jump = zero(T)
 
     for component in 1:component_total
       minus_value = _trace_component_value(minus_compiled, component_coefficients[component], axis,
-                                           UPPER, minus_reference_points[point_index])
+                                           UPPER, scratch.minus_basis)
       plus_value = _trace_component_value(plus_compiled, component_coefficients[component], axis,
-                                          LOWER, plus_reference_points[point_index])
+                                          LOWER, scratch.plus_basis)
       difference = plus_value - minus_value
       point_jump += difference * difference
     end
 
-    jump_energy += point_jump * weights[point_index]
+    jump_energy += point_jump * weight(quadrature, point_index) * weight_scale
   end
 
   return jump_energy
@@ -1712,42 +1917,35 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
   specs = _filtered_upper_face_neighbor_specs(grid(space), space.active_leaves, space.leaf_to_index)
   isempty(specs) && return [ntuple(_ -> zero(T), D) for _ in 1:active_leaf_total]
   domain_data = domain(space)
-  component_coefficients = ntuple(component -> field_component_values(state, field, component),
-                                  component_count(field))
+  component_coefficients = _component_coefficient_views(state, field)
+  quadrature_table = _interface_jump_quadrature_table(T, space, specs)
   worker_count = max(1, min(Threads.nthreads(), length(specs)))
-  thread_indicators = [zeros(T, active_leaf_total, D) for _ in 1:worker_count]
+  thread_scratch = [_InterfaceJumpScratch(T, Val(D), active_leaf_total) for _ in 1:worker_count]
 
-  _run_chunks_with_scratch!(thread_indicators, length(specs)) do indicators, first_spec, last_spec
+  _run_chunks_with_scratch!(thread_scratch, length(specs)) do scratch, first_spec, last_spec
     for spec_index in first_spec:last_spec
       minus_leaf, axis, plus_leaf = specs[spec_index]
       minus_leaf_index = @inbounds space.leaf_to_index[minus_leaf]
       plus_leaf_index = @inbounds space.leaf_to_index[plus_leaf]
       minus_compiled = @inbounds space.compiled_leaves[minus_leaf_index]
       plus_compiled = @inbounds space.compiled_leaves[plus_leaf_index]
-      shape = ntuple(current_axis -> current_axis == axis ? 1 :
-                                     max(minus_compiled.quadrature_shape[current_axis],
-                                         plus_compiled.quadrature_shape[current_axis]), D)
-      points, plus_points, weights = _interface_face_points(T, domain_data, minus_leaf, axis, UPPER,
-                                                            plus_leaf, LOWER, shape)
-      minus_reference_points = map(point -> map_to_biunit_cube(domain_data, minus_leaf, point),
-                                   points)
-      plus_reference_points = map(point -> map_to_biunit_cube(domain_data, plus_leaf, point),
-                                  plus_points)
+      shape = _interface_jump_shape(minus_compiled, plus_compiled, axis)
+      quadrature = quadrature_table[(axis, _face_tangential_shape(shape, axis))]
       jump_energy = _interface_jump_energy(component_coefficients, minus_compiled, plus_compiled,
-                                           axis, minus_reference_points, plus_reference_points,
-                                           weights)
+                                           domain_data, minus_leaf, plus_leaf, axis, quadrature,
+                                           scratch)
       minus_scale = ((minus_compiled.degrees[axis] + 1)^2) /
                     cell_size(domain_data, minus_leaf, axis)
       plus_scale = ((plus_compiled.degrees[axis] + 1)^2) / cell_size(domain_data, plus_leaf, axis)
-      indicators[minus_leaf_index, axis] += minus_scale * jump_energy
-      indicators[plus_leaf_index, axis] += plus_scale * jump_energy
+      scratch.indicators[minus_leaf_index, axis] += minus_scale * jump_energy
+      scratch.indicators[plus_leaf_index, axis] += plus_scale * jump_energy
     end
   end
 
-  indicators = thread_indicators[1]
+  indicators = thread_scratch[1].indicators
 
-  for worker in 2:length(thread_indicators)
-    _merge_thread_axis_indicators!(indicators, thread_indicators[worker])
+  for worker in 2:length(thread_scratch)
+    _merge_thread_axis_indicators!(indicators, thread_scratch[worker].indicators)
   end
 
   return [ntuple(axis -> sqrt(indicators[leaf_index, axis]), D)
@@ -1806,6 +2004,7 @@ function _modal_axis_detail_data(state::State{T}, field::AbstractField) where {T
   field_dof_range(field_layout(state), field)
   space = field_space(field)
   D = dimension(space)
+  component_coefficients = _component_coefficient_views(state, field)
   detail = Vector{NTuple{D,T}}(undef, active_leaf_count(space))
   decay = Vector{NTuple{D,T}}(undef, active_leaf_count(space))
   thread_scratch = [_ModalAxisDetailScratch(zeros(T, D), zeros(T, D))
@@ -1820,14 +2019,14 @@ function _modal_axis_detail_data(state::State{T}, field::AbstractField) where {T
       total_energy = zero(T)
 
       for mode_index in eachindex(compiled.local_modes)
-        amplitude_squared = _local_mode_energy(field, state, compiled, mode_index)
+        amplitude_squared = _local_mode_energy(component_coefficients, compiled, mode_index)
         amplitude_squared == zero(T) && continue
         total_energy += amplitude_squared
       end
 
       for axis in 1:D
-        scratch.top[axis], scratch.previous[axis] = _axis_layer_energies(field, state, compiled,
-                                                                         axis)
+        scratch.top[axis], scratch.previous[axis] = _axis_layer_energies(component_coefficients,
+                                                                         compiled, axis)
       end
 
       detail[leaf_index] = total_energy == zero(T) ? ntuple(_ -> zero(T), D) :
@@ -1972,9 +2171,53 @@ end
 # Thread-local projection buffers. Columns correspond to field components and
 # rows to parent modes; each candidate uses leading subviews sized by its target
 # basis, so the buffers can be reused without allocation across chunks.
-struct _ProjectionIndicatorScratch{T<:AbstractFloat}
+struct _ProjectionIndicatorScratch{D,T<:AbstractFloat}
   rhs::Matrix{T}
   coefficients::Matrix{T}
+  parent_basis::NTuple{D,Vector{T}}
+  child_basis::NTuple{D,Vector{T}}
+  component_values::Vector{T}
+  shape_values::Vector{T}
+end
+
+function _ProjectionIndicatorScratch(::Type{T}, ::Val{D}, max_mode_count::Int,
+                                     components::Int) where {D,T<:AbstractFloat}
+  return _ProjectionIndicatorScratch{D,T}(Matrix{T}(undef, max_mode_count, components),
+                                          Matrix{T}(undef, max_mode_count, components),
+                                          ntuple(_ -> T[], D), ntuple(_ -> T[], D),
+                                          Vector{T}(undef, components),
+                                          Vector{T}(undef, max_mode_count))
+end
+
+function _fill_projection_shape_values!(shape_values::AbstractVector{T},
+                                        modes::AbstractVector{<:NTuple{D,Int}},
+                                        basis_values::NTuple{D,Vector{T}}) where {D,
+                                                                                  T<:AbstractFloat}
+  length(shape_values) >= length(modes) ||
+    throw(ArgumentError("projection shape buffer is too small"))
+
+  for mode_index in eachindex(modes)
+    shape_values[mode_index] = _projection_shape_value(modes, basis_values, mode_index)
+  end
+
+  return shape_values
+end
+
+function _projection_quadrature_table(::Type{T}, space::HpSpace{D},
+                                      candidates::AbstractVector{HCoarseningCandidate{D}}) where {D,
+                                                                                                  T<:AbstractFloat}
+  cache = Dict{Tuple{NTuple{D,Int},NTuple{D,Int}},TensorQuadrature{D,T}}()
+
+  for candidate in candidates
+    for child in candidate.children
+      key = (candidate.target_degrees, cell_degrees(space, child))
+      haskey(cache, key) || (cache[key] = TensorQuadrature(T,
+                                                           _projection_quadrature_shape(candidate.target_degrees,
+                                                                                        key[2])))
+    end
+  end
+
+  return cache
 end
 
 """
@@ -2000,10 +2243,11 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
   indicators = Vector{T}(undef, length(checked_candidates))
   isempty(checked_candidates) && return indicators
   components = component_count(field)
+  component_coefficients = _component_coefficient_views(state, field)
   references, max_mode_count = _projection_reference_table(space, checked_candidates)
+  quadrature_table = _projection_quadrature_table(T, space, checked_candidates)
   worker_count = max(1, min(Threads.nthreads(), length(checked_candidates)))
-  scratch = [_ProjectionIndicatorScratch(Matrix{T}(undef, max_mode_count, components),
-                                         Matrix{T}(undef, max_mode_count, components))
+  scratch = [_ProjectionIndicatorScratch(T, Val(dimension(space)), max_mode_count, components)
              for _ in 1:worker_count]
 
   _with_internal_blas_threads() do
@@ -2016,45 +2260,33 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
         mode_count = length(modes)
         rhs = @view buffers.rhs[1:mode_count, 1:components]
         coefficients = @view buffers.coefficients[1:mode_count, 1:components]
+        shape_values = @view buffers.shape_values[1:mode_count]
         fill!(rhs, zero(T))
         fine_norm = zero(T)
         parent_jacobian = jacobian_determinant_from_biunit_cube(domain(space), candidate.cell)
 
         for child in candidate.children
-          quadrature = TensorQuadrature(T,
-                                        _projection_quadrature_shape(candidate.target_degrees,
-                                                                     cell_degrees(space, child)))
+          child_compiled = _compiled_leaf(space, child)
+          quadrature = quadrature_table[(candidate.target_degrees, child_compiled.degrees)]
           child_jacobian = jacobian_determinant_from_biunit_cube(domain(space), child)
 
           for point_index in 1:point_count(quadrature)
             ξ_child = point(quadrature, point_index)
             ξ_parent = _child_point_in_parent(space, candidate.cell, child, ξ_child)
-            basis_values = ntuple(axis -> _fe_basis_values(ξ_parent[axis],
-                                                           candidate.target_degrees[axis]),
-                                  dimension(space))
+            _fill_leaf_basis!(buffers.parent_basis, candidate.target_degrees, ξ_parent)
+            _fill_leaf_basis!(buffers.child_basis, child_compiled.degrees, ξ_child)
+            _leaf_component_values!(buffers.component_values, child_compiled,
+                                    component_coefficients, buffers.child_basis)
+            _fill_projection_shape_values!(shape_values, modes, buffers.parent_basis)
             weighted = weight(quadrature, point_index) * child_jacobian
-            local_value = _field_value_on_leaf(field, state, child, ξ_child)
 
-            if components == 1
-              scalar_value = local_value
+            for component in 1:components
+              scalar_value = buffers.component_values[component]
               fine_norm += scalar_value * scalar_value * weighted
+              weighted_value = scalar_value * weighted
 
               for mode_index in 1:mode_count
-                rhs[mode_index, 1] += _projection_shape_value(modes, basis_values, mode_index) *
-                                      scalar_value *
-                                      weighted
-              end
-            else
-              for component in 1:components
-                scalar_value = local_value[component]
-                fine_norm += scalar_value * scalar_value * weighted
-
-                for mode_index in 1:mode_count
-                  rhs[mode_index, component] += _projection_shape_value(modes, basis_values,
-                                                                        mode_index) *
-                                                scalar_value *
-                                                weighted
-                end
+                rhs[mode_index, component] += shape_values[mode_index] * weighted_value
               end
             end
           end
@@ -2100,8 +2332,12 @@ end
 function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T<:AbstractFloat}
   field_dof_range(field_layout(state), field)
   space = field_space(field)
+  D = dimension(space)
   energies = zeros(T, active_leaf_count(space))
   components = component_count(field)
+  component_coefficients = _component_coefficient_views(state, field)
+  basis_scratch = _LeafBasisScratch(T, Val(D))
+  component_values = Vector{T}(undef, components)
 
   for (leaf_index, leaf) in enumerate(active_leaves(space))
     compiled = space.compiled_leaves[leaf_index]
@@ -2112,15 +2348,13 @@ function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T
     for point_index in 1:point_count(quadrature)
       ξ = point(quadrature, point_index)
       weighted = weight(quadrature, point_index) * jacobian
-      local_value = _field_value_on_leaf(field, state, leaf, ξ)
+      _fill_leaf_basis!(basis_scratch.values, compiled.degrees, ξ)
+      _leaf_component_values!(component_values, compiled, component_coefficients,
+                              basis_scratch.values)
 
-      if components == 1
-        energy += local_value * local_value * weighted
-      else
-        for component in 1:components
-          value = local_value[component]
-          energy += value * value * weighted
-        end
+      for component in 1:components
+        value = component_values[component]
+        energy += value * value * weighted
       end
     end
 
@@ -2653,62 +2887,4 @@ function adaptivity_summary(plan::AdaptivityPlan)
           h_derefinement_cell_count=h_derefinement_cell_count,
           p_refinement_leaf_count=p_refinement_leaf_count,
           p_derefinement_leaf_count=p_derefinement_leaf_count)
-end
-
-# Direct leaf-local field evaluation used by transfer and projection indicators.
-
-# Evaluate a field directly on one compiled leaf by reconstructing its modal
-# expansion on reference coordinates. These helpers keep the transfer and
-# projection indicator code independent of the global integration machinery.
-function _transition_value(transition::SpaceTransition{D,T}, field::AbstractField, state::State{T},
-                           target_leaf::Int, x::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  leaf = _source_leaf_at_point(transition, target_leaf, x)
-  ξ = map_to_biunit_cube(domain(source_space(transition)), leaf, x)
-  return _field_value_on_leaf(field, state, leaf, ξ)
-end
-
-function _field_value_on_leaf(field::ScalarField, state::State{T}, leaf::Int,
-                              ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  return _field_component_value_on_leaf(field, state, leaf, ξ, 1)
-end
-
-function _field_value_on_leaf(field::VectorField, state::State{T}, leaf::Int,
-                              ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  return ntuple(component -> _field_component_value_on_leaf(field, state, leaf, ξ, component),
-                component_count(field))
-end
-
-function _field_component_value_on_leaf(field::AbstractField, state::State{T}, leaf::Int,
-                                        ξ::NTuple{D,<:Real},
-                                        component::Int) where {D,T<:AbstractFloat}
-  compiled = _compiled_leaf(field_space(field), leaf)
-  basis_values = ntuple(axis -> _fe_basis_values(T(ξ[axis]), compiled.degrees[axis]), D)
-  coefficients = field_component_values(state, field, component)
-  result = zero(T)
-
-  for mode_index in eachindex(compiled.local_modes)
-    mode = compiled.local_modes[mode_index]
-    shape = one(T)
-
-    for axis in 1:D
-      shape *= basis_values[axis][mode[axis]+1]
-    end
-
-    shape == zero(T) && continue
-
-    amplitude = _term_amplitude(compiled.term_offsets, compiled.term_indices,
-                                compiled.term_coefficients, compiled.single_term_indices,
-                                compiled.single_term_coefficients, coefficients, mode_index)
-    result += shape * amplitude
-  end
-
-  return result
-end
-
-function _local_mode_amplitude(field::AbstractField, state::State{T}, compiled::_CompiledLeaf,
-                               component::Int, mode_index::Int) where {T<:AbstractFloat}
-  coefficients = field_component_values(state, field, component)
-  return _term_amplitude(compiled.term_offsets, compiled.term_indices, compiled.term_coefficients,
-                         compiled.single_term_indices, compiled.single_term_coefficients,
-                         coefficients, mode_index)
 end
