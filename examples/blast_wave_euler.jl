@@ -503,37 +503,8 @@ function euler_residual_plan(field, gamma)
 end
 
 # ---------------------------------------------------------------------------
-# 4. Diagnostics, CFL control, and runtime context
+# 4. CFL control and runtime context
 # ---------------------------------------------------------------------------
-
-# These diagnostics are cheap global health checks that we print during the run:
-# minimum density, minimum pressure, total mass, total energy, and the largest
-# local characteristic speed.
-function euler_diagnostics(plan, state, field, gamma)
-  min_density = Inf
-  min_pressure = Inf
-  max_wave_speed = 0.0
-  total_mass = 0.0
-  total_energy = 0.0
-
-  for item in plan.integration.cells
-    for point_index in 1:point_count(item)
-      q = value(item, state, field, point_index)
-      rho, velocity_data, pressure_value = primitive_variables(q, gamma)
-      weighted = weight(item, point_index)
-      wave_speed = hypot(velocity_data[1], velocity_data[2]) + sqrt(gamma * pressure_value / rho)
-      min_density = min(min_density, q[1])
-      min_pressure = min(min_pressure,
-                         (gamma - 1.0) *
-                         (q[4] - 0.5 * (q[2]^2 + q[3]^2) / max(q[1], DENSITY_FLOOR)))
-      max_wave_speed = max(max_wave_speed, wave_speed)
-      total_mass += q[1] * weighted
-      total_energy += q[4] * weighted
-    end
-  end
-
-  return (; min_density, min_pressure, max_wave_speed, total_mass, total_energy)
-end
 
 # The explicit timestep estimate follows the usual DG scaling
 #
@@ -570,7 +541,7 @@ end
 
 struct CellwiseMassInverse{B,V}
   blocks::B
-  workspace::V
+  workspaces::V
 end
 
 # On a DG mesh, the mass matrix is block diagonal by cell. We exploit that
@@ -617,26 +588,34 @@ function build_cellwise_mass_inverse(plan, field)
     max_local_dofs = max(max_local_dofs, length(local_dofs))
   end
 
-  return CellwiseMassInverse(blocks, zeros(T, max_local_dofs))
+  workspaces = [zeros(T, max_local_dofs) for _ in 1:Threads.maxthreadid()]
+  return CellwiseMassInverse(blocks, workspaces)
 end
 
 # Apply the precomputed cellwise inverse to the assembled residual to obtain
-# the time derivative `dq_h/dt`.
+# the time derivative `dq_h/dt`. Each DG cell block is independent, so the
+# block solves can run in parallel as long as each worker owns its RHS buffer
+# and BLAS is kept single-threaded inside the threaded region.
 function apply_mass_inverse!(du, mass_inverse::CellwiseMassInverse, rhs)
   fill!(du, zero(eltype(du)))
+  blocks = mass_inverse.blocks
+  workspaces = mass_inverse.workspaces
 
-  for block in mass_inverse.blocks
-    local_dof_count = length(block.global_dofs)
-    local_rhs = view(mass_inverse.workspace, 1:local_dof_count)
+  Grico._with_internal_blas_threads() do
+    Threads.@threads :static for block_index in eachindex(blocks)
+      block = blocks[block_index]
+      local_dof_count = length(block.global_dofs)
+      local_rhs = view(workspaces[Threads.threadid()], 1:local_dof_count)
 
-    for local_dof in 1:local_dof_count
-      local_rhs[local_dof] = rhs[block.global_dofs[local_dof]]
-    end
+      for local_dof in 1:local_dof_count
+        local_rhs[local_dof] = rhs[block.global_dofs[local_dof]]
+      end
 
-    ldiv!(block.factorization, local_rhs)
+      ldiv!(block.factorization, local_rhs)
 
-    for local_dof in 1:local_dof_count
-      du[block.global_dofs[local_dof]] = local_rhs[local_dof]
+      for local_dof in 1:local_dof_count
+        du[block.global_dofs[local_dof]] = local_rhs[local_dof]
+      end
     end
   end
 
@@ -644,22 +623,21 @@ function apply_mass_inverse!(du, mass_inverse::CellwiseMassInverse, rhs)
 end
 
 # Bundle the runtime objects that the driver updates after each solve/adapt
-# segment. The context carries both the DG state and the cheap diagnostics
-# derived from it.
+# segment. The context carries only data needed to advance the semidiscrete
+# system; visual diagnostics are recovered from VTK output rather than from a
+# separate runtime quadrature pass.
 function blast_wave_context(conserved, state; gamma=GAMMA, cfl=CFL, degree=POLYDEG)
   spatial_plan = euler_residual_plan(conserved, gamma)
   mass_inverse = build_cellwise_mass_inverse(spatial_plan, conserved)
-  diagnostics = euler_diagnostics(spatial_plan, state, conserved, gamma)
   dt = suggest_timestep(spatial_plan, state, conserved, gamma; cfl)
   return (; domain=field_space(conserved).domain, space=field_space(conserved), conserved, gamma,
-          cfl, degree, mass_inverse, spatial_plan, state, diagnostics, dt)
+          cfl, degree, mass_inverse, spatial_plan, state, dt)
 end
 
 function refresh_blast_wave_context(context, state=context.state)
-  diagnostics = euler_diagnostics(context.spatial_plan, state, context.conserved, context.gamma)
   dt = suggest_timestep(context.spatial_plan, state, context.conserved, context.gamma;
                         cfl=context.cfl)
-  return merge(context, (; state, diagnostics, dt))
+  return merge(context, (; state, dt))
 end
 
 function build_blast_wave_euler_context(; root_counts=ROOT_COUNTS, degree=POLYDEG,
@@ -780,21 +758,12 @@ function merge_time_grids(grids...)
   return unique_times
 end
 
-sampled_conserved(values, field) = getproperty(values, field_name(field))
-
-function blast_wave_history_entry(step, time, context, initial_diagnostics)
-  diagnostics = context.diagnostics
-  mass_scale = max(abs(initial_diagnostics.total_mass), 1.0)
-  energy_scale = max(abs(initial_diagnostics.total_energy), 1.0)
+function blast_wave_history_entry(step, time, context)
   return (; step, time=Float64(time), active_leaves=active_leaf_count(context.space),
-          dofs=length(coefficients(context.state)), min_density=diagnostics.min_density,
-          min_pressure=diagnostics.min_pressure, max_wave_speed=diagnostics.max_wave_speed,
-          total_mass=diagnostics.total_mass, total_energy=diagnostics.total_energy,
-          relative_mass_drift=(diagnostics.total_mass - initial_diagnostics.total_mass) /
-                              mass_scale,
-          relative_energy_drift=(diagnostics.total_energy - initial_diagnostics.total_energy) /
-                                energy_scale)
+          dofs=length(coefficients(context.state)), dt=context.dt)
 end
+
+sampled_conserved(values, field) = getproperty(values, field_name(field))
 
 function blast_wave_adaptivity_limits(context; max_h_level=MAX_H_LEVEL)
   return AdaptivityLimits(context.space; min_p=context.degree, max_p=context.degree,
@@ -859,12 +828,8 @@ function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__
                               degree=leaf -> Float64.(cell_degrees(context.space, leaf)),
                               refinement_indicator=refinement_indicator,
                               refinement_indicator_norm=refinement_indicator_norm),
-                   field_data=(time=entry.time, min_density=entry.min_density,
-                               min_pressure=entry.min_pressure,
-                               relative_mass_drift=entry.relative_mass_drift,
-                               relative_energy_drift=entry.relative_energy_drift),
-                   subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE, append=true,
-                   compress=true, ascii=false)
+                   field_data=(time=entry.time, dt=entry.dt), subdivisions=EXPORT_SUBDIVISIONS,
+                   export_degree=EXPORT_DEGREE, append=true, compress=true, ascii=false)
 end
 
 # Print a compact run header so the solver configuration is visible without
@@ -892,13 +857,12 @@ function print_blast_wave_header(context, final_time; save_interval=SAVE_INTERVA
   @printf("  adapt tolerance    : %.2e\n", adaptivity_tolerance)
 
   @printf("  final time         : %.3f\n", final_time)
-  println("  step time leaves dofs min(rho) min(p) rel-mass rel-energy max-wave")
+  println("  step time leaves dofs dt")
 end
 
 function print_blast_wave_history_entry(entry)
-  @printf("  %4d %.3f %5d %5d %.6e %.6e %.6e %.6e %.6e\n", entry.step, entry.time,
-          entry.active_leaves, entry.dofs, entry.min_density, entry.min_pressure,
-          entry.relative_mass_drift, entry.relative_energy_drift, entry.max_wave_speed)
+  @printf("  %4d %.3f %5d %5d %.6e\n", entry.step, entry.time, entry.active_leaves, entry.dofs,
+          entry.dt)
 end
 
 # ---------------------------------------------------------------------------
@@ -911,8 +875,8 @@ end
 # 2. optional output writes, and
 # 3. optional `h`-adaptation.
 #
-# The history table printed to the terminal lets users monitor the most
-# important conservation and positivity diagnostics while the example runs.
+# The compact history table printed to the terminal tracks mesh size and the
+# active explicit timestep. Physical fields are written to VTK for inspection.
 function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
                                       quadrature_extra_points=QUADRATURE_EXTRA_POINTS, gamma=GAMMA,
                                       cfl=CFL, final_time=FINAL_TIME, save_interval=SAVE_INTERVAL,
@@ -929,11 +893,10 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
   context = build_blast_wave_euler_context(; root_counts, degree, quadrature_extra_points, gamma,
                                            cfl, initial_refinement_layers,
                                            initial_refinement_radius)
-  initial_diagnostics = context.diagnostics
   save_times = saved_times((0.0, final_time), save_interval)
   adapt_times = saved_times((0.0, final_time), adapt_interval)
   times = merge_time_grids(save_times, adapt_times)
-  history = NamedTuple[blast_wave_history_entry(0, 0.0, context, initial_diagnostics)]
+  history = NamedTuple[blast_wave_history_entry(0, 0.0, context)]
   adaptivity_history = NamedTuple[]
   segment_solutions = store_segment_solutions ? Any[] : nothing
   vtk_files = String[]
@@ -962,8 +925,7 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
     context = refresh_blast_wave_context(context, segment_state)
 
     while save_index <= length(save_times) && same_time(save_times[save_index], times[step + 1])
-      entry = blast_wave_history_entry(length(history), save_times[save_index], context,
-                                       initial_diagnostics)
+      entry = blast_wave_history_entry(length(history), save_times[save_index], context)
       push!(history, entry)
       print_summary && print_blast_wave_history_entry(entry)
       write_vtk && push!(vtk_files, write_blast_wave_vtk(context, entry; max_h_level=max_h_level))

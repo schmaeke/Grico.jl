@@ -17,9 +17,8 @@ include("../examples/blast_wave_euler.jl")
   @test extent(coarse_context.domain) == (1.0, 1.0)
   @test active_leaf_count(context.space) > active_leaf_count(coarse_context.space)
   @test length(coefficients(context.state)) > length(coefficients(coarse_context.state))
-  @test context.diagnostics.min_density > 0.0
-  @test context.diagnostics.min_pressure > 0.0
   @test context.dt > 0.0
+  @test !hasproperty(context, :diagnostics)
   @test !hasproperty(context, :mass_plan)
   @test !hasproperty(context, :mass_matrix)
   @test merge_time_grids([0.0, 0.01], [0.0, 0.005, 0.01]) ≈ [0.0, 0.005, 0.01]
@@ -47,7 +46,8 @@ include("../examples/blast_wave_euler.jl")
   @test adaptivity_entry.after_active_leaves > adaptivity_entry.before_active_leaves
   @test adaptivity_entry.h_refinement_leaf_count == plan_summary.h_refinement_leaf_count
 
-  entry = blast_wave_history_entry(0, 0.0, context, context.diagnostics)
+  entry = blast_wave_history_entry(0, 0.0, context)
+  @test entry.dt == context.dt
   mktempdir() do directory
     vtk_path = write_blast_wave_vtk(context, entry; output_directory=directory)
     @test isfile(vtk_path)
