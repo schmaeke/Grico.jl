@@ -90,18 +90,9 @@ function build_ordered_ilu_operator(matrix_data::SparseMatrixCSC{T,Int};
   return operator, nnz(factor.L) + nnz(factor.U)
 end
 
-# Load the cavity example as a reusable setup library without running its
-# top-level example driver inside this benchmark harness.
-let previous = get(ENV, "GRICO_LDC_AUTORUN", nothing)
-  ENV["GRICO_LDC_AUTORUN"] = "0"
-  include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity.jl"))
-
-  if previous === nothing
-    delete!(ENV, "GRICO_LDC_AUTORUN")
-  else
-    ENV["GRICO_LDC_AUTORUN"] = previous
-  end
-end
+# Load the benchmark-facing wrapper for the cavity example. The instructional
+# driver remains focused on the example and only runs when invoked as a script.
+include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity", "benchmarking.jl"))
 
 struct Diffusion{F}
   field::F

@@ -195,16 +195,7 @@ function _build_affine_interface_case()
                     plan, system, metadata, candidates)
 end
 
-let previous = get(ENV, "GRICO_LDC_AUTORUN", nothing)
-  ENV["GRICO_LDC_AUTORUN"] = "0"
-  include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity.jl"))
-
-  if previous === nothing
-    delete!(ENV, "GRICO_LDC_AUTORUN")
-  else
-    ENV["GRICO_LDC_AUTORUN"] = previous
-  end
-end
+include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity", "benchmarking.jl"))
 
 function _build_flow_case()
   context = build_lid_driven_cavity_context(root_counts=FLOW_ROOT_COUNTS)

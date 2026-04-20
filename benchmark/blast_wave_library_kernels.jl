@@ -3,9 +3,10 @@
 const BENCHMARK_PROJECT = @__DIR__
 const REPO_ROOT = normpath(joinpath(BENCHMARK_PROJECT, ".."))
 
-# Keep the benchmark independent of user/global environments. In particular,
-# the blast-wave example should see OrdinaryDiffEq as unavailable unless the
-# active project provides it.
+# Keep the benchmark independent of user/global environments. The benchmark
+# wrapper for the blast-wave example deliberately does not load OrdinaryDiffEq,
+# because these measurements exercise mesh, projection, residual, and adaptation
+# kernels rather than full time integration.
 empty!(LOAD_PATH)
 push!(LOAD_PATH, REPO_ROOT)
 push!(LOAD_PATH, "@stdlib")
@@ -26,8 +27,7 @@ const DEFAULT_ADVANCE_STEPS = 2
 const DEFAULT_PHASE_LABEL = "Blast-Wave Library Kernel Baseline"
 const DEFAULT_THREAD_NOTE = "Primary scaling set capped at 6 Julia threads for Apple M2 Pro performance-core runs."
 
-ENV["GRICO_BLAST_WAVE_EULER_AUTORUN"] = "0"
-include(joinpath(REPO_ROOT, "examples", "blast_wave_euler.jl"))
+include(joinpath(REPO_ROOT, "examples", "blast_wave_euler", "benchmarking.jl"))
 
 struct KernelOperation
   id::String

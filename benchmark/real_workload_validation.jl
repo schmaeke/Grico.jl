@@ -56,33 +56,21 @@ function _parse_cases(raw)
   return selected
 end
 
-function _include_example_module(module_name::Symbol, env_key::String,
-                                 relative_path::AbstractString)
-  previous = get(ENV, env_key, nothing)
-  ENV[env_key] = "0"
+function _include_example_module(module_name::Symbol, relative_path::AbstractString)
   module_object = Module(module_name)
-
-  try
-    Base.include(module_object, joinpath(REPO_ROOT, relative_path))
-  finally
-    if previous === nothing
-      delete!(ENV, env_key)
-    else
-      ENV[env_key] = previous
-    end
-  end
-
+  Base.include(module_object, joinpath(REPO_ROOT, relative_path))
   return module_object
 end
 
 const AnnularExample = _include_example_module(:RealWorkloadAnnularPlateNitsche,
-                                               "GRICO_ANNULAR_AUTORUN",
-                                               joinpath("examples", "annular_plate_nitsche.jl"))
+                                               joinpath("examples", "annular_plate_nitsche",
+                                                        "benchmarking.jl"))
 const OriginExample = _include_example_module(:RealWorkloadOriginSingularityPoisson,
-                                              "GRICO_ORIGIN_SINGULARITY_AUTORUN",
-                                              joinpath("examples", "origin_singularity_poisson.jl"))
-const LidExample = _include_example_module(:RealWorkloadLidDrivenCavity, "GRICO_LDC_AUTORUN",
-                                           joinpath("examples", "lid_driven_cavity.jl"))
+                                              joinpath("examples", "origin_singularity_poisson",
+                                                       "benchmarking.jl"))
+const LidExample = _include_example_module(:RealWorkloadLidDrivenCavity,
+                                           joinpath("examples", "lid_driven_cavity",
+                                                    "benchmarking.jl"))
 
 @inline _median(values::Vector{Float64}) = median(values)
 @inline _mib(bytes::Real) = bytes / 1024^2

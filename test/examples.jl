@@ -1,7 +1,6 @@
 using Test
 
-ENV["GRICO_BLAST_WAVE_EULER_AUTORUN"] = "0"
-include("../examples/blast_wave_euler.jl")
+include("../examples/blast_wave_euler/benchmarking.jl")
 
 @testset "Blast-Wave Euler Example" begin
   coarse_context = build_blast_wave_euler_context(; root_counts=(2, 2), degree=1,

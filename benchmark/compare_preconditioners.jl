@@ -35,18 +35,9 @@ struct SolverMeasurement
   complexity::Float64
 end
 
-# Load the cavity example as a provider of reusable setup helpers while keeping
-# its normal top-level run path disabled inside this benchmark harness.
-let previous = get(ENV, "GRICO_LDC_AUTORUN", nothing)
-  ENV["GRICO_LDC_AUTORUN"] = "0"
-  include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity.jl"))
-
-  if previous === nothing
-    delete!(ENV, "GRICO_LDC_AUTORUN")
-  else
-    ENV["GRICO_LDC_AUTORUN"] = previous
-  end
-end
+# Load the benchmark-facing wrapper for the cavity example. The instructional
+# driver remains focused on the example and only runs when invoked as a script.
+include(joinpath(REPO_ROOT, "examples", "lid_driven_cavity", "benchmarking.jl"))
 
 function _krylov_controls(system::Grico.AffineSystem)
   return (rtol=Grico._default_krylov_reltol(Float64), memory=Grico._default_gmres_restart(system),
