@@ -2,6 +2,11 @@ using Test
 
 include("../examples/blast_wave_euler/benchmarking.jl")
 
+module NewtonFractalPoissonExample
+Base.include(@__MODULE__,
+             joinpath(@__DIR__, "..", "examples", "newton_fractal_poisson", "benchmarking.jl"))
+end
+
 @testset "Blast-Wave Euler Example" begin
   coarse_context = build_blast_wave_euler_context(; root_counts=(2, 2), degree=1,
                                                   quadrature_extra_points=1, cfl=0.08,
@@ -64,5 +69,30 @@ include("../examples/blast_wave_euler/benchmarking.jl")
           result.adaptivity_history[1].before_active_leaves
     @test result.segment_solutions === nothing
     @test last(result.history).time ≈ 0.01 atol = 1.0e-12
+  end
+end
+
+@testset "Newton Fractal Poisson Example" begin
+  result = NewtonFractalPoissonExample.run_newton_fractal_poisson_example(; max_h_level=3,
+                                                                          write_vtk=false,
+                                                                          print_summary=false)
+
+  @test length(result.history) == 4
+  @test first(result.history).active_leaves == 1
+  @test last(result.history).max_h_level == 3
+  @test last(result.history).active_leaves > first(result.history).active_leaves
+  @test first(result.history).h_refinement_leaf_count > 0
+  @test any(entry -> entry.p_refinement_leaf_count > 0, result.history)
+  @test isfinite(result.final_error)
+  @test result.min_degree == NewtonFractalPoissonExample.MIN_DEGREE
+  @test result.min_degree <= result.initial_degree <= result.max_degree
+  @test length(result.model.roots) == 3
+  @test result.model.iterations == NewtonFractalPoissonExample.NEWTON_ITERATIONS
+  @test abs(result.exact_solution((0.0, 0.5))) > 1.0e-6
+  @test 1 <= NewtonFractalPoissonExample.newton_basin_index(result.model, (0.5, 0.5)) <= 3
+  @test isfinite(NewtonFractalPoissonExample.newton_source_value(result.model, (0.5, 0.5)))
+  @test_throws ArgumentError begin
+    NewtonFractalPoissonExample.build_newton_fractal_poisson_context(; min_degree=4,
+                                                                     initial_degree=3, max_degree=5)
   end
 end

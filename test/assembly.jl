@@ -778,6 +778,19 @@ end
   end
 end
 
+@testset "Dirichlet Projection Rank Tolerance" begin
+  matrix = Diagonal([300.0, 4.0e-6])
+  rhs = [0.0, 6.0e-6]
+  constraint_matrix, targets, tolerance = Grico._dirichlet_constraint_system(Matrix(matrix), rhs,
+                                                                             :u)
+  coefficients = constraint_matrix \ targets
+
+  @test tolerance < matrix[2, 2]
+  @test matrix * coefficients ≈ rhs atol = ASSEMBLY_TOL
+  @test_throws ArgumentError Grico._dirichlet_constraint_system([1.0 0.0; 0.0 0.0], [0.0, 1.0e-6],
+                                                                :u)
+end
+
 @testset "Dirichlet On Selected Refined Boundary Subset" begin
   domain = Grico.Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (3, 3, 3))
   grid = Grico.grid(domain)

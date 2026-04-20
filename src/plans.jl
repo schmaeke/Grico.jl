@@ -797,9 +797,12 @@ function _active_projection_dofs(matrix_data::SparseMatrixCSC{T,Int},
   return findall(active)
 end
 
-# Numerical rank tolerance for the boundary projection Gram matrix.
-function _boundary_projection_rank_tolerance(::Type{T}, scale::T) where {T<:AbstractFloat}
-  return sqrt(eps(T)) * max(scale, one(T))
+# Numerical rank tolerance for the boundary projection Gram matrix. The cutoff
+# should identify algebraic null modes of the trace basis, not discard small but
+# valid positive modes on deep hp boundary meshes.
+function _boundary_projection_rank_tolerance(::Type{T}, scale::T,
+                                             dimension::Integer) where {T<:AbstractFloat}
+  return 1000 * eps(T) * max(scale, one(T)) * max(Int(dimension), 1)
 end
 
 # Convert the projected boundary system to either explicitly fixed dofs or affine
@@ -880,7 +883,7 @@ function _dirichlet_constraint_system(matrix_data::AbstractMatrix{T}, rhs_data::
   eigenvalues = decomposition.values[order]
   basis = decomposition.vectors[:, order]
   scale = maximum(abs, eigenvalues; init=zero(T))
-  tolerance = _boundary_projection_rank_tolerance(T, scale)
+  tolerance = _boundary_projection_rank_tolerance(T, scale, size(matrix_data, 1))
   constraint_count = count(>(tolerance), eigenvalues)
   transformed_rhs = transpose(basis) * rhs_data
   rhs_tolerance = tolerance * max(norm(rhs_data), one(T))
