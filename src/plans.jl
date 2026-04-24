@@ -99,14 +99,8 @@ struct _FilteredKernelBatch
   operator_indices::Vector{Int}
 end
 
-struct _BatchWorkEstimate
-  cumulative_costs::Vector{Int}
-  total_cost::Int
-end
-
 struct _TraversalPlan
   cell_batches::Vector{_KernelBatch}
-  cell_affine_work_estimates::Vector{_BatchWorkEstimate}
   boundary_batches::Vector{_FilteredKernelBatch}
   interface_batches::Vector{_KernelBatch}
   surface_batches::Vector{_FilteredKernelBatch}
@@ -133,13 +127,13 @@ The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
 must be compiled.
 """
-struct AssemblyPlan{D,T<:AbstractFloat,S}
+struct AssemblyPlan{D,T<:AbstractFloat,CO<:Tuple,BO<:Tuple,IO<:Tuple,SO<:Tuple,I,S}
   layout::FieldLayout{D,T}
-  cell_operators::Tuple
-  boundary_operators::Tuple
-  interface_operators::Tuple
-  surface_operators::Tuple
-  integration
+  cell_operators::CO
+  boundary_operators::BO
+  interface_operators::IO
+  surface_operators::SO
+  integration::I
   dirichlet::_CompiledDirichlet{T}
   mean_constraints::Vector{_CompiledLinearConstraint{T}}
   constraint_masks::_ConstraintMasks{T}
@@ -175,14 +169,12 @@ compile(problem::AffineProblem) = _compile_problem_description(problem, Val(:aff
 compile(problem::ResidualProblem) = _compile_problem_description(problem, Val(:residual))
 
 function _compile_problem_description(problem::_AbstractProblem, assembly_kind)
-  return _with_internal_blas_threads() do
-    _validate_problem_data(problem)
-    data = _problem_data(problem)
-    _compile_problem(data.fields, Tuple(data.cell_operators), Tuple(data.boundary_operators),
-                     Tuple(data.interface_operators), Tuple(data.surface_operators),
-                     data.cell_quadratures, data.embedded_surfaces, data.dirichlet_constraints,
-                     data.mean_constraints, assembly_kind)
-  end
+  _validate_problem_data(problem)
+  data = _problem_data(problem)
+  return _compile_problem(data.fields, Tuple(data.cell_operators), Tuple(data.boundary_operators),
+                          Tuple(data.interface_operators), Tuple(data.surface_operators),
+                          data.cell_quadratures, data.embedded_surfaces, data.dirichlet_constraints,
+                          data.mean_constraints, assembly_kind)
 end
 
 # Main compilation pipeline from problem description to immutable plan.
@@ -230,26 +222,17 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                                                    surface_operators, integration,
                                                    compiled_dirichlet, compiled_mean_constraints,
                                                    constraint_masks)
-  return AssemblyPlan{dimension(layout),T,typeof(assembly_structure)}(layout, cell_operators,
-                                                                      boundary_operators,
-                                                                      interface_operators,
-                                                                      surface_operators,
-                                                                      integration,
-                                                                      compiled_dirichlet,
-                                                                      compiled_mean_constraints,
-                                                                      constraint_masks,
-                                                                      traversal_plan,
-                                                                      assembly_structure)
+  return AssemblyPlan(layout, cell_operators, boundary_operators, interface_operators,
+                      surface_operators, integration, compiled_dirichlet, compiled_mean_constraints,
+                      constraint_masks, traversal_plan, assembly_structure)
 end
 
-# Compile batched traversal metadata for shared-memory assembly/evaluation.
+# Compile serial traversal metadata for assembly and nonlinear evaluation.
 function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegration,
                                  boundary_operators, interface_operators, surface_operators)
   boundary_lookup = _boundary_operator_lookup(dimension, boundary_operators)
   surface_lookup = _surface_operator_lookup(integration.embedded_surfaces, surface_operators)
   cell_batches = _compile_kernel_batches(integration.cells, _cell_kernel_signature)
-  cell_affine_work_estimates = _compile_cell_affine_work_estimates(cell_batches, integration,
-                                                                   boundary_lookup, surface_lookup)
   interface_batches = isempty(interface_operators) ? _KernelBatch[] :
                       _compile_kernel_batches(integration.interfaces, _interface_kernel_signature)
   boundary_batches = isempty(boundary_operators) ? _FilteredKernelBatch[] :
@@ -261,8 +244,8 @@ function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegrati
                                               _surface_kernel_signature,
                                               surface -> _surface_operator_indices(surface_lookup,
                                                                                    surface.tag))
-  return _TraversalPlan(cell_batches, cell_affine_work_estimates, boundary_batches,
-                        interface_batches, surface_batches, boundary_lookup, surface_lookup)
+  return _TraversalPlan(cell_batches, boundary_batches, interface_batches, surface_batches,
+                        boundary_lookup, surface_lookup)
 end
 
 @inline _boundary_lookup_slot(axis::Int, side::Int) = 2 * (axis - 1) + side
@@ -304,7 +287,8 @@ function _surface_operator_lookup(surfaces, surface_operators)
   for tag in available_tags
     tag === nothing && continue
     indices = copy(wildcard)
-    append!(indices, get(tagged, tag, Int[]))
+    tagged_indices = get(tagged, tag, nothing)
+    tagged_indices === nothing || append!(indices, tagged_indices)
     lookup[tag] = indices
   end
 
@@ -334,89 +318,6 @@ function _compile_kernel_batches(items, signature_fn)
 
   return [_KernelBatch(batch_indices[index], batch_local_dofs[index])
           for index in eachindex(batch_indices)]
-end
-
-@inline _positive_work_cost(cost::Int) = max(cost, 1)
-
-function _uniform_batch_work_estimate(item_count::Int, unit_cost::Int=1)
-  unit_cost = _positive_work_cost(unit_cost)
-  return _BatchWorkEstimate(Int[], item_count * unit_cost)
-end
-
-function _weighted_batch_work_estimate(item_costs::Vector{Int})
-  isempty(item_costs) && return _BatchWorkEstimate(Int[], 0)
-  sanitized_costs = map(_positive_work_cost, item_costs)
-  first_cost = first(sanitized_costs)
-
-  if all(cost -> cost == first_cost, sanitized_costs)
-    return _uniform_batch_work_estimate(length(sanitized_costs), first_cost)
-  end
-
-  cumulative_costs = Vector{Int}(undef, length(sanitized_costs) + 1)
-  cumulative_costs[1] = 0
-  total_cost = 0
-
-  for item_index in eachindex(sanitized_costs)
-    cost = sanitized_costs[item_index]
-    total_cost += cost
-    cumulative_costs[item_index+1] = total_cost
-  end
-
-  return _BatchWorkEstimate(cumulative_costs, total_cost)
-end
-
-@inline function _local_matrix_work_cost(local_dof_count::Int, quadrature_points::Int,
-                                         operator_count::Int=1)
-  operator_count = max(operator_count, 1)
-  return _positive_work_cost(operator_count * (local_dof_count * local_dof_count +
-                                               quadrature_points * local_dof_count))
-end
-
-function _cell_affine_item_cost(cell::CellValues, leaf::_LeafIntegration, boundary_faces,
-                                embedded_surfaces, boundary_lookup, surface_lookup)
-  cost = _local_matrix_work_cost(cell.local_dof_count, point_count(cell))
-
-  for face_index in leaf.boundary_faces
-    face = @inbounds boundary_faces[face_index]
-    operator_count = length(boundary_lookup[_boundary_lookup_slot(face.axis, face.side)])
-    operator_count == 0 && continue
-    cost += _local_matrix_work_cost(face.local_dof_count, point_count(face), operator_count)
-  end
-
-  for surface_index in leaf.embedded_surfaces
-    surface = @inbounds embedded_surfaces[surface_index]
-    operator_count = length(_surface_operator_indices(surface_lookup, surface.tag))
-    operator_count == 0 && continue
-    cost += _local_matrix_work_cost(surface.local_dof_count, point_count(surface), operator_count)
-  end
-
-  return cost
-end
-
-function _compile_cell_affine_work_estimates(cell_batches::Vector{_KernelBatch},
-                                             integration::_CompiledIntegration, boundary_lookup,
-                                             surface_lookup)
-  estimates = Vector{_BatchWorkEstimate}(undef, length(cell_batches))
-  boundary_faces = integration.boundary_faces
-  embedded_surfaces = integration.embedded_surfaces
-  leaves = integration.leaves
-  cells = integration.cells
-
-  for batch_index in eachindex(cell_batches)
-    batch = cell_batches[batch_index]
-    item_costs = Vector{Int}(undef, length(batch.item_indices))
-
-    for local_index in eachindex(batch.item_indices)
-      cell_index = batch.item_indices[local_index]
-      item_costs[local_index] = _cell_affine_item_cost(cells[cell_index], leaves[cell_index],
-                                                       boundary_faces, embedded_surfaces,
-                                                       boundary_lookup, surface_lookup)
-    end
-
-    estimates[batch_index] = _weighted_batch_work_estimate(item_costs)
-  end
-
-  return estimates
 end
 
 function _compile_filtered_batches(items, signature_fn, operators_fn)
@@ -580,14 +481,15 @@ end
 # on the active trace basis `{ϕᵢ}` of the selected field and boundary set.
 function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{D,T},
                                      boundary_faces, constraints) where {D,T<:AbstractFloat}
-  selected_faces = FaceValues[]
+  selected_face_indices = Int[]
   constraint_matches = falses(length(constraints))
   component_total = component_count(slot.field)
 
-  for face in boundary_faces
+  for face_index in eachindex(boundary_faces)
+    face = boundary_faces[face_index]
     matched = _matching_dirichlets(constraints, face, component_total)
     isempty(matched) && continue
-    push!(selected_faces, face)
+    push!(selected_face_indices, face_index)
 
     for index in matched
       constraint_matches[index] = true
@@ -596,16 +498,15 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
 
   all(constraint_matches) ||
     throw(ArgumentError("Dirichlet constraint does not match any boundary face for field $(field_name(slot.field))"))
-  isempty(selected_faces) && return Int[], spzeros(T, 0, 0), T[]
+  isempty(selected_face_indices) && return Int[], spzeros(T, 0, 0), T[]
+  selected_faces = boundary_faces[selected_face_indices]
   operators = [_BoundaryContribution(constraint.boundary,
                                      _DirichletProjection(slot.field, constraint.components,
                                                           constraint.data))
                for constraint in constraints]
   ndofs = dof_count(layout)
   max_local_dofs = maximum(face.local_dof_count for face in selected_faces)
-  worker_count = min(Threads.nthreads(), length(selected_faces))
-  scratch = [_ThreadScratch(T, max_local_dofs, worker_count, worker_id)
-             for worker_id in 1:worker_count]
+  scratch = _AssemblyScratch(T, max_local_dofs)
   fixed = falses(ndofs)
   fixed_values = zeros(T, ndofs)
   pivot_rows = falses(ndofs)
@@ -613,19 +514,13 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
   boundary_batches = _compile_filtered_batches(selected_faces, _face_kernel_signature,
                                                face -> boundary_lookup[_boundary_lookup_slot(face.axis,
                                                                                              face.side)])
-  row_partition = _OwnedRowPartition(ndofs, worker_count)
   matrix_template = _compile_boundary_projection_template(T, ndofs, selected_faces, operators)
   full_matrix = _instantiate_sparse(T, matrix_template)
   rhs_data = zeros(T, ndofs)
-  matrix_accumulator = _OwnedSparseAccumulator(matrix_template.pattern, full_matrix.nzval,
-                                               row_partition)
-  rhs_accumulator = _OwnedVectorAccumulator{T}(rhs_data, row_partition)
-  _prepare_matrix_accumulator!(matrix_accumulator, scratch)
-  _prepare_vector_accumulator!(rhs_accumulator, scratch)
+  matrix_accumulator = _SparseAccumulator(matrix_template.pattern, full_matrix.nzval)
+  rhs_accumulator = _VectorAccumulator(rhs_data)
   _assemble_boundary_pass!(scratch, matrix_accumulator, rhs_accumulator, boundary_batches,
                            selected_faces, operators, fixed, fixed_values, pivot_rows)
-  _finalize_matrix_accumulator!(matrix_accumulator, scratch)
-  _finalize_vector_accumulator!(rhs_accumulator, scratch)
 
   slot_range = field_dof_range(layout, slot.field)
   slot_matrix = full_matrix[slot_range, slot_range]
@@ -648,6 +543,18 @@ end
   throw(ArgumentError("selected component $component is not part of this Dirichlet constraint"))
 end
 
+@noinline function _throw_dirichlet_data_conversion_error(value, ::Type{T}) where {T<:AbstractFloat}
+  throw(ArgumentError("Dirichlet data entries must be convertible to $T; got $(typeof(value))"))
+end
+
+function _dirichlet_data_value(value, ::Type{T}) where {T<:AbstractFloat}
+  try
+    return T(value)
+  catch
+    _throw_dirichlet_data_conversion_error(value, T)
+  end
+end
+
 function _dirichlet_component_value(data, x, component::Int, components::Tuple{Vararg{Int}},
                                     component_total::Int, ::Type{T}) where {T<:AbstractFloat}
   value = data isa Function ? data(x) : data
@@ -655,14 +562,14 @@ function _dirichlet_component_value(data, x, component::Int, components::Tuple{V
   selected_index = _selected_component_index(components, component)
 
   if value isa Tuple || value isa AbstractVector
-    length(value) == selected_total && return T(value[selected_index])
-    length(value) == component_total && return T(value[component])
+    length(value) == selected_total && return _dirichlet_data_value(value[selected_index], T)
+    length(value) == component_total && return _dirichlet_data_value(value[component], T)
     throw(ArgumentError("Dirichlet data must match the selected component count or the full field component count"))
   end
 
   selected_total == 1 ||
     throw(ArgumentError("Dirichlet data for multiple selected components must return a tuple or vector"))
-  return T(value)
+  return _dirichlet_data_value(value, T)
 end
 
 # Mean-value constraint compilation as explicit linear equations.
@@ -678,7 +585,7 @@ function _compile_mean_constraints(layout::FieldLayout{D,T}, cells,
   union!(blocked, row.pivot for row in dirichlet.rows)
   fixed_values = Dict(dirichlet.fixed_dofs[index] => dirichlet.fixed_values[index]
                       for index in eachindex(dirichlet.fixed_dofs))
-  domain_measure_value = sum(cell_volume(layout.slots[1].space.domain, cell.leaf) for cell in cells)
+  domain_measure_value = _cell_integration_measure(cells, T)
   compiled = _CompiledLinearConstraint{T}[]
   used_pivots = Set{Int}()
 
@@ -713,6 +620,18 @@ function _compile_mean_constraints(layout::FieldLayout{D,T}, cells,
   end
 
   return compiled
+end
+
+function _cell_integration_measure(cells, ::Type{T}) where {T<:AbstractFloat}
+  measure = zero(T)
+
+  for cell in cells
+    for weight_value in cell.weights
+      measure += weight_value
+    end
+  end
+
+  return measure
 end
 
 # Auxiliary operator used to assemble the boundary L² projection system for
@@ -935,9 +854,21 @@ end
 end
 
 # Interpret a scalar or vector mean target with the correct component count.
+@noinline function _throw_mean_target_conversion_error(value, ::Type{T}) where {T<:AbstractFloat}
+  throw(ArgumentError("mean target entries must be convertible to $T; got $(typeof(value))"))
+end
+
+function _mean_target_value(value, ::Type{T}) where {T<:AbstractFloat}
+  try
+    return T(value)
+  catch
+    _throw_mean_target_conversion_error(value, T)
+  end
+end
+
 function _mean_targets(target, component_total::Int, ::Type{T}) where {T<:AbstractFloat}
   if component_total == 1
-    return (T(target),)
+    return (_mean_target_value(target, T),)
   end
 
   target isa Tuple ||
@@ -945,5 +876,5 @@ function _mean_targets(target, component_total::Int, ::Type{T}) where {T<:Abstra
     throw(ArgumentError("vector-valued mean target must be a tuple or vector"))
   length(target) == component_total ||
     throw(ArgumentError("mean target must match the field component count"))
-  return ntuple(index -> T(target[index]), component_total)
+  return ntuple(index -> _mean_target_value(target[index], T), component_total)
 end

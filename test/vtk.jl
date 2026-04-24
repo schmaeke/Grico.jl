@@ -24,6 +24,7 @@ end
   @test vtk_export_supported(1)
   @test vtk_export_supported(3)
   @test !vtk_export_supported(4)
+  @test !vtk_export_supported(big(typemax(Int)) + 1)
 
   domain = Domain((0.0,), (1.0,), (1,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
@@ -63,9 +64,8 @@ end
                      cell_data=(cell_marker=[4.0], leaf_marker=leaf -> Float64(leaf),
                                 centered_cell=(leaf, x) -> leaf + x[1],
                                 contextual_cell=(leaf, x, ξ) -> leaf + x[1] + ξ[1],
-                                tuple_cell=(leaf, x) -> (Float64(leaf), x[1])),
-                     field_data=(time=1.5,), subdivisions=2, export_degree=2, append=false,
-                     ascii=true)
+                                tuple_cell=(leaf, x) -> (leaf, x[1])), field_data=(time=1.5,),
+                     subdivisions=2, export_degree=2, append=false, ascii=true)
     xml = read(path, String)
 
     @test isfile(path)
@@ -205,6 +205,11 @@ end
     @test occursin("series_0000.vtu", xml)
     @test occursin("series_0001.vtu", xml)
     @test_throws ArgumentError write_pvd(joinpath(directory, "bad.pvd"), paths; timesteps=[0.0])
+    escaped_path = write_pvd(joinpath(directory, "escaped.pvd"),
+                             [joinpath(directory, "series&a.vtu")]; timesteps=["0<1"])
+    escaped_xml = read(escaped_path, String)
+    @test occursin("timestep=\"0&lt;1\"", escaped_xml)
+    @test occursin("file=\"series&amp;a.vtu\"", escaped_xml)
 
     mesh_path = write_vtk(joinpath(directory, "series_mesh_0000"), state; mesh=true, append=false,
                           ascii=true)
@@ -223,6 +228,14 @@ end
                            append=false, ascii=true))
     @test_throws ArgumentError write_vtk(joinpath(directory, "wrongdomain"), refined_domain;
                                          state=state, append=false, ascii=true)
+    @test_throws ArgumentError write_vtk(joinpath(directory, "badfields"), domain; state=state,
+                                         fields=(1,), append=false, ascii=true)
+    @test_throws ArgumentError write_vtk(joinpath(directory, "bad_point_data"), domain;
+                                         point_data=1, append=false, ascii=true)
+    @test_throws ArgumentError write_vtk(joinpath(directory, "bad_point_name"), domain;
+                                         point_data=(1 => [1.0, 2.0],), append=false, ascii=true)
+    @test_throws ArgumentError write_vtk(joinpath(directory, "empty_tuple_data"), domain;
+                                         point_data=(empty=x -> (),), append=false, ascii=true)
     @test_throws ArgumentError write_vtk(joinpath(directory, "dup_point"), domain;
                                          point_data=["marker" => [1.0, 2.0],
                                                      "marker" => [1.0, 2.0]], append=false,

@@ -43,7 +43,7 @@ storing `Pₙ(x)`.
 function legendre_values(x::T, degree::Integer) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   values = _polynomial_output(T, n)
-  _legendre_values_and_derivatives!(x, n, values, nothing)
+  _legendre_values!(x, n, values)
   return values
 end
 
@@ -60,7 +60,7 @@ gradient evaluation on cells, faces, and embedded surfaces.
 function legendre_derivatives(x::T, degree::Integer) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   derivatives = _polynomial_output(T, n)
-  _legendre_values_and_derivatives!(x, n, nothing, derivatives)
+  _legendre_derivatives!(x, n, derivatives)
   return derivatives
 end
 
@@ -89,7 +89,7 @@ storing `ψₙ(x)`.
 function integrated_legendre_values(x::T, degree::Integer) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   values = _polynomial_output(T, n)
-  _integrated_legendre_values_and_derivatives!(x, n, values, nothing)
+  _integrated_legendre_values!(x, n, values)
   return values
 end
 
@@ -111,7 +111,7 @@ special cases beyond the two endpoint modes.
 function integrated_legendre_derivatives(x::T, degree::Integer) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   derivatives = _polynomial_output(T, n)
-  _integrated_legendre_values_and_derivatives!(x, n, nothing, derivatives)
+  _integrated_legendre_derivatives!(x, n, derivatives)
   return derivatives
 end
 
@@ -123,9 +123,10 @@ end
 Write Legendre values and/or derivatives at `x` into preallocated buffers.
 
 At least one of `values` or `derivatives` must be provided. When present, each
-buffer must have length `degree + 1`. The method signature also requires the
-buffers to have the same floating-point element type as `x`, so callers can
-reuse scratch storage in hot loops without hidden promotions or allocations.
+buffer must have length at least `degree + 1`. The method signature also
+requires the buffers to have the same floating-point element type as `x`, so
+callers can reuse scratch storage in hot loops without hidden promotions or
+allocations.
 
 The indexing convention matches [`legendre_values`](@ref): entry `n + 1`
 corresponds to polynomial degree `n`. This routine is the allocation-free core
@@ -137,7 +138,16 @@ function legendre_values_and_derivatives!(x::T, degree::Integer,
                                           derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   _check_polynomial_outputs(n, values, derivatives)
-  _legendre_values_and_derivatives!(x, n, values, derivatives)
+
+  if values === nothing
+    _legendre_derivatives!(x, n, derivatives::AbstractVector{T})
+  elseif derivatives === nothing
+    _legendre_values!(x, n, values::AbstractVector{T})
+  else
+    _legendre_values_and_derivatives!(x, n, values::AbstractVector{T},
+                                      derivatives::AbstractVector{T})
+  end
+
   return nothing
 end
 
@@ -149,8 +159,8 @@ buffers.
 
 This is the allocation-free counterpart of [`integrated_legendre_values`](@ref)
 and [`integrated_legendre_derivatives`](@ref). At least one output buffer must
-be provided, every supplied buffer must have length `degree + 1`, and the
-buffers must share the same floating-point element type as `x`.
+be provided, every supplied buffer must have length at least `degree + 1`, and
+the buffers must share the same floating-point element type as `x`.
 
 Like the nonmutating interface, the function writes the full family
 `ψ₀, …, ψ_degree` using the `n + 1 ↔ n` indexing convention.
@@ -160,7 +170,16 @@ function integrated_legendre_values_and_derivatives!(x::T, degree::Integer,
                                                      derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   _check_polynomial_outputs(n, values, derivatives)
-  _integrated_legendre_values_and_derivatives!(x, n, values, derivatives)
+
+  if values === nothing
+    _integrated_legendre_derivatives!(x, n, derivatives::AbstractVector{T})
+  elseif derivatives === nothing
+    _integrated_legendre_values!(x, n, values::AbstractVector{T})
+  else
+    _integrated_legendre_values_and_derivatives!(x, n, values::AbstractVector{T},
+                                                 derivatives::AbstractVector{T})
+  end
+
   return nothing
 end
 
@@ -174,7 +193,7 @@ end
 function _fe_basis_values(x::T, degree::Integer) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   values = _polynomial_output(T, n)
-  _fe_basis_values_and_derivatives!(x, n, values, nothing)
+  _fe_basis_values!(x, n, values)
   return values
 end
 
@@ -183,20 +202,43 @@ function _fe_basis_values_and_derivatives!(x::T, degree::Integer,
                                            derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
   x, n = _checked_polynomial_problem(x, degree)
   _check_polynomial_outputs(n, values, derivatives)
-  _fe_basis_values_and_derivatives!(x, n, values, derivatives)
+
+  if values === nothing
+    _fe_basis_derivatives!(x, n, derivatives::AbstractVector{T})
+  elseif derivatives === nothing
+    _fe_basis_values!(x, n, values::AbstractVector{T})
+  else
+    _fe_basis_values_and_derivatives!(x, n, values::AbstractVector{T},
+                                      derivatives::AbstractVector{T})
+  end
+
   return nothing
 end
 
-function _fe_basis_values_and_derivatives!(x::T, degree::Int,
-                                           values::Union{Nothing,AbstractVector{T}},
-                                           derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
-  values === nothing &&
-    derivatives === nothing &&
-    throw(ArgumentError("at least one output buffer is required"))
-
+function _fe_basis_values!(x::T, degree::Int, values::AbstractVector{T}) where {T<:AbstractFloat}
   if degree == 0
-    values === nothing || (values[1] = one(T))
-    derivatives === nothing || (derivatives[1] = zero(T))
+    values[1] = one(T)
+    return nothing
+  end
+
+  return _integrated_legendre_values!(x, degree, values)
+end
+
+function _fe_basis_derivatives!(x::T, degree::Int,
+                                derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  if degree == 0
+    derivatives[1] = zero(T)
+    return nothing
+  end
+
+  return _integrated_legendre_derivatives!(x, degree, derivatives)
+end
+
+function _fe_basis_values_and_derivatives!(x::T, degree::Int, values::AbstractVector{T},
+                                           derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  if degree == 0
+    values[1] = one(T)
+    derivatives[1] = zero(T)
     return nothing
   end
 
@@ -205,8 +247,8 @@ end
 
 # Validation and buffer checks. Dispatch already guarantees that `x` is a
 # floating-point number, and that supplied buffers share its element type. The
-# helpers below therefore only need to enforce finiteness, nonnegative degree,
-# and correct buffer lengths.
+# helpers below therefore enforce finiteness, Int-representable nonnegative
+# degree values, output presence, buffer sizes, and non-aliasing outputs.
 @inline function _checked_polynomial_problem(x::T, degree::Integer) where {T<:AbstractFloat}
   return _checked_polynomial_input(x), _checked_nonnegative(degree, "degree")
 end
@@ -216,12 +258,20 @@ end
   return x
 end
 
-# Buffer element types are enforced by method dispatch, so only lengths are
-# checked here.
+# Buffer element types are enforced by method dispatch. Aliasing is rejected
+# because the recurrence kernels use output buffers as temporary polynomial
+# storage before writing the requested family.
 @inline function _check_polynomial_outputs(degree::Int, values::Union{Nothing,AbstractVector},
                                            derivatives::Union{Nothing,AbstractVector})
+  values === nothing &&
+    derivatives === nothing &&
+    throw(ArgumentError("at least one output buffer is required"))
   values === nothing || _require_length(values, degree + 1, "values")
   derivatives === nothing || _require_length(derivatives, degree + 1, "derivatives")
+  values === nothing ||
+    derivatives === nothing ||
+    !Base.mightalias(values, derivatives) ||
+    throw(ArgumentError("values and derivatives buffers must not alias"))
   return nothing
 end
 
@@ -237,36 +287,28 @@ end
 # The implementation evaluates `P₀, P₁, …, P_degree` in one forward sweep. When
 # derivatives are requested, it differentiates the same recurrence in lockstep,
 # so values and derivatives are produced together without a second pass.
-function _legendre_values_and_derivatives!(x::T, degree::Int,
-                                           values::Union{Nothing,AbstractVector{T}},
-                                           derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
-  values === nothing &&
-    derivatives === nothing &&
-    throw(ArgumentError("at least one output buffer is required"))
-
-  # Even in the derivatives-only case, the differentiated recurrence depends on
-  # the current Legendre values. A temporary `standard_values` buffer is
-  # therefore always needed.
-  standard_values = values === nothing ? Vector{T}(undef, degree + 1) : values
-  standard_values[1] = one(T)
+function _legendre_values!(x::T, degree::Int, values::AbstractVector{T}) where {T<:AbstractFloat}
+  values[1] = one(T)
 
   if degree >= 1
-    standard_values[2] = x
+    values[2] = x
   end
 
-  # If only values are needed, the standard three-term recurrence is sufficient.
-  if derivatives === nothing
-    @inbounds for n in 2:degree
-      inv_n = inv(T(n))
-      standard_values[n+1] = T(2n - 1) * inv_n * x * standard_values[n] -
-                             T(n - 1) * inv_n * standard_values[n-1]
-    end
-    return nothing
+  @inbounds for n in 2:degree
+    inv_n = inv(T(n))
+    values[n+1] = T(2n - 1) * inv_n * x * values[n] - T(n - 1) * inv_n * values[n-1]
   end
 
+  return nothing
+end
+
+function _legendre_values_and_derivatives!(x::T, degree::Int, values::AbstractVector{T},
+                                           derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  values[1] = one(T)
   derivatives[1] = zero(T)
 
   if degree >= 1
+    values[2] = x
     derivatives[2] = one(T)
   end
 
@@ -276,8 +318,38 @@ function _legendre_values_and_derivatives!(x::T, degree::Int,
     inv_n = inv(T(n))
     first = T(2n - 1) * inv_n
     second = T(n - 1) * inv_n
-    standard_values[n+1] = first * x * standard_values[n] - second * standard_values[n-1]
-    derivatives[n+1] = first * (standard_values[n] + x * derivatives[n]) - second * derivatives[n-1]
+    values[n+1] = first * x * values[n] - second * values[n-1]
+    derivatives[n+1] = first * (values[n] + x * derivatives[n]) - second * derivatives[n-1]
+  end
+
+  return nothing
+end
+
+function _legendre_derivatives!(x::T, degree::Int,
+                                derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  derivatives[1] = zero(T)
+  degree == 0 && return nothing
+
+  derivatives[2] = one(T)
+
+  previous_previous_value = one(T)
+  previous_value = x
+  previous_previous_derivative = zero(T)
+  previous_derivative = one(T)
+
+  @inbounds for n in 2:degree
+    inv_n = inv(T(n))
+    first = T(2n - 1) * inv_n
+    second = T(n - 1) * inv_n
+    current_value = first * x * previous_value - second * previous_previous_value
+    current_derivative = first * (previous_value + x * previous_derivative) -
+                         second * previous_previous_derivative
+    derivatives[n+1] = current_derivative
+
+    previous_previous_value = previous_value
+    previous_value = current_value
+    previous_previous_derivative = previous_derivative
+    previous_derivative = current_derivative
   end
 
   return nothing
@@ -290,62 +362,69 @@ end
 # `Pₙ₋₂`, so writing from high degree down to low degree preserves the source
 # data long enough even when the caller's output buffers double as temporary
 # storage for the standard family.
-function _integrated_legendre_values_and_derivatives!(x::T, degree::Int,
-                                                      values::Union{Nothing,AbstractVector{T}},
-                                                      derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
-  values === nothing &&
-    derivatives === nothing &&
-    throw(ArgumentError("at least one output buffer is required"))
+function _integrated_legendre_values!(x::T, degree::Int,
+                                      values::AbstractVector{T}) where {T<:AbstractFloat}
+  _legendre_values!(x, degree, values)
 
-  standard_values, standard_derivatives = _integrated_legendre_standard_family(x, degree, values,
-                                                                               derivatives)
-
-  if !(values === nothing)
-    # Interior modes are normalized differences of Legendre polynomials and
-    # therefore vanish at both endpoints. The first two modes are then replaced
-    # by the endpoint trace functions `(1 ∓ x) / 2`.
-    @inbounds for n in degree:-1:2
-      values[n+1] = (standard_values[n+1] - standard_values[n-1]) / sqrt(T(4n - 2))
-    end
-
-    values[1] = T(0.5) * (one(T) - x)
-
-    if degree >= 1
-      values[2] = T(0.5) * (one(T) + x)
-    end
+  @inbounds for n in degree:-1:2
+    values[n+1] = (values[n+1] - values[n-1]) / sqrt(T(4n - 2))
   end
 
-  if !(derivatives === nothing)
-    # The same high-to-low overwrite pattern applies to the derivatives. For
-    # `n ≥ 2`, differentiating the normalized difference yields the scaled
-    # Legendre relation stated in the public docstring above.
-    @inbounds for n in degree:-1:2
-      derivatives[n+1] = (standard_derivatives[n+1] - standard_derivatives[n-1]) / sqrt(T(4n - 2))
-    end
+  values[1] = T(0.5) * (one(T) - x)
 
-    derivatives[1] = -T(0.5)
-
-    if degree >= 1
-      derivatives[2] = T(0.5)
-    end
+  if degree >= 1
+    values[2] = T(0.5) * (one(T) + x)
   end
 
   return nothing
 end
 
-# Compute the standard Legendre family into reusable temporary storage. Whenever
-# possible, the caller's output buffers are reused as that storage so the
-# integrated-family interface remains allocation-free.
-function _integrated_legendre_standard_family(x::T, degree::Int,
-                                              values::Union{Nothing,AbstractVector{T}},
-                                              derivatives::Union{Nothing,AbstractVector{T}}) where {T<:AbstractFloat}
-  standard_values = values === nothing ? Vector{T}(undef, degree + 1) : values
+function _integrated_legendre_derivatives!(x::T, degree::Int,
+                                           derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  _legendre_values!(x, degree, derivatives)
 
-  if derivatives === nothing
-    _legendre_values_and_derivatives!(x, degree, standard_values, nothing)
-    return standard_values, nothing
+  @inbounds for n in degree:-1:2
+    derivatives[n+1] = sqrt(T(2n - 1) / T(2)) * derivatives[n]
   end
 
-  _legendre_values_and_derivatives!(x, degree, standard_values, derivatives)
-  return standard_values, derivatives
+  derivatives[1] = -T(0.5)
+
+  if degree >= 1
+    derivatives[2] = T(0.5)
+  end
+
+  return nothing
+end
+
+function _integrated_legendre_values_and_derivatives!(x::T, degree::Int, values::AbstractVector{T},
+                                                      derivatives::AbstractVector{T}) where {T<:AbstractFloat}
+  _legendre_values!(x, degree, values)
+
+  # The derivative of each interior integrated mode is a scaled Legendre
+  # polynomial one degree lower. Values are overwritten afterwards from high to
+  # low, so this can safely read the standard Legendre table from `values`.
+  @inbounds for n in degree:-1:2
+    derivatives[n+1] = sqrt(T(2n - 1) / T(2)) * values[n]
+  end
+
+  derivatives[1] = -T(0.5)
+
+  if degree >= 1
+    derivatives[2] = T(0.5)
+  end
+
+  # Interior modes are normalized differences of Legendre polynomials and
+  # therefore vanish at both endpoints. The first two modes are then replaced
+  # by the endpoint trace functions `(1 ∓ x) / 2`.
+  @inbounds for n in degree:-1:2
+    values[n+1] = (values[n+1] - values[n-1]) / sqrt(T(4n - 2))
+  end
+
+  values[1] = T(0.5) * (one(T) - x)
+
+  if degree >= 1
+    values[2] = T(0.5) * (one(T) + x)
+  end
+
+  return nothing
 end

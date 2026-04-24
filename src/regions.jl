@@ -51,14 +51,16 @@ struct PhysicalDomain{D,T<:AbstractFloat,B<:Domain{D,T},R<:AbstractPhysicalRegio
   region::R
 end
 
-struct _LeafSignature{D}
+struct _LeafSignature{D,T<:AbstractFloat}
+  origin::NTuple{D,T}
+  extent::NTuple{D,T}
   root_counts::NTuple{D,Int}
   level::NTuple{D,Int}
   coordinate::NTuple{D,Int}
 end
 
-struct _QuadratureSignature{D}
-  leaf::_LeafSignature{D}
+struct _QuadratureSignature{D,T<:AbstractFloat}
+  leaf::_LeafSignature{D,T}
   quadrature_shape::NTuple{D,Int}
 end
 
@@ -69,28 +71,30 @@ Implicit physical region described by a classifier in physical coordinates.
 
 The classifier uses the finite-cell sign convention
 
-  classifier(x) ≤ 0  inside,
+  classifier(x) < 0  inside,
+  classifier(x) = 0  boundary,
   classifier(x) > 0  outside.
 
-`ImplicitRegion` caches leaf classifications and cut-cell quadratures by the
-stable logical signature of each background cell. Reusing the same region object
-across copied or adaptively rebuilt domains therefore also reuses those caches.
-For codimension-0 integration, cells with only measure-zero contact to the
-physical region are classified as outside so the active-leaf set remains a true
-volume discretization.
+Boolean classifiers are also accepted: `true` means inside and `false` means
+outside. `ImplicitRegion` caches leaf classifications and cut-cell quadratures
+by a geometry-aware signature of each background cell. Reusing the same region
+object across copied or adaptively rebuilt domains therefore also reuses those
+caches, while domains with different physical boxes get independent cache
+entries. For codimension-0 integration, cells with only measure-zero contact to
+the physical region are classified as outside so the active-leaf set remains a
+true volume discretization.
 """
-mutable struct ImplicitRegion{F} <: AbstractPhysicalRegion
+struct ImplicitRegion{F} <: AbstractPhysicalRegion
   classifier::F
   subdivision_depth::Int
   leaf_classification_cache::Dict{_LeafSignature,Symbol}
   cut_quadrature_cache::Dict{_QuadratureSignature,AbstractQuadrature}
-  lock::ReentrantLock
 end
 
 function ImplicitRegion(classifier; subdivision_depth::Integer=2)
   checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
   return ImplicitRegion(classifier, checked_depth, Dict{_LeafSignature,Symbol}(),
-                        Dict{_QuadratureSignature,AbstractQuadrature}(), ReentrantLock())
+                        Dict{_QuadratureSignature,AbstractQuadrature}())
 end
 
 grid(domain::PhysicalDomain) = grid(domain.background)
@@ -111,8 +115,8 @@ end
 
 @inline function _leaf_signature(domain::AbstractDomain{D}, leaf::Int) where {D}
   grid_data = grid(domain)
-  return _LeafSignature(root_cell_counts(grid_data), level(grid_data, leaf),
-                        logical_coordinate(grid_data, leaf))
+  return _LeafSignature(origin(domain), extent(domain), root_cell_counts(grid_data),
+                        level(grid_data, leaf), logical_coordinate(grid_data, leaf))
 end
 
 @inline function _quadrature_signature(domain::AbstractDomain{D}, leaf::Int,
@@ -121,28 +125,20 @@ end
 end
 
 function _cached_leaf_classification(region::ImplicitRegion, signature)
-  lock(region.lock) do
-    return get(region.leaf_classification_cache, signature, nothing)
-  end
+  return get(region.leaf_classification_cache, signature, nothing)
 end
 
 function _store_leaf_classification!(region::ImplicitRegion, signature, classification::Symbol)
-  lock(region.lock) do
-    region.leaf_classification_cache[signature] = classification
-  end
+  region.leaf_classification_cache[signature] = classification
   return classification
 end
 
 function _cached_cut_quadrature(region::ImplicitRegion, signature)
-  lock(region.lock) do
-    return get(region.cut_quadrature_cache, signature, nothing)
-  end
+  return get(region.cut_quadrature_cache, signature, nothing)
 end
 
 function _store_cut_quadrature!(region::ImplicitRegion, signature, quadrature)
-  lock(region.lock) do
-    region.cut_quadrature_cache[signature] = quadrature
-  end
+  region.cut_quadrature_cache[signature] = quadrature
   return quadrature
 end
 
@@ -232,8 +228,12 @@ leaf defined by `classifier`.
 
 The classifier is evaluated in physical coordinates and follows the convention
 
-  classifier(x) ≤ 0  inside,
+  classifier(x) < 0  inside,
+  classifier(x) = 0  boundary,
   classifier(x) > 0  outside.
+
+Boolean classifiers are interpreted as indicator functions: `true` means inside
+and `false` means outside.
 
 If the leaf is fully outside, the result is `nothing`. If it is fully inside,
 the result is the ordinary tensor-product rule corresponding to
@@ -289,38 +289,20 @@ end
   return ntuple(axis -> T(0.5) * (first_point[axis] + second_point[axis]), D)
 end
 
+@inline function _subcell_corner_count(::Val{D}) where {D}
+  D < Sys.WORD_SIZE - 1 || throw(ArgumentError("subcell corner count must be Int-representable"))
+  return 1 << D
+end
+
+@inline _subcell_sample_count(::Val{D}) where {D} = _subcell_corner_count(Val(D)) + 1
+
 function _collect_finite_cell_candidates!(points::Vector{NTuple{D,T}}, weights::Vector{T},
                                           domain::Domain{D,T}, leaf::Int, classifier,
                                           base_quadrature::TensorQuadrature{D,T},
                                           lower::NTuple{D,T}, upper::NTuple{D,T},
                                           max_depth::Int) where {D,T<:AbstractFloat}
-  if max_depth == 0 || Threads.nthreads() == 1
-    _collect_finite_cell_candidates_recursive!(points, weights, domain, leaf, classifier,
-                                               base_quadrature, lower, upper, 0, max_depth)
-    return nothing
-  end
-
-  midpoint = _subcell_midpoint(lower, upper, T)
-  child_total = 1 << D
-  child_points = [NTuple{D,T}[] for _ in 1:child_total]
-  child_weights = [T[] for _ in 1:child_total]
-
-  _run_chunks!(child_total) do first_child, last_child
-    for child_index in first_child:last_child
-      child_mask = child_index - 1
-      child_lower, child_upper = _subcell_child_bounds(lower, midpoint, upper, child_mask)
-      _collect_finite_cell_candidates_recursive!(child_points[child_index],
-                                                 child_weights[child_index], domain, leaf,
-                                                 classifier, base_quadrature, child_lower,
-                                                 child_upper, 1, max_depth)
-    end
-  end
-
-  for child_index in 1:child_total
-    append!(points, child_points[child_index])
-    append!(weights, child_weights[child_index])
-  end
-
+  _collect_finite_cell_candidates_recursive!(points, weights, domain, leaf, classifier,
+                                             base_quadrature, lower, upper, 0, max_depth)
   return nothing
 end
 
@@ -347,8 +329,9 @@ function _collect_finite_cell_candidates_recursive!(points::Vector{NTuple{D,T}},
   end
 
   midpoint = _subcell_midpoint(lower, upper, T)
+  corner_count = _subcell_corner_count(Val(D))
 
-  for child_mask in 0:((1<<D)-1)
+  for child_mask in 0:(corner_count-1)
     child_lower, child_upper = _subcell_child_bounds(lower, midpoint, upper, child_mask)
     _collect_finite_cell_candidates_recursive!(points, weights, domain, leaf, classifier,
                                                base_quadrature, child_lower, child_upper, depth + 1,
@@ -387,27 +370,24 @@ end
 function _finite_cell_moment_matrix(points::Vector{NTuple{D,T}}, degrees::NTuple{D,Int},
                                     modes::Vector{NTuple{D,Int}}) where {D,T<:AbstractFloat}
   matrix = Matrix{T}(undef, length(modes), length(points))
-  worker_count = max(1, min(Threads.nthreads(), length(points)))
-  axis_buffers = [ntuple(axis -> Vector{T}(undef, degrees[axis] + 1), D) for _ in 1:worker_count]
+  axis_buffers = ntuple(axis -> Vector{T}(undef, degrees[axis] + 1), D)
 
-  _run_chunks_with_scratch!(axis_buffers, length(points)) do buffers, first_point, last_point
-    for point_index in first_point:last_point
-      point_data = points[point_index]
+  for point_index in eachindex(points)
+    point_data = points[point_index]
 
-      for axis in 1:D
-        legendre_values_and_derivatives!(point_data[axis], degrees[axis], buffers[axis], nothing)
+    for axis in 1:D
+      _legendre_values!(point_data[axis], degrees[axis], axis_buffers[axis])
+    end
+
+    for mode_index in eachindex(modes)
+      mode = modes[mode_index]
+      value = one(T)
+
+      @inbounds for axis in 1:D
+        value *= axis_buffers[axis][mode[axis]+1]
       end
 
-      for mode_index in eachindex(modes)
-        mode = modes[mode_index]
-        value = one(T)
-
-        @inbounds for axis in 1:D
-          value *= buffers[axis][mode[axis]+1]
-        end
-
-        matrix[mode_index, point_index] = value
-      end
+      matrix[mode_index, point_index] = value
     end
   end
 
@@ -563,8 +543,9 @@ function _subcell_sample_extrema(domain::AbstractDomain{D,T}, leaf::Int, classif
                                  ::Type{T}) where {D,T<:AbstractFloat}
   minimum_value = typemax(T)
   maximum_value = typemin(T)
+  corner_count = _subcell_corner_count(Val(D))
 
-  for corner_mask in 0:((1<<D)-1)
+  for corner_mask in 0:(corner_count-1)
     ξ = _subcell_corner(lower, upper, corner_mask)
     value = classifier_value(classifier, map_from_biunit_cube(domain, leaf, ξ), T)
     minimum_value = min(minimum_value, value)
@@ -580,16 +561,17 @@ end
 
 # The subcell classifier samples corners plus the midpoint. This is a compact
 # heuristic rather than an exact geometric predicate, but it is consistent with
-# the later candidate generation: strictly negative samples provide physical
-# volume evidence, strictly positive samples provide outside evidence, and pure
-# zero-contact subcells are treated as outside so the active set remains a
-# codimension-0 volume discretization.
+# the later candidate generation: negative samples provide physical volume
+# evidence, positive samples provide outside evidence, and pure zero-contact
+# subcells are treated as outside so the active set remains a codimension-0
+# volume discretization.
 function _classify_subcell(domain::AbstractDomain{D,T}, leaf::Int, classifier, lower::NTuple{D,T},
                            upper::NTuple{D,T}, ::Type{T}) where {D,T<:AbstractFloat}
   has_negative = false
   has_positive = false
+  corner_count = _subcell_corner_count(Val(D))
 
-  for corner_mask in 0:((1<<D)-1)
+  for corner_mask in 0:(corner_count-1)
     ξ = _subcell_corner(lower, upper, corner_mask)
     value = _classifier_value(classifier, map_from_biunit_cube(domain, leaf, ξ), T)
     has_negative |= value < zero(T)
@@ -601,8 +583,8 @@ function _classify_subcell(domain::AbstractDomain{D,T}, leaf::Int, classifier, l
   has_negative |= center_value < zero(T)
   has_positive |= center_value > zero(T)
 
-  !has_positive && return :inside
   !has_negative && return :outside
+  !has_positive && return :inside
   return :cut
 end
 
@@ -622,7 +604,7 @@ function _append_subcell_quadrature!(points::Vector{NTuple{D,T}}, weights::Vecto
     ξ = ntuple(axis -> muladd(half_size[axis], η[axis], center[axis]), D)
 
     if filter_points
-      _classifier_value(classifier, map_from_biunit_cube(domain, leaf, ξ), T) <= zero(T) || continue
+      _classifier_value(classifier, map_from_biunit_cube(domain, leaf, ξ), T) < zero(T) || continue
     end
 
     push!(points, ξ)
@@ -645,7 +627,7 @@ function _append_subcell_sample_fallback!(points::Vector{NTuple{D,T}}, weights::
                                           domain::AbstractDomain{D,T}, leaf::Int, classifier,
                                           lower::NTuple{D,T}, upper::NTuple{D,T},
                                           ::Type{T}) where {D,T<:AbstractFloat}
-  sample_total = (1 << D) + 1
+  sample_total = _subcell_sample_count(Val(D))
   sample_weight = prod(ntuple(axis -> upper[axis] - lower[axis], D)) / sample_total
   center = _subcell_midpoint(lower, upper, T)
 
@@ -654,7 +636,9 @@ function _append_subcell_sample_fallback!(points::Vector{NTuple{D,T}}, weights::
     push!(weights, sample_weight)
   end
 
-  for corner_mask in 0:((1<<D)-1)
+  corner_count = _subcell_corner_count(Val(D))
+
+  for corner_mask in 0:(corner_count-1)
     ξ = _subcell_corner(lower, upper, corner_mask)
     _classifier_value(classifier, map_from_biunit_cube(domain, leaf, ξ), T) < zero(T) || continue
     push!(points, ξ)

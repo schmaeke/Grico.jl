@@ -33,12 +33,20 @@ end
 
 function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
                                       cell_quadratures) where {D,T<:AbstractFloat}
-  overrides = Dict{Int,AbstractQuadrature{D,T}}()
   space = layout.slots[1].space
+  grid_data = grid(space)
+  domain_data = domain(space)
+  overrides = Dict{Int,AbstractQuadrature{D}}()
 
-  if extra > 0
+  if extra == 0
+    for (leaf, quadrature) in _automatic_cell_quadrature_overrides(layout)
+      overrides[leaf] = quadrature
+    end
+  else
     for leaf in active_leaves(space)
-      overrides[leaf] = TensorQuadrature(T, _verification_quadrature_shape(layout, leaf, extra))
+      shape = _verification_quadrature_shape(layout, leaf, extra)
+      quadrature = _default_cell_quadrature(domain_data, leaf, shape)
+      overrides[leaf] = quadrature === nothing ? TensorQuadrature(T, shape) : quadrature
     end
   end
 
@@ -47,9 +55,17 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
   for attachment in cell_quadratures
     attachment isa Pair ||
       throw(ArgumentError("cell quadratures must be provided as leaf => quadrature pairs"))
-    checked_leaf = Int(attachment.first)
+    attachment.first isa Integer || throw(ArgumentError("cell quadrature leaf must be an integer"))
+    attachment.second isa AbstractQuadrature ||
+      throw(ArgumentError("cell quadrature value must be an AbstractQuadrature"))
+    checked_leaf = _checked_cell(grid_data, attachment.first)
+    _checked_active_leaf_index(grid_data, space.leaf_to_index, checked_leaf,
+                               "verification cell quadrature")
     !(checked_leaf in explicit_overrides) ||
       throw(ArgumentError("duplicate verification cell quadrature attachment for leaf $checked_leaf"))
+    dimension(attachment.second) == D ||
+      throw(ArgumentError("verification cell quadrature dimension must match the space dimension"))
+    _check_reference_quadrature(attachment.second)
     push!(explicit_overrides, checked_leaf)
     overrides[checked_leaf] = attachment.second
   end
@@ -57,22 +73,17 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
   return overrides
 end
 
-# Build the cell-evaluation data used for verification. By default the routine
-# reuses the compiled cell quadratures from the field layout, but users may
-# request a uniformly enriched quadrature rule via `extra_points` or override
-# individual leaves explicitly through `cell_quadratures`. This is useful when
-# the verification integral should be more accurate than the quadrature that was
-# chosen for assembly.
+# Build the cell-evaluation data used for verification. By default this uses
+# the layout's normal cell quadrature, including domain-specific physical-cell
+# overrides. Users may request a uniformly enriched quadrature rule via
+# `extra_points` or override individual leaves explicitly through
+# `cell_quadratures`. This is useful when the verification integral should be
+# more accurate than the quadrature that was chosen for assembly.
 function _rebuild_verification_cells(layout::FieldLayout{D,T}; extra_points::Integer=0,
                                      cell_quadratures=()) where {D,T<:AbstractFloat}
   extra = _checked_verification_extra(extra_points)
-
-  if extra == 0 && isempty(cell_quadratures)
-    return _compile_integration(layout).cells
-  end
-
   overrides = _verification_cell_overrides(layout, extra, cell_quadratures)
-  return _compile_integration(layout, [leaf => quadrature for (leaf, quadrature) in overrides]).cells
+  return _compile_cells(layout, overrides)
 end
 
 # Decide which compiled cell data to use for the verification integral. If the
@@ -111,8 +122,12 @@ function _verification_component_value(data, x, component::Int, component_total:
   value = _verification_reference_value(data, x)
 
   if component_total == 1
-    value isa Tuple && return T(value[1])
-    value isa AbstractVector && return T(value[1])
+    if value isa Tuple || value isa AbstractVector
+      length(value) == 1 ||
+        throw(ArgumentError("scalar reference data must be scalar or contain exactly one value"))
+      return T(value[1])
+    end
+
     return T(value)
   end
 
@@ -125,27 +140,6 @@ function _verification_component_value(data, x, component::Int, component_total:
   throw(ArgumentError("vector-valued reference data must return a tuple or vector"))
 end
 
-# Reconstruct one field component at one quadrature point from the cached local
-# basis values and the global coefficient vector. This is the same modal
-# evaluation pattern used elsewhere in the library, but restricted to the data
-# needed for norm computation.
-function _component_value_at_point(data::_FieldValues{D,T}, coefficients::AbstractVector{T},
-                                   component::Int, point_index::Int) where {D,T<:AbstractFloat}
-  result = zero(T)
-
-  @inbounds for mode_index in 1:data.local_mode_count
-    shape = data.values[mode_index, point_index]
-    shape == zero(T) && continue
-    local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(data.term_offsets, data.term_indices, data.term_coefficients,
-                                data.single_term_indices, data.single_term_coefficients,
-                                coefficients, local_dof)
-    result += shape * amplitude
-  end
-
-  return result
-end
-
 # Accumulation of absolute and relative `L2` error components.
 
 # Accumulate the numerator and denominator of the relative `L2` error,
@@ -154,43 +148,33 @@ end
 #
 # over all active cells. Scalar and vector fields are both reduced to sums over
 # components, so the norm is the standard Euclidean field norm integrated over
-# the domain. Thread-local partial sums avoid synchronization inside the cell
-# loop.
+# the domain.
 function _l2_error_components(cells, state::State{T}, field::AbstractField,
                               exact) where {T<:AbstractFloat}
   isempty(cells) && return zero(T), zero(T)
   state_coefficients = coefficients(state)
   component_total = component_count(field)
-  worker_count = max(1, min(Threads.nthreads(), length(cells)))
-  thread_totals = [zeros(T, 2) for _ in 1:worker_count]
+  numerator = zero(T)
+  denominator = zero(T)
 
-  _run_chunks_with_scratch!(thread_totals, length(cells)) do totals, first_cell, last_cell
-    numerator = zero(T)
-    denominator = zero(T)
+  for cell in cells
+    data = _field_values(cell, field)
 
-    for cell_index in first_cell:last_cell
-      cell = cells[cell_index]
-      data = _field_values(cell, field)
+    @inbounds for point_index in 1:point_count(cell)
+      x = cell.points[point_index]
+      weighted = cell.weights[point_index]
 
-      @inbounds for point_index in 1:point_count(cell)
-        x = cell.points[point_index]
-        weighted = cell.weights[point_index]
-
-        for component in 1:component_total
-          approximate = _component_value_at_point(data, state_coefficients, component, point_index)
-          reference = _verification_component_value(exact, x, component, component_total, T)
-          difference = approximate - reference
-          numerator += difference * difference * weighted
-          denominator += reference * reference * weighted
-        end
+      for component in 1:component_total
+        approximate = _field_value_component(data, state_coefficients, component, point_index)
+        reference = _verification_component_value(exact, x, component, component_total, T)
+        difference = approximate - reference
+        numerator += difference * difference * weighted
+        denominator += reference * reference * weighted
       end
     end
-
-    totals[1] += numerator
-    totals[2] += denominator
   end
 
-  return sum(totals[1] for totals in thread_totals), sum(totals[2] for totals in thread_totals)
+  return numerator, denominator
 end
 
 function _verification_l2_components(state::State{T}, field::AbstractField, exact, plan;

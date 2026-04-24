@@ -20,6 +20,25 @@ function _integrated_polynomial_value_allocation(values)
   return nothing
 end
 
+function _polynomial_derivative_allocation(derivatives)
+  Grico.legendre_values_and_derivatives!(0.25, 5, nothing, derivatives)
+  Grico.integrated_legendre_values_and_derivatives!(0.25, 5, nothing, derivatives)
+  return nothing
+end
+
+function _polynomial_kernel_allocation(values, derivatives)
+  Grico._legendre_values!(0.25, 5, values)
+  Grico._legendre_derivatives!(0.25, 5, derivatives)
+  Grico._legendre_values_and_derivatives!(0.25, 5, values, derivatives)
+  Grico._integrated_legendre_values!(0.25, 5, values)
+  Grico._integrated_legendre_derivatives!(0.25, 5, derivatives)
+  Grico._integrated_legendre_values_and_derivatives!(0.25, 5, values, derivatives)
+  Grico._fe_basis_values!(0.25, 5, values)
+  Grico._fe_basis_derivatives!(0.25, 5, derivatives)
+  Grico._fe_basis_values_and_derivatives!(0.25, 5, values, derivatives)
+  return nothing
+end
+
 function _integrate_monomial(rule, degree::Int)
   value = 0.0
 
@@ -80,17 +99,31 @@ _quadrature_tolerance(::Type{Float64}) = 1.0e-12
   Grico.legendre_values_and_derivatives!(0.5f0, 2, values, derivatives)
   @test values ≈ Float32[1.0, 0.5, -0.125] atol = 1.0f-6
   @test derivatives ≈ Float32[0.0, 1.0, 1.5] atol = 1.0f-6
+  derivative_only = zeros(Float64, 3)
+  Grico.legendre_values_and_derivatives!(0.5, 2, nothing, derivative_only)
+  @test derivative_only ≈ [0.0, 1.0, 1.5] atol = TOL
+  Grico.integrated_legendre_values_and_derivatives!(0.0, 2, nothing, derivative_only)
+  @test derivative_only ≈ [-0.5, 0.5, 0.0] atol = TOL
 
   _polynomial_eval_allocation()
   alloc_values = zeros(Float64, 6)
   alloc_derivatives = zeros(Float64, 6)
   _polynomial_eval_allocation(alloc_values, alloc_derivatives)
   _integrated_polynomial_value_allocation(alloc_values)
+  _polynomial_derivative_allocation(alloc_derivatives)
+  _polynomial_kernel_allocation(alloc_values, alloc_derivatives)
   @test @allocated(_polynomial_eval_allocation(alloc_values, alloc_derivatives)) == 0
   @test @allocated(_integrated_polynomial_value_allocation(alloc_values)) == 0
+  @test @allocated(_polynomial_derivative_allocation(alloc_derivatives)) == 0
+  @test @allocated(_polynomial_kernel_allocation(alloc_values, alloc_derivatives)) == 0
   @test_throws MethodError Grico.legendre_values_and_derivatives!(0.5, 2, values, derivatives)
+  aliased = zeros(Float64, 3)
+  @test_throws ArgumentError Grico.legendre_values_and_derivatives!(0.5, 2, aliased, aliased)
+  @test_throws ArgumentError Grico.integrated_legendre_values_and_derivatives!(0.5, 2, aliased,
+                                                                               aliased)
 
   @test_throws ArgumentError Grico.legendre_values(0.0, -1)
+  @test_throws ArgumentError Grico.legendre_values(0.0, big(typemax(Int)) + 1)
   @test_throws ArgumentError Grico.integrated_legendre_values(0.0, -1)
   @test_throws ArgumentError Grico.legendre_values(Inf, 2)
   @test_throws ArgumentError Grico.legendre_derivatives(NaN, 2)
@@ -131,6 +164,11 @@ end
   @test Grico.basis_mode_count(Grico.TrunkBasis(), (1, 3)) ==
         length(collect(Grico.basis_modes(Grico.TrunkBasis(), (1, 3))))
 
+  trunk_ordered = collect(Grico.basis_modes(Grico.TrunkBasis(), (4, 3, 2)))
+  full_ordered = collect(Grico.basis_modes(Grico.FullTensorBasis(), (4, 3, 2)))
+  @test trunk_ordered ==
+        filter(mode -> Grico.is_active_mode(Grico.TrunkBasis(), (4, 3, 2), mode), full_ordered)
+
   for (basis, degrees) in ((Grico.FullTensorBasis(), (4,)), (Grico.FullTensorBasis(), (2, 3, 1)),
                            (Grico.TrunkBasis(), (3, 3)), (Grico.TrunkBasis(), (3, 2, 1, 2)))
     iterator = Grico.basis_modes(basis, degrees)
@@ -138,6 +176,19 @@ end
     @test length(iterator) == length(collected)
     @test Grico.basis_mode_count(basis, degrees) == length(collected)
   end
+
+  oversized_mode = (big(typemax(Int)) + 1,)
+  @test !Grico.is_active_mode(Grico.FullTensorBasis(), (2,), oversized_mode)
+  @test !Grico.is_active_mode(Grico.TrunkBasis(), (2,), oversized_mode)
+  @test !Grico.is_active_mode(Grico.TrunkBasis(), (typemax(Int) - 1, typemax(Int) - 1),
+                              (typemax(Int) - 1, typemax(Int) - 1))
+  @test_throws ArgumentError Grico.basis_modes(Grico.FullTensorBasis(), ())
+  @test_throws ArgumentError Grico.basis_mode_count(Grico.TrunkBasis(), ())
+  @test_throws ArgumentError Grico.is_active_mode(Grico.FullTensorBasis(), (), ())
+  @test_throws ArgumentError Grico.basis_mode_count(Grico.FullTensorBasis(), (typemax(Int),))
+  @test_throws ArgumentError Grico.basis_modes(Grico.FullTensorBasis(), (typemax(Int),))
+  @test_throws ArgumentError Grico.basis_mode_count(Grico.TrunkBasis(), (typemax(Int),))
+  @test_throws ArgumentError Grico.basis_modes(Grico.TrunkBasis(), (typemax(Int),))
 end
 
 @testset "Quadrature" begin
@@ -146,6 +197,15 @@ end
   @test Grico.point_count(rule) == 3
   @test Grico.gauss_legendre_exact_degree(3) == 5
   @test Grico.minimum_gauss_legendre_points(5) == 3
+  @test Grico.gauss_legendre_exact_degree(typemax(Int) ÷ 2 + 1) == typemax(Int)
+  @test Grico.minimum_gauss_legendre_points(typemax(Int)) == typemax(Int) ÷ 2 + 1
+  @test_throws ArgumentError Grico.gauss_legendre_exact_degree(typemax(Int) ÷ 2 + 2)
+  @test_throws ArgumentError Grico.minimum_gauss_legendre_points(big(typemax(Int)) + 1)
+
+  manual_rule = Grico.GaussLegendreRule([0.0], [2.0])
+  @test manual_rule isa Grico.GaussLegendreRule{Float64}
+  @test Grico.point(manual_rule, 1) == (0.0,)
+  @test Grico.weight(manual_rule, 1) == 2.0
 
   for degree in 0:5
     @test _integrate_monomial(rule, degree) ≈ _exact_interval_monomial(degree) atol = 1.0e-12

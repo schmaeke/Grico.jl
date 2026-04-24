@@ -1,10 +1,53 @@
 using Test
+using LinearAlgebra
+using Printf
+using Grico
+import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!,
+              interface_residual!
 
-include("../examples/blast_wave_euler/benchmarking.jl")
+function _active_project_has_dependency(name::AbstractString)
+  project = Base.active_project()
+  project === nothing && return false
+  in_deps = false
+
+  for raw_line in eachline(project)
+    line = strip(first(split(raw_line, '#'; limit=2)))
+    isempty(line) && continue
+
+    if startswith(line, "[") && endswith(line, "]")
+      in_deps = line == "[deps]"
+      continue
+    end
+
+    in_deps && startswith(line, name * " ") && occursin("=", line) && return true
+  end
+
+  return false
+end
+
+const ORDINARYDIFFEQ_AVAILABLE = if _active_project_has_dependency("OrdinaryDiffEq")
+  try
+    @eval import OrdinaryDiffEq
+    true
+  catch
+    false
+  end
+else
+  false
+end
+
+const BLAST_WAVE_EXAMPLE_DIR = joinpath(@__DIR__, "..", "examples", "blast_wave_euler")
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "parameters.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "euler_physics.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "projection.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "dg_residual.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "runtime_context.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "output.jl"))
+include(joinpath(BLAST_WAVE_EXAMPLE_DIR, "time_driver.jl"))
 
 module NewtonFractalPoissonExample
 Base.include(@__MODULE__,
-             joinpath(@__DIR__, "..", "examples", "newton_fractal_poisson", "benchmarking.jl"))
+             joinpath(@__DIR__, "..", "examples", "newton_fractal_poisson", "driver.jl"))
 end
 
 @testset "Blast-Wave Euler Example" begin

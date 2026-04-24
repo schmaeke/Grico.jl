@@ -88,10 +88,8 @@ struct UniformDegree <: AbstractDegreePolicy
   # Degree policies permit zero so DG spaces can represent piecewise constants.
   # The later `HpSpace` compilation step enforces that continuous axes still use
   # degree at least one.
-  UniformDegree(degree::Int) = new(_checked_nonnegative(degree, "degree"))
+  UniformDegree(degree::Integer) = new(_checked_nonnegative(degree, "degree"))
 end
-
-UniformDegree(degree::Integer) = UniformDegree(Int(degree))
 
 """
     AxisDegrees(degrees)
@@ -106,12 +104,10 @@ degree pattern on every cell.
 struct AxisDegrees{D} <: AbstractDegreePolicy
   degrees::NTuple{D,Int}
 
-  AxisDegrees{D}(degrees::NTuple{D,Int}) where {D} = new{D}(_checked_degree_tuple(degrees))
+  AxisDegrees{D}(degrees::NTuple{D,<:Integer}) where {D} = new{D}(_checked_degree_tuple(degrees))
 end
 
-function AxisDegrees(degrees::NTuple{D,<:Integer}) where {D}
-  return AxisDegrees{D}(ntuple(axis -> Int(degrees[axis]), D))
-end
+AxisDegrees(degrees::NTuple{D,<:Integer}) where {D} = AxisDegrees{D}(degrees)
 
 """
     ByLeafDegrees(f)
@@ -158,10 +154,10 @@ cells still receive a valid quadrature rule.
 struct DegreePlusQuadrature <: AbstractQuadraturePolicy
   extra_points::Int
 
-  DegreePlusQuadrature(extra_points::Int) = new(_checked_nonnegative(extra_points, "extra_points"))
+  function DegreePlusQuadrature(extra_points::Integer)
+    new(_checked_nonnegative(extra_points, "extra_points"))
+  end
 end
-
-DegreePlusQuadrature(extra_points::Integer) = DegreePlusQuadrature(Int(extra_points))
 
 """
     SpaceOptions(; basis=TrunkBasis(), degree=UniformDegree(1),
@@ -290,26 +286,20 @@ end
 #    the quadrature requirements induced by the quadrature policy.
 function HpSpace(domain::AbstractDomain{D,T},
                  options::SpaceOptions=SpaceOptions()) where {D,T<:AbstractFloat}
-  active = _domain_active_leaves(domain)
-  raw_degree_policy = StoredDegrees(domain, options.degree, active)
+  compiled_domain = copy(domain)
+  active = _domain_active_leaves(compiled_domain)
   continuity_policy = _normalized_continuity_policy(options.continuity, Val(D))
-  checked_leaf_degrees = Vector{NTuple{D,Int}}(undef, length(raw_degree_policy.data))
-
-  for index in eachindex(raw_degree_policy.data)
-    checked_leaf_degrees[index] = _checked_space_degree_tuple(raw_degree_policy.data[index],
-                                                              continuity_policy,
-                                                              "leaf_degrees[$index]")
-  end
-
-  degree_policy = StoredDegrees{D}(raw_degree_policy.leaf_to_index, checked_leaf_degrees)
-  active, leaf_to_index, compiled, scalar_dofs, global_quadrature_shape = _compile_space_data(domain,
+  degree_policy = _space_degrees(compiled_domain, options.degree, active, continuity_policy)
+  active, leaf_to_index, compiled, scalar_dofs, global_quadrature_shape = _compile_space_data(compiled_domain,
                                                                                               active,
+                                                                                              degree_policy.leaf_to_index,
                                                                                               options.basis,
                                                                                               degree_policy.data,
                                                                                               continuity_policy,
                                                                                               options.quadrature)
-  return HpSpace(domain, options.basis, degree_policy, options.quadrature, continuity_policy,
-                 active, leaf_to_index, compiled, scalar_dofs, global_quadrature_shape)
+  return HpSpace(compiled_domain, options.basis, degree_policy, options.quadrature,
+                 continuity_policy, active, leaf_to_index, compiled, scalar_dofs,
+                 global_quadrature_shape)
 end
 
 # Public query layer on compiled spaces.
@@ -409,8 +399,10 @@ Return the `index`-th active leaf of `space`.
 This provides indexed access to the compilation order used by
 [`active_leaves`](@ref) and [`active_leaf_count`](@ref).
 """
-function active_leaf(space::HpSpace, index::Integer)
-  @inbounds space.active_leaves[_checked_index(index, active_leaf_count(space), "active leaf")]
+@inline function active_leaf(space::HpSpace, index::Integer)
+  count = active_leaf_count(space)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "active leaf")
+  return @inbounds space.active_leaves[Int(index)]
 end
 
 """
@@ -499,9 +491,20 @@ Return `true` if `mode` is an active local tensor-product mode on `leaf`.
 This checks both the box bounds induced by the local degrees and the filtering
 rule of the chosen basis family.
 """
-function is_mode_active(space::HpSpace, leaf::Integer, mode::NTuple{D,<:Integer}) where {D}
+function is_mode_active(space::HpSpace{D}, leaf::Integer, mode::NTuple{D,<:Integer}) where {D}
+  checked_mode = _checked_public_mode_tuple(space, mode)
   compiled = _compiled_leaf(space, leaf)
-  return _mode_lookup(compiled, mode) != 0
+  return _mode_lookup(compiled, checked_mode) != 0
+end
+
+function is_mode_active(space::HpSpace, leaf::Integer, mode::Tuple)
+  checked_mode = _checked_public_mode_tuple(space, mode)
+  compiled = _compiled_leaf(space, leaf)
+  return _mode_lookup(compiled, checked_mode) != 0
+end
+
+function is_mode_active(space::HpSpace, leaf::Integer, mode)
+  throw(ArgumentError("mode must be a tuple of integer indices"))
 end
 
 """
@@ -522,11 +525,25 @@ This is the most direct public view of the continuity compilation performed in
 """
 function mode_terms(space::HpSpace{D,T}, leaf::Integer,
                     mode::NTuple{D,<:Integer}) where {D,T<:AbstractFloat}
+  checked_mode = _checked_public_mode_tuple(space, mode)
   compiled = _compiled_leaf(space, leaf)
-  mode_index = _mode_lookup(compiled, mode)
+  mode_index = _mode_lookup(compiled, checked_mode)
   mode_index != 0 || throw(ArgumentError("mode is not active on this leaf"))
   return Pair{Int,T}[compiled.term_indices[term_index] => compiled.term_coefficients[term_index]
                      for term_index in _mode_term_range(compiled, mode_index)]
+end
+
+function mode_terms(space::HpSpace{D,T}, leaf::Integer, mode::Tuple) where {D,T<:AbstractFloat}
+  checked_mode = _checked_public_mode_tuple(space, mode)
+  compiled = _compiled_leaf(space, leaf)
+  mode_index = _mode_lookup(compiled, checked_mode)
+  mode_index != 0 || throw(ArgumentError("mode is not active on this leaf"))
+  return Pair{Int,T}[compiled.term_indices[term_index] => compiled.term_coefficients[term_index]
+                     for term_index in _mode_term_range(compiled, mode_index)]
+end
+
+function mode_terms(space::HpSpace, leaf::Integer, mode)
+  throw(ArgumentError("mode must be a tuple of integer indices"))
 end
 
 """
@@ -543,20 +560,28 @@ is detected and otherwise returns `nothing`.
 The same checks apply to continuous, discontinuous, and mixed spaces: only the
 structure of the stored local mode expansions differs.
 """
-function check_space(space::HpSpace)
+function check_space(space::HpSpace{D}) where {D}
   length(space.active_leaves) == length(space.compiled_leaves) ||
     throw(ArgumentError("compiled leaf data must match the active-leaf list"))
   stored_cell_count(grid(space)) == length(space.leaf_to_index) ||
     throw(ArgumentError("leaf lookup length mismatch"))
-  all(axis -> space.global_quadrature_shape[axis] > 0, 1:dimension(space)) ||
-    throw(ArgumentError("global quadrature shape entries must be positive"))
+  space.active_leaves == _domain_active_leaves(space.domain) ||
+    throw(ArgumentError("space active leaves must match the domain active leaves"))
+  space.leaf_to_index == _active_leaf_lookup(grid(space), space.active_leaves) ||
+    throw(ArgumentError("leaf lookup does not match the active-leaf list"))
+  space.scalar_dof_count >= 0 || throw(ArgumentError("scalar dof count must be non-negative"))
 
   used = falses(space.scalar_dof_count)
+  expected_global_quadrature_shape = ntuple(_ -> 1, D)
 
   for leaf_index in eachindex(space.active_leaves)
-    _check_compiled_leaf!(space, leaf_index, used)
+    quadrature_shape = _check_compiled_leaf!(space, leaf_index, used)
+    expected_global_quadrature_shape = _merge_quadrature_shapes(expected_global_quadrature_shape,
+                                                                quadrature_shape)
   end
 
+  space.global_quadrature_shape == expected_global_quadrature_shape ||
+    throw(ArgumentError("global quadrature shape does not match compiled leaves"))
   all(used) || throw(ArgumentError("some scalar dofs are unused"))
   return nothing
 end
@@ -628,6 +653,24 @@ function StoredDegrees(domain::AbstractDomain{D},
   return StoredDegrees(domain, _domain_active_leaves(domain), degrees)
 end
 
+# Materialize degree data for `HpSpace` construction. This applies the
+# continuity-aware degree validation in the same pass as the public degree policy
+# evaluation, so the constructor does not first build a general stored policy and
+# then copy it into a second checked representation.
+function _space_degrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy,
+                        active::AbstractVector{<:Integer},
+                        continuity_policy::_AxisContinuity{D}) where {D}
+  leaf_to_index = _active_leaf_lookup(grid(domain), active)
+  degrees = Vector{NTuple{D,Int}}(undef, length(active))
+
+  for index in eachindex(active)
+    degrees[index] = _checked_space_degree_tuple(_leaf_degrees(policy, domain, active[index]),
+                                                 continuity_policy, "leaf_degrees[$index]")
+  end
+
+  return StoredDegrees{D}(leaf_to_index, degrees)
+end
+
 # Quadrature-policy evaluation and full space compilation.
 
 # The default quadrature policy simply adds a fixed offset to every local degree
@@ -650,13 +693,13 @@ end
 # immutable `HpSpace`. Algebraically, this is where a set of leaf-local modal
 # bases becomes one sparse global space description.
 function _compile_space_data(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                             basis::B, leaf_degrees::Vector{NTuple{D,Int}},
+                             leaf_to_index::Vector{Int}, basis::B,
+                             leaf_degrees::Vector{NTuple{D,Int}},
                              continuity_policy::_AxisContinuity{D},
                              quadrature_policy) where {D,T<:AbstractFloat,B<:AbstractBasisFamily}
-  grid_data = grid(domain)
-  state = _enumerate_space_modes(domain, active, basis, leaf_degrees, continuity_policy)
+  state = _enumerate_space_modes(domain, active, leaf_to_index, basis, leaf_degrees,
+                                 continuity_policy)
   _compile_face_coupling!(state, continuity_policy)
-  leaf_to_index = _active_leaf_lookup(grid_data, active)
   compiled, global_quadrature_shape = _finalize_compiled_leaves(state, continuity_policy,
                                                                 quadrature_policy)
 
@@ -704,14 +747,37 @@ function _checked_space_degree_tuple(degrees::NTuple{D,<:Integer},
                                               "$name[$axis]"), D)
 end
 
+# Public mode queries accept tuples of nonnegative integer mode indices. Wrong
+# tuple lengths or non-integer entries are semantic API errors; indices outside
+# the local degree box are left to the normal active-mode lookup, which reports
+# "inactive" or "not active".
+function _checked_public_mode_tuple(space::HpSpace{D}, mode::Tuple) where {D}
+  length(mode) == D || throw(ArgumentError("mode tuple length must match the space dimension"))
+
+  return ntuple(axis -> begin
+                  value = mode[axis]
+                  value isa Integer || throw(ArgumentError("mode[$axis] must be an integer"))
+                  0 <= value <= typemax(Int) ||
+                    throw(ArgumentError("mode[$axis] must be a non-negative Int-representable integer"))
+                  Int(value)
+                end, D)
+end
+
 # Validate one compiled leaf and mark all referenced global scalar dofs as used.
 function _check_compiled_leaf!(space::HpSpace, leaf_index::Int, used::BitVector)
   leaf = space.active_leaves[leaf_index]
   compiled = space.compiled_leaves[leaf_index]
   compiled.leaf == leaf || throw(ArgumentError("compiled leaf mismatch"))
   space.leaf_to_index[leaf] == leaf_index || throw(ArgumentError("leaf lookup mismatch"))
+  compiled.degrees == space.degree_policy.data[leaf_index] ||
+    throw(ArgumentError("compiled leaf degrees do not match stored degree data"))
+  compiled.support_shape == ntuple(axis -> compiled.degrees[axis] + 1, dimension(space)) ||
+    throw(ArgumentError("compiled support shape does not match cell degrees"))
+  length(compiled.mode_lookup) == _checked_basis_mode_box_count(compiled.degrees) ||
+    throw(ArgumentError("mode lookup length does not match the support shape"))
   length(compiled.term_offsets) == length(compiled.local_modes) + 1 ||
     throw(ArgumentError("term offsets must match the local-mode count"))
+  first(compiled.term_offsets) == 1 || throw(ArgumentError("term offsets must start at 1"))
   compiled.term_offsets[end] == length(compiled.term_indices) + 1 ||
     throw(ArgumentError("invalid term offsets"))
   length(compiled.term_coefficients) == length(compiled.term_indices) ||
@@ -720,10 +786,13 @@ function _check_compiled_leaf!(space::HpSpace, leaf_index::Int, used::BitVector)
     throw(ArgumentError("single-term lookup length mismatch"))
   length(compiled.single_term_coefficients) == length(compiled.local_modes) ||
     throw(ArgumentError("single-term coefficient length mismatch"))
-  all(axis -> compiled.quadrature_shape[axis] > 0, 1:dimension(space)) ||
-    throw(ArgumentError("cell quadrature shape entries must be positive"))
+  compiled.quadrature_shape == _quadrature_shape(space.quadrature_policy, compiled.degrees) ||
+    throw(ArgumentError("cell quadrature shape does not match the quadrature policy"))
+  _check_mode_lookup!(space, compiled)
+  _check_term_offsets!(compiled)
+  _check_single_term_metadata!(compiled)
   _mark_compiled_leaf_dofs!(used, compiled, space.scalar_dof_count)
-  return nothing
+  return compiled.quadrature_shape
 end
 
 function _mark_compiled_leaf_dofs!(used::BitVector, compiled::_CompiledLeaf, scalar_dof_count::Int)
@@ -731,11 +800,68 @@ function _mark_compiled_leaf_dofs!(used::BitVector, compiled::_CompiledLeaf, sca
     for term_index in _mode_term_range(compiled, mode_index)
       global_dof = compiled.term_indices[term_index]
       1 <= global_dof <= scalar_dof_count || throw(ArgumentError("global dof out of bounds"))
+      coefficient = compiled.term_coefficients[term_index]
+      isfinite(coefficient) || throw(ArgumentError("global dof coefficient must be finite"))
+      !iszero(coefficient) || throw(ArgumentError("global dof coefficient must be nonzero"))
       used[global_dof] = true
     end
   end
 
   return used
+end
+
+function _check_mode_lookup!(space::HpSpace, compiled::_CompiledLeaf)
+  expected_lookup = zeros(Int, length(compiled.mode_lookup))
+
+  for mode_index in eachindex(compiled.local_modes)
+    mode = compiled.local_modes[mode_index]
+    _mode_within_degrees(compiled.degrees, mode) ||
+      throw(ArgumentError("local mode exceeds compiled leaf degrees"))
+    is_active_mode(space.basis, compiled.degrees, mode) ||
+      throw(ArgumentError("local mode is not active in the selected basis"))
+    lookup_index = _flatten_mode(mode, compiled.support_shape)
+    expected_lookup[lookup_index] == 0 || throw(ArgumentError("duplicate local mode entry"))
+    expected_lookup[lookup_index] = mode_index
+  end
+
+  compiled.mode_lookup == expected_lookup || throw(ArgumentError("mode lookup table mismatch"))
+  return nothing
+end
+
+function _check_term_offsets!(compiled::_CompiledLeaf)
+  term_limit = length(compiled.term_indices) + 1
+
+  for mode_index in eachindex(compiled.local_modes)
+    first_term = compiled.term_offsets[mode_index]
+    next_term = compiled.term_offsets[mode_index+1]
+    1 <= first_term < next_term <= term_limit ||
+      throw(ArgumentError("term offsets must define nonempty ordered ranges"))
+  end
+
+  return nothing
+end
+
+function _check_single_term_metadata!(compiled::_CompiledLeaf)
+  T = eltype(compiled.single_term_coefficients)
+
+  for mode_index in eachindex(compiled.local_modes)
+    first_term = compiled.term_offsets[mode_index]
+    next_term = compiled.term_offsets[mode_index+1]
+
+    if next_term == first_term + 1
+      compiled.single_term_indices[mode_index] == compiled.term_indices[first_term] ||
+        throw(ArgumentError("single-term index metadata mismatch"))
+      compiled.single_term_coefficients[mode_index] == compiled.term_coefficients[first_term] ||
+        throw(ArgumentError("single-term coefficient metadata mismatch"))
+    else
+      compiled.single_term_indices[mode_index] == 0 ||
+        throw(ArgumentError("multi-term mode must not store a single-term index"))
+      compiled.single_term_coefficients[mode_index] == zero(T) ||
+        throw(ArgumentError("multi-term mode must not store a single-term coefficient"))
+    end
+  end
+
+  return nothing
 end
 
 # Resolve one active leaf to its compiled leaf data.

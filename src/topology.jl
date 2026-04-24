@@ -139,11 +139,11 @@ end
 # Build the unrefined root tree and initialize the same-level neighbor tables.
 # Root cells are numbered in mixed-radix order with axis 1 varying fastest, so
 # the direct neighbors can be reconstructed from strides on the root lattice.
-function CartesianGrid(root_counts::NTuple{D,<:Integer}; periodic=false) where {D}
+function CartesianGrid(root_counts::Tuple{Vararg{Integer,D}}; periodic=false) where {D}
   D >= 1 || throw(ArgumentError("dimension must be positive"))
   checked_counts = ntuple(axis -> _checked_positive(root_counts[axis], "root_counts[$axis]"), D)
   checked_periodic = _checked_periodic_axes(periodic, D)
-  cell_total = prod(checked_counts)
+  cell_total = _checked_root_cell_total(checked_counts)
   levels = ntuple(_ -> zeros(Int, cell_total), D)
   coords = ntuple(_ -> zeros(Int, cell_total), D)
   parent = fill(NONE, cell_total)
@@ -217,7 +217,11 @@ Return the number of root cells on a single axis.
 If a cell has logical level `ℓ` on that axis, then the corresponding logical
 lattice consists of `root_cell_count(grid, axis) * 2^ℓ` intervals there.
 """
-root_cell_count(grid::CartesianGrid, axis::Integer) = grid.root_counts[_checked_axis(grid, axis)]
+@inline function root_cell_count(grid::CartesianGrid, axis::Integer)
+  count = dimension(grid)
+  @boundscheck 1 <= axis <= count || _throw_index_error(axis, count, "axis")
+  return _root_cell_count(grid, Int(axis))
+end
 
 """
     periodic_axes(grid)
@@ -239,7 +243,11 @@ On a periodic axis, the lower and upper root boundaries are identified, and
 queries such as [`neighbor`](@ref), [`covering_neighbor`](@ref), and
 [`is_domain_boundary`](@ref) behave accordingly.
 """
-is_periodic_axis(grid::CartesianGrid, axis::Integer) = grid.periodic[_checked_axis(grid, axis)]
+@inline function is_periodic_axis(grid::CartesianGrid, axis::Integer)
+  count = dimension(grid)
+  @boundscheck 1 <= axis <= count || _throw_index_error(axis, count, "axis")
+  return _is_periodic_axis(grid, Int(axis))
+end
 
 """
     root_cell_total(grid)
@@ -249,7 +257,7 @@ Return the total number of root cells in the unrefined tensor-product mesh.
 This is the product of [`root_cell_counts`](@ref) and equals the number of
 stored cells in a freshly constructed grid before any refinement occurs.
 """
-root_cell_total(grid::CartesianGrid) = prod(grid.root_counts)
+root_cell_total(grid::CartesianGrid) = _checked_root_cell_total(grid.root_counts)
 
 """
     stored_cell_count(grid)
@@ -293,6 +301,41 @@ storage, so callers may reorder or modify it without mutating the grid.
 """
 active_leaves(grid::CartesianGrid) = copy(grid.active_leaves)
 
+@inline _root_cell_count(grid::CartesianGrid, axis::Int) = @inbounds grid.root_counts[axis]
+
+@inline _is_periodic_axis(grid::CartesianGrid, axis::Int) = @inbounds grid.periodic[axis]
+
+@inline _active_leaf(grid::CartesianGrid, index::Int) = @inbounds grid.active_leaves[index]
+
+@inline _level(grid::CartesianGrid, cell::Int, axis::Int) = @inbounds grid.levels[axis][cell]
+
+@inline function _level_tuple(grid::CartesianGrid{D}, cell::Int) where {D}
+  return ntuple(axis -> _level(grid, cell, axis), D)
+end
+
+@inline _logical_coordinate(grid::CartesianGrid, cell::Int, axis::Int) = @inbounds grid.coords[axis][cell]
+
+@inline function _logical_coordinate_tuple(grid::CartesianGrid{D}, cell::Int) where {D}
+  return ntuple(axis -> _logical_coordinate(grid, cell, axis), D)
+end
+
+@inline _parent(grid::CartesianGrid, cell::Int) = @inbounds grid.parent[cell]
+
+@inline _first_child(grid::CartesianGrid, cell::Int) = @inbounds grid.first_child[cell]
+
+@inline _split_axis(grid::CartesianGrid, cell::Int) = @inbounds grid.split_axis[cell]
+
+@inline _is_active_leaf(grid::CartesianGrid, cell::Int) = @inbounds grid.active[cell]
+
+@inline _is_expanded(grid::CartesianGrid, cell::Int) = _split_axis(grid, cell) != 0
+
+@inline _is_tree_cell(grid::CartesianGrid, cell::Int) = _is_active_leaf(grid, cell) ||
+                                                        _is_expanded(grid, cell)
+
+@inline function _neighbor(grid::CartesianGrid, cell::Int, axis::Int, side::Int)
+  return @inbounds _neighbor_array(grid, side)[axis][cell]
+end
+
 # Cell-local tree queries.
 
 """
@@ -303,8 +346,10 @@ Return the `index`-th active leaf of the current tree.
 This provides indexed access to the ordering used by [`active_leaves`](@ref)
 and [`active_leaf_count`](@ref).
 """
-function active_leaf(grid::CartesianGrid, index::Integer)
-  @inbounds grid.active_leaves[_checked_index(index, active_leaf_count(grid), "active leaf")]
+@inline function active_leaf(grid::CartesianGrid, index::Integer)
+  count = active_leaf_count(grid)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "active leaf")
+  return _active_leaf(grid, Int(index))
 end
 
 """
@@ -318,13 +363,18 @@ Levels are stored per axis because refinement is anisotropic. Along axis `a`, a
 level `ℓₐ` means that the cell lives on a dyadic refinement lattice obtained by
 subdividing each root interval into `2^ℓₐ` subintervals.
 """
-function level(grid::CartesianGrid{D}, cell::Integer) where {D}
-  checked = _checked_cell(grid, cell)
-  return ntuple(axis -> @inbounds(grid.levels[axis][checked]), D)
+@inline function level(grid::CartesianGrid{D}, cell::Integer) where {D}
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _level_tuple(grid, Int(cell))
 end
 
-function level(grid::CartesianGrid, cell::Integer, axis::Integer)
-  @inbounds grid.levels[_checked_axis(grid, axis)][_checked_cell(grid, cell)]
+@inline function level(grid::CartesianGrid, cell::Integer, axis::Integer)
+  cell_count = stored_cell_count(grid)
+  axis_count = dimension(grid)
+  @boundscheck 1 <= cell <= cell_count || _throw_index_error(cell, cell_count, "cell")
+  @boundscheck 1 <= axis <= axis_count || _throw_index_error(axis, axis_count, "axis")
+  return _level(grid, Int(cell), Int(axis))
 end
 
 """
@@ -338,13 +388,18 @@ Together with [`level`](@ref), the logical coordinate identifies the cell within
 the dyadically refined root lattice. On axis `a`, the valid range is
 `0:(root_cell_count(grid, a) * 2^ℓₐ - 1)`.
 """
-function logical_coordinate(grid::CartesianGrid{D}, cell::Integer) where {D}
-  checked = _checked_cell(grid, cell)
-  return ntuple(axis -> @inbounds(grid.coords[axis][checked]), D)
+@inline function logical_coordinate(grid::CartesianGrid{D}, cell::Integer) where {D}
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _logical_coordinate_tuple(grid, Int(cell))
 end
 
-function logical_coordinate(grid::CartesianGrid, cell::Integer, axis::Integer)
-  @inbounds grid.coords[_checked_axis(grid, axis)][_checked_cell(grid, cell)]
+@inline function logical_coordinate(grid::CartesianGrid, cell::Integer, axis::Integer)
+  cell_count = stored_cell_count(grid)
+  axis_count = dimension(grid)
+  @boundscheck 1 <= cell <= cell_count || _throw_index_error(cell, cell_count, "cell")
+  @boundscheck 1 <= axis <= axis_count || _throw_index_error(axis, axis_count, "axis")
+  return _logical_coordinate(grid, Int(cell), Int(axis))
 end
 
 # Parent/child relations in the refinement tree.
@@ -357,7 +412,11 @@ Return the parent of `cell`, or [`NONE`](@ref) if `cell` is a root cell.
 Parent links define the refinement tree and are used to climb from a fine cell
 to coarser coverings when resolving nonmatching neighbors.
 """
-parent(grid::CartesianGrid, cell::Integer) = @inbounds grid.parent[_checked_cell(grid, cell)]
+@inline function parent(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _parent(grid, Int(cell))
+end
 
 """
     first_child(grid, cell)
@@ -368,8 +427,10 @@ currently expanded.
 Children are stored in contiguous blocks of length two because refinement always
 splits one axis at its midpoint.
 """
-function first_child(grid::CartesianGrid, cell::Integer)
-  @inbounds grid.first_child[_checked_cell(grid, cell)]
+@inline function first_child(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _first_child(grid, Int(cell))
 end
 
 """
@@ -381,8 +442,10 @@ currently expanded.
 This records the anisotropic refinement direction of the most recent split that
 produced the current child block.
 """
-function split_axis(grid::CartesianGrid, cell::Integer)
-  @inbounds grid.split_axis[_checked_cell(grid, cell)]
+@inline function split_axis(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _split_axis(grid, Int(cell))
 end
 
 # Face-neighborhood queries.
@@ -397,11 +460,13 @@ the corresponding full face at that level. If no such same-level tree cell
 exists, the function returns [`NONE`](@ref). For nonmatching interfaces, use
 [`covering_neighbor`](@ref) or [`opposite_active_leaves`](@ref) instead.
 """
-function neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, side::Integer)
-  checked_cell = _checked_cell(grid, cell)
-  checked_axis = _checked_axis(grid, axis)
+@inline function neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, side::Integer)
+  cell_count = stored_cell_count(grid)
+  axis_count = dimension(grid)
+  @boundscheck 1 <= cell <= cell_count || _throw_index_error(cell, cell_count, "cell")
+  @boundscheck 1 <= axis <= axis_count || _throw_index_error(axis, axis_count, "axis")
   checked_side = _checked_side(side)
-  return @inbounds (checked_side == LOWER ? grid.neighbor_lower : grid.neighbor_upper)[checked_axis][checked_cell]
+  return _neighbor(grid, Int(cell), Int(axis), checked_side)
 end
 
 """
@@ -413,8 +478,10 @@ Active leaves are the cells that currently partition the domain. They are not
 expanded further and therefore represent the elements used by discretization and
 integration routines.
 """
-function is_active_leaf(grid::CartesianGrid, cell::Integer)
-  @inbounds grid.active[_checked_cell(grid, cell)]
+@inline function is_active_leaf(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _is_active_leaf(grid, Int(cell))
 end
 
 """
@@ -425,7 +492,11 @@ Return `true` if `cell` has been refined into children.
 Expanded cells remain part of the tree as ancestors, but they are no longer
 active leaves.
 """
-is_expanded(grid::CartesianGrid, cell::Integer) = split_axis(grid, cell) != 0
+@inline function is_expanded(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _is_expanded(grid, Int(cell))
+end
 
 """
     is_tree_cell(grid, cell)
@@ -435,8 +506,10 @@ Return `true` if `cell` currently belongs to the refinement tree.
 This is the union of active leaves and expanded ancestors. It excludes retired
 stored cells that no longer participate in the live tree after derefinement.
 """
-function is_tree_cell(grid::CartesianGrid, cell::Integer)
-  is_active_leaf(grid, cell) || is_expanded(grid, cell)
+@inline function is_tree_cell(grid::CartesianGrid, cell::Integer)
+  count = stored_cell_count(grid)
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _is_tree_cell(grid, Int(cell))
 end
 
 """
@@ -469,14 +542,17 @@ function covering_neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, si
   current = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   checked_side = _checked_side(side)
+  return _covering_neighbor(grid, current, checked_axis, checked_side)
+end
 
+function _covering_neighbor(grid::CartesianGrid, current::Int, checked_axis::Int, checked_side::Int)
   while true
     # The direct neighbor tables resolve only same-level tree neighbors. When a
     # fine face abuts a coarser cell, we ascend until the missing face segment
     # reaches an ancestor whose opposite side is represented at the same level.
-    candidate = @inbounds _neighbor_array(grid, checked_side)[checked_axis][current]
+    candidate = _neighbor(grid, current, checked_axis, checked_side)
     candidate != NONE && return candidate
-    current_parent = @inbounds grid.parent[current]
+    current_parent = _parent(grid, current)
     current_parent == NONE && return NONE
     _touches_parent_boundary(grid, current, checked_axis, checked_side) ||
       throw(ArgumentError("cell $current is missing a covering neighbor"))
@@ -499,7 +575,7 @@ function opposite_active_leaves(grid::CartesianGrid, cell::Integer, axis::Intege
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   checked_side = _checked_side(side)
-  candidate = covering_neighbor(grid, checked_cell, checked_axis, checked_side)
+  candidate = _covering_neighbor(grid, checked_cell, checked_axis, checked_side)
   candidate == NONE && return Int[]
   leaves = Int[]
 
@@ -511,7 +587,7 @@ function opposite_active_leaves(grid::CartesianGrid, cell::Integer, axis::Intege
 
   # Then sort tangentially on a common finest comparison level so later face
   # traversals see a deterministic geometric ordering even across hp mismatch.
-  comparison_levels = [maximum(level(grid, leaf, current_axis)
+  comparison_levels = [maximum(_level(grid, leaf, current_axis)
                                for leaf in Iterators.flatten(((checked_cell,), leaves)))
                        for current_axis in 1:dimension(grid)]
   sort!(leaves;
@@ -574,33 +650,17 @@ function check_topology(grid::CartesianGrid)
   computed_active = Int[]
 
   for cell in 1:stored
-    is_active_leaf(grid, cell) && push!(computed_active, cell)
+    _is_active_leaf(grid, cell) && push!(computed_active, cell)
     _check_topology_cell!(grid, cell)
   end
 
   computed_active == grid.active_leaves || throw(ArgumentError("active-leaf list is inconsistent"))
+  _check_live_tree_structure!(grid)
   _check_direct_neighbor_tables!(grid)
   return nothing
 end
 
 # Structural rebuild helpers used by refinement and derefinement.
-
-# Reconstruct root logical coordinates from mixed-radix cell numbering. This is
-# mainly useful when a grid is materialized from raw arrays and the root portion
-# needs to be reinitialized consistently.
-function _initialize_root_coordinates!(grid::CartesianGrid{D}) where {D}
-  strides = ntuple(axis -> axis == 1 ? 1 : prod(grid.root_counts[1:(axis-1)]), D)
-
-  for cell in 1:root_cell_total(grid)
-    linear = cell - 1
-
-    @inbounds for axis in 1:D
-      grid.coords[axis][cell] = fld(linear, strides[axis]) % grid.root_counts[axis]
-    end
-  end
-
-  return grid
-end
 
 # Append storage for a new binary child block. The block is initialized as two
 # active leaves with empty topology links; the caller is responsible for filling
@@ -630,22 +690,11 @@ end
 # deterministic leaf enumeration.
 function _rebuild_active_leaves!(grid::CartesianGrid)
   stored = stored_cell_count(grid)
-  worker_count = max(1, min(Threads.nthreads(), stored))
-  thread_active = [Int[] for _ in 1:worker_count]
-
-  _run_chunks_with_scratch!(thread_active, stored) do leaves, first_cell, last_cell
-    for cell in first_cell:last_cell
-      @inbounds grid.active[cell] && push!(leaves, cell)
-    end
-  end
-
   empty!(grid.active_leaves)
 
-  for leaves in thread_active
-    append!(grid.active_leaves, leaves)
+  for cell in 1:stored
+    @inbounds grid.active[cell] && push!(grid.active_leaves, cell)
   end
-
-  sort!(grid.active_leaves)
 
   return grid
 end
@@ -657,28 +706,24 @@ end
 function _rebuild_direct_neighbors!(grid::CartesianGrid{D}) where {D}
   stored = stored_cell_count(grid)
 
-  _run_chunks!(stored) do first_cell, last_cell
-    for cell in first_cell:last_cell
-      @inbounds for axis in 1:D
-        grid.neighbor_lower[axis][cell] = NONE
-        grid.neighbor_upper[axis][cell] = NONE
-      end
+  for cell in 1:stored
+    @inbounds for axis in 1:D
+      grid.neighbor_lower[axis][cell] = NONE
+      grid.neighbor_upper[axis][cell] = NONE
     end
   end
 
   lookup = _tree_cell_lookup(grid)
 
-  _run_chunks!(stored) do first_cell, last_cell
-    for cell in first_cell:last_cell
-      is_tree_cell(grid, cell) || continue
-      cell_level = level(grid, cell)
-      cell_coord = logical_coordinate(grid, cell)
+  for cell in 1:stored
+    _is_tree_cell(grid, cell) || continue
+    cell_level = _level_tuple(grid, cell)
+    cell_coord = _logical_coordinate_tuple(grid, cell)
 
-      @inbounds for axis in 1:D
-        lower, upper = _expected_direct_neighbors(grid, lookup, cell_level, cell_coord, axis)
-        grid.neighbor_lower[axis][cell] = lower
-        grid.neighbor_upper[axis][cell] = upper
-      end
+    @inbounds for axis in 1:D
+      lower, upper = _expected_direct_neighbors(grid, lookup, cell_level, cell_coord, axis)
+      grid.neighbor_lower[axis][cell] = lower
+      grid.neighbor_upper[axis][cell] = upper
     end
   end
 
@@ -694,23 +739,23 @@ end
 # Scale interval endpoints to a common finest level so cells with different
 # refinement levels can be compared on one integer lattice without roundoff.
 function _scaled_lower_coordinate(grid::CartesianGrid, cell::Int, axis::Int, target_level::Int)
-  return Int128(logical_coordinate(grid, cell, axis)) << (target_level - level(grid, cell, axis))
+  return Int128(_logical_coordinate(grid, cell, axis)) << (target_level - _level(grid, cell, axis))
 end
 
 function _scaled_upper_coordinate(grid::CartesianGrid, cell::Int, axis::Int, target_level::Int)
-  return (Int128(logical_coordinate(grid, cell, axis)) + 1) <<
-         (target_level - level(grid, cell, axis))
+  return (Int128(_logical_coordinate(grid, cell, axis)) + 1) <<
+         (target_level - _level(grid, cell, axis))
 end
 
 # Determine whether a child touches the queried side of its parent. This is the
 # condition under which a missing same-level neighbor may be resolved by moving
 # to the parent when searching for a covering cell.
 function _touches_parent_boundary(grid::CartesianGrid, cell::Int, axis::Int, side::Int)
-  parent_cell = parent(grid, cell)
+  parent_cell = _parent(grid, cell)
   parent_cell == NONE && return false
-  split = split_axis(grid, parent_cell)
+  split = _split_axis(grid, parent_cell)
   split != axis && return true
-  return (logical_coordinate(grid, cell, axis) & 1) == _side_bit(side)
+  return (_logical_coordinate(grid, cell, axis) & 1) == _side_bit(side)
 end
 
 # Two face patches interact only if their intervals overlap in every tangential
@@ -720,7 +765,7 @@ function _tangential_intervals_overlap(grid::CartesianGrid{D}, first::Int, secon
                                        face_axis::Int) where {D}
   for axis in 1:D
     axis == face_axis && continue
-    comparison_level = max(level(grid, first, axis), level(grid, second, axis))
+    comparison_level = max(_level(grid, first, axis), _level(grid, second, axis))
     first_lower = _scaled_lower_coordinate(grid, first, axis, comparison_level)
     first_upper = _scaled_upper_coordinate(grid, first, axis, comparison_level)
     second_lower = _scaled_lower_coordinate(grid, second, axis, comparison_level)
@@ -739,14 +784,14 @@ function _collect_opposite_active_leaves!(leaves::Vector{Int}, grid::CartesianGr
                                           axis::Int, side::Int, candidate::Int)
   _tangential_intervals_overlap(grid, source, candidate, axis) || return leaves
 
-  if is_active_leaf(grid, candidate)
+  if _is_active_leaf(grid, candidate)
     push!(leaves, candidate)
     return leaves
   end
 
-  split = split_axis(grid, candidate)
+  split = _split_axis(grid, candidate)
   split == 0 && return leaves
-  first = first_child(grid, candidate)
+  first = _first_child(grid, candidate)
 
   if split == axis
     # Only the child adjacent to the queried face can touch the source cell when
@@ -772,26 +817,77 @@ end
 # cells, and the consistency of parent/child relationships.
 function _check_topology_cell!(grid::CartesianGrid, cell::Int)
   for axis in 1:dimension(grid)
-    lvl = @inbounds grid.levels[axis][cell]
-    coord = @inbounds grid.coords[axis][cell]
-    lvl >= 0 || throw(ArgumentError("negative refinement level"))
-    0 <= coord < (grid.root_counts[axis] << lvl) ||
-      throw(ArgumentError("logical coordinate out of bounds"))
+    lvl = grid.levels[axis][cell]
+    coord = grid.coords[axis][cell]
+    extent = _checked_axis_extent(grid.root_counts[axis], lvl, axis)
+    0 <= coord < extent || throw(ArgumentError("logical coordinate out of bounds"))
   end
 
-  is_active_leaf(grid, cell) &&
-    is_expanded(grid, cell) &&
+  _is_active_leaf(grid, cell) &&
+    _is_expanded(grid, cell) &&
     throw(ArgumentError("cell cannot be active and expanded"))
 
-  if is_expanded(grid, cell)
-    first = first_child(grid, cell)
+  first = _first_child(grid, cell)
+  first == NONE || _check_retained_child_block!(grid, cell, first)
+
+  if _is_expanded(grid, cell)
     first != NONE || throw(ArgumentError("expanded cell must own children"))
-    checked_axis = split_axis(grid, cell)
+    checked_axis = _split_axis(grid, cell)
     1 <= checked_axis <= dimension(grid) || throw(ArgumentError("invalid split axis"))
 
     for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
-      @inbounds grid.parent[child] == cell || throw(ArgumentError("child parent mismatch"))
+      _is_tree_cell(grid, child) ||
+        throw(ArgumentError("expanded cell child must belong to the live tree"))
     end
+  end
+
+  return nothing
+end
+
+function _check_retained_child_block!(grid::CartesianGrid, cell::Int, first::Int)
+  1 <= first <= stored_cell_count(grid) - _MIDPOINT_CHILD_COUNT + 1 ||
+    throw(ArgumentError("retained child block is out of bounds"))
+
+  for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
+    grid.parent[child] == cell || throw(ArgumentError("retained child parent mismatch"))
+  end
+
+  return nothing
+end
+
+function _check_live_tree_structure!(grid::CartesianGrid)
+  stored = stored_cell_count(grid)
+  root_total = root_cell_total(grid)
+  root_total <= stored || throw(ArgumentError("stored topology is missing root cells"))
+
+  for root in 1:root_total
+    grid.parent[root] == NONE || throw(ArgumentError("root cell parent must be NONE"))
+    _is_tree_cell(grid, root) || throw(ArgumentError("root cell must belong to the live tree"))
+  end
+
+  for cell in (root_total+1):stored
+    parent_cell = grid.parent[cell]
+    parent_cell != NONE || throw(ArgumentError("non-root cell must have a parent"))
+    1 <= parent_cell <= stored || throw(ArgumentError("cell parent is out of bounds"))
+  end
+
+  for cell in 1:stored
+    _is_tree_cell(grid, cell) || continue
+    parent_cell = grid.parent[cell]
+
+    if cell <= root_total
+      parent_cell == NONE || throw(ArgumentError("root cell parent must be NONE"))
+      continue
+    end
+
+    parent_cell != NONE || throw(ArgumentError("live non-root cell must have a parent"))
+    1 <= parent_cell <= stored || throw(ArgumentError("live cell parent is out of bounds"))
+    _is_tree_cell(grid, parent_cell) ||
+      throw(ArgumentError("live cell parent must belong to the live tree"))
+    _is_expanded(grid, parent_cell) || throw(ArgumentError("live cell parent must be expanded"))
+    first = _first_child(grid, parent_cell)
+    first <= cell <= first + _MIDPOINT_CHILD_COUNT - 1 ||
+      throw(ArgumentError("live child is outside its parent child block"))
   end
 
   return nothing
@@ -805,14 +901,14 @@ function _check_direct_neighbor_tables!(grid::CartesianGrid{D}) where {D}
 
   for cell in 1:stored_cell_count(grid)
     for axis in 1:D
-      expected_lower, expected_upper = is_tree_cell(grid, cell) ?
+      expected_lower, expected_upper = _is_tree_cell(grid, cell) ?
                                        _expected_direct_neighbors(grid, lookup, cell, axis) :
                                        (NONE, NONE)
 
-      @inbounds grid.neighbor_lower[axis][cell] == expected_lower ||
-                throw(ArgumentError("lower neighbor table is inconsistent"))
-      @inbounds grid.neighbor_upper[axis][cell] == expected_upper ||
-                throw(ArgumentError("upper neighbor table is inconsistent"))
+      grid.neighbor_lower[axis][cell] == expected_lower ||
+        throw(ArgumentError("lower neighbor table is inconsistent"))
+      grid.neighbor_upper[axis][cell] == expected_upper ||
+        throw(ArgumentError("upper neighbor table is inconsistent"))
     end
   end
 
@@ -827,8 +923,11 @@ function _tree_cell_lookup(grid::CartesianGrid{D}) where {D}
   lookup = Dict{Tuple{NTuple{D,Int},NTuple{D,Int}},Int}()
 
   for cell in 1:stored_cell_count(grid)
-    is_tree_cell(grid, cell) || continue
-    lookup[(level(grid, cell), logical_coordinate(grid, cell))] = cell
+    _is_tree_cell(grid, cell) || continue
+    signature = (_level_tuple(grid, cell), _logical_coordinate_tuple(grid, cell))
+    haskey(lookup, signature) &&
+      throw(ArgumentError("tree cells must have unique logical signatures"))
+    lookup[signature] = cell
   end
 
   return lookup
@@ -846,23 +945,8 @@ function _expected_direct_neighbors(grid::CartesianGrid{D}, lookup, cell_level::
 end
 
 function _expected_direct_neighbors(grid::CartesianGrid{D}, lookup, cell::Int, axis::Int) where {D}
-  return _expected_direct_neighbors(grid, lookup, level(grid, cell), logical_coordinate(grid, cell),
-                                    axis)
-end
-
-# Enumerate each active face interface exactly once by visiting only upper-side
-# faces. Downstream code uses these tuples to build continuity relations and
-# interface integration data without creating duplicate face pairs.
-function _upper_face_neighbor_specs(grid::CartesianGrid{D}) where {D}
-  specs = Tuple{Int,Int,Int}[]
-
-  for leaf in active_leaves(grid), axis in 1:D
-    for other in opposite_active_leaves(grid, leaf, axis, UPPER)
-      push!(specs, (leaf, axis, other))
-    end
-  end
-
-  return specs
+  return _expected_direct_neighbors(grid, lookup, _level_tuple(grid, cell),
+                                    _logical_coordinate_tuple(grid, cell), axis)
 end
 
 function _filtered_upper_face_neighbor_specs(grid::CartesianGrid{D},
@@ -881,6 +965,43 @@ function _filtered_upper_face_neighbor_specs(grid::CartesianGrid{D},
 end
 
 # Input normalization and low-level argument checks.
+
+function _checked_root_cell_total(root_counts::NTuple{D,Int}) where {D}
+  total = Int128(1)
+
+  for axis in 1:D
+    count = root_counts[axis]
+    count >= 1 || throw(ArgumentError("root_counts[$axis] must be positive"))
+    total *= Int128(count)
+    total <= typemax(Int) || throw(ArgumentError("root cell total must be Int-representable"))
+  end
+
+  return Int(total)
+end
+
+function _checked_axis_extent(root_count::Int, level::Int, axis::Int)
+  level >= 0 || throw(ArgumentError("level[$axis] must be non-negative"))
+  level < Sys.WORD_SIZE - 1 ||
+    throw(ArgumentError("logical extent on axis $axis must be Int-representable"))
+  extent = Int128(root_count) << level
+  extent <= typemax(Int) ||
+    throw(ArgumentError("logical extent on axis $axis must be Int-representable"))
+  return Int(extent)
+end
+
+function _checked_refinement_level(level::Int, axis::Int)
+  level >= 0 || throw(ArgumentError("level[$axis] must be non-negative"))
+  level < typemax(Int) ||
+    throw(ArgumentError("refinement level on axis $axis must be Int-representable"))
+  return level + 1
+end
+
+function _checked_child_coordinate(parent_coord::Int, child_offset::Int, axis::Int)
+  child_coord = 2 * Int128(parent_coord) + child_offset
+  0 <= child_coord <= typemax(Int) ||
+    throw(ArgumentError("child coordinate on axis $axis must be Int-representable"))
+  return Int(child_coord)
+end
 
 # Normalize the periodicity specification to a per-axis tuple and validate its
 # shape. This keeps the public constructor flexible while storing one canonical
@@ -904,11 +1025,11 @@ end
 # the outer boundary returns `nothing`.
 function _neighbor_coordinate(grid::CartesianGrid{D}, cell_level::NTuple{D,Int},
                               cell_coord::NTuple{D,Int}, axis::Int, side::Int) where {D}
-  axis_extent = grid.root_counts[axis] << cell_level[axis]
+  axis_extent = _checked_axis_extent(grid.root_counts[axis], cell_level[axis], axis)
   next_coord = cell_coord[axis] + (side == LOWER ? -1 : 1)
 
   if !(0 <= next_coord < axis_extent)
-    is_periodic_axis(grid, axis) || return nothing
+    _is_periodic_axis(grid, axis) || return nothing
     next_coord = mod(next_coord, axis_extent)
   end
 
@@ -918,13 +1039,12 @@ end
 _side_bit(side::Int) = side - LOWER
 
 function _checked_cell(grid::CartesianGrid, cell::Integer)
-  return _checked_index(cell, stored_cell_count(grid), "cell")
+  return _require_index(cell, stored_cell_count(grid), "cell")
 end
 
-_checked_axis(grid::CartesianGrid, axis::Integer) = _checked_index(axis, dimension(grid), "axis")
+_checked_axis(grid::CartesianGrid, axis::Integer) = _require_index(axis, dimension(grid), "axis")
 
 function _checked_side(side::Integer)
-  checked = Int(side)
-  (checked == LOWER || checked == UPPER) || throw(ArgumentError("side must be LOWER or UPPER"))
-  return checked
+  (side == LOWER || side == UPPER) || throw(ArgumentError("side must be LOWER or UPPER"))
+  return Int(side)
 end

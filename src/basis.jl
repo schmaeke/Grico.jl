@@ -114,9 +114,20 @@ struct TrunkBasis <: AbstractBasisFamily end
 
 # Iterator representation for admissible mode tuples.
 
-# Internal iterator state for enumerating admissible tensor-product mode tuples.
-# `count` stores the precomputed number of active modes so the iterator reports a
-# stable length without having to traverse the admissibility rule each time.
+# Internal iterator states for enumerating admissible tensor-product mode tuples.
+# `count` stores the precomputed number of active modes so each iterator reports
+# a stable length without having to traverse the admissibility rule each time.
+struct FullTensorBasisModes{D}
+  degrees::NTuple{D,Int}
+  count::Int
+end
+
+struct TrunkBasisModes{D}
+  degrees::NTuple{D,Int}
+  count::Int
+  completion_counts::Vector{Vector{Int}}
+end
+
 struct BasisModes{D,B<:AbstractBasisFamily}
   basis::B
   degrees::NTuple{D,Int}
@@ -147,10 +158,24 @@ expansions.
 If some axis has degree zero, then the box on that axis contains only the
 single index `mₐ = 0`. On DG spaces this later corresponds to the unique
 cellwise constant factor on that axis.
+
+The degree tuple must contain at least one axis. Zero-dimensional basis
+selection is rejected until a concrete use case fixes the intended semantics.
 """
+function basis_modes(::FullTensorBasis, degrees::NTuple{D,<:Integer}) where {D}
+  checked_degrees = _checked_basis_degrees(degrees)
+  return FullTensorBasisModes{D}(checked_degrees, _checked_basis_mode_box_count(checked_degrees))
+end
+
+function basis_modes(::TrunkBasis, degrees::NTuple{D,<:Integer}) where {D}
+  checked_degrees = _checked_basis_degrees(degrees)
+  completion_counts = _trunk_completion_counts(checked_degrees)
+  return TrunkBasisModes{D}(checked_degrees, last(completion_counts)[end], completion_counts)
+end
+
 function basis_modes(basis::AbstractBasisFamily, degrees::NTuple{D,<:Integer}) where {D}
-  checked_degrees = _checked_degrees(degrees)
-  box_count = _basis_mode_box_count(checked_degrees)
+  checked_degrees = _checked_basis_degrees(degrees)
+  box_count = _checked_basis_mode_box_count(checked_degrees)
   return BasisModes{D,typeof(basis)}(basis, checked_degrees, box_count,
                                      _basis_mode_count(basis, checked_degrees))
 end
@@ -172,9 +197,20 @@ enumeration.
 Degree-zero axes still contribute exactly one admissible choice, not zero. This
 matters for DG spaces because a cell that is piecewise constant in one
 coordinate direction still has one valid tensor-product factor there.
+
+The degree tuple must contain at least one axis.
 """
+function basis_mode_count(::FullTensorBasis, degrees::NTuple{D,<:Integer}) where {D}
+  return _checked_basis_mode_box_count(_checked_basis_degrees(degrees))
+end
+
+function basis_mode_count(::TrunkBasis, degrees::NTuple{D,<:Integer}) where {D}
+  checked_degrees = _checked_basis_degrees(degrees)
+  return _trunk_mode_count(checked_degrees)
+end
+
 function basis_mode_count(basis::AbstractBasisFamily, degrees::NTuple{D,<:Integer}) where {D}
-  return _basis_mode_count(basis, _checked_degrees(degrees))
+  return _basis_mode_count(basis, _checked_basis_degrees(degrees))
 end
 
 # Counting logic for the different basis families.
@@ -184,7 +220,7 @@ end
 # closed-form or dynamic-programming count.
 function _basis_mode_count(basis::AbstractBasisFamily, degrees::NTuple{D,Int}) where {D}
   count = 0
-  total = _basis_mode_box_count(degrees)
+  total = _checked_basis_mode_box_count(degrees)
 
   for state in 0:(total-1)
     mode = _mode_from_linear_index(state, degrees)
@@ -196,38 +232,11 @@ end
 
 # The full tensor basis activates every mode within the per-axis degree bounds.
 function _basis_mode_count(::FullTensorBasis, degrees::NTuple{D,Int}) where {D}
-  return _basis_mode_box_count(degrees)
+  return _checked_basis_mode_box_count(degrees)
 end
 
-# Count trunk-basis modes without enumerating the full tensor product. The array
-# `counts[r+1]` stores how many partial modes on the processed axes have
-# retained order `r`, where indices `0` and `1` contribute nothing and every
-# interior index `m ≥ 2` contributes its full value `m`. Processing one axis
-# updates this distribution by adding either an endpoint choice or one of the
-# admissible interior indices on that axis.
-function _basis_mode_count(::TrunkBasis, degrees::NTuple{D,Int}) where {D}
-  maximum_degree = _trunk_retained_order_limit(degrees)
-  counts = zeros(Int, maximum_degree + 1)
-  counts[1] = 1
-
-  for axis in 1:D
-    next = zeros(Int, maximum_degree + 1)
-
-    for retained_order in 0:maximum_degree
-      current = counts[retained_order+1]
-      current == 0 && continue
-      for value in _axis_mode_values(degrees[axis])
-        total_order = retained_order + _trunk_mode_order(value)
-        total_order <= maximum_degree || continue
-        next[total_order+1] += current
-      end
-    end
-
-    counts = next
-  end
-
-  return sum(counts)
-end
+# Count trunk-basis modes without enumerating the full tensor product.
+_basis_mode_count(::TrunkBasis, degrees::NTuple{D,Int}) where {D} = _trunk_mode_count(degrees)
 
 # Public admissibility predicates.
 
@@ -241,19 +250,19 @@ The tuple `mode` must have the same length as `degrees`. For
 [`FullTensorBasis`](@ref), admissibility is simply the box condition
 `0 ≤ mₐ ≤ pₐ`. For [`TrunkBasis`](@ref), the mode must additionally satisfy the
 retained-order constraint described in the type documentation.
+
+The degree and mode tuples must contain at least one axis.
 """
 function is_active_mode(::FullTensorBasis, degrees::NTuple{D,<:Integer},
                         mode::NTuple{D,<:Integer}) where {D}
-  checked_degrees = _checked_degrees(degrees)
+  checked_degrees = _checked_basis_degrees(degrees)
   return _mode_within_degrees(checked_degrees, mode)
 end
 
 function is_active_mode(::TrunkBasis, degrees::NTuple{D,<:Integer},
                         mode::NTuple{D,<:Integer}) where {D}
-  checked_degrees = _checked_degrees(degrees)
-  _mode_within_degrees(checked_degrees, mode) || return false
-  max_degree = _trunk_retained_order_limit(checked_degrees)
-  return _trunk_retained_order(mode) <= max_degree
+  checked_degrees = _checked_basis_degrees(degrees)
+  return _is_trunk_mode_active(checked_degrees, mode)
 end
 
 # Iterator interface.
@@ -262,8 +271,33 @@ Base.IteratorSize(::Type{<:BasisModes}) = Base.HasLength()
 Base.eltype(::Type{BasisModes{D,B}}) where {D,B} = NTuple{D,Int}
 Base.length(iterator::BasisModes) = iterator.count
 
+Base.IteratorSize(::Type{<:FullTensorBasisModes}) = Base.HasLength()
+Base.eltype(::Type{FullTensorBasisModes{D}}) where {D} = NTuple{D,Int}
+Base.length(iterator::FullTensorBasisModes) = iterator.count
+
+Base.IteratorSize(::Type{<:TrunkBasisModes}) = Base.HasLength()
+Base.eltype(::Type{TrunkBasisModes{D}}) where {D} = NTuple{D,Int}
+Base.length(iterator::TrunkBasisModes) = iterator.count
+
+# Full tensor iteration needs no filtering: every mixed-radix state is active.
+function Base.iterate(iterator::FullTensorBasisModes, state::Int=0)
+  state < iterator.count || return nothing
+  return _mode_from_linear_index(state, iterator.degrees), state + 1
+end
+
+# Trunk iteration un-ranks active modes directly in the same ordering that a
+# filtered mixed-radix tensor-product traversal would produce. This avoids
+# scanning rejected high-order cross terms.
+function Base.iterate(iterator::TrunkBasisModes{D}, state::Int=0) where {D}
+  state < iterator.count || return nothing
+  mode = _trunk_mode_from_rank(Val(D), iterator.degrees, iterator.completion_counts,
+                               _trunk_retained_order_limit(iterator.degrees), state)
+  return mode, state + 1
+end
+
 # Iterate over the mixed-radix tensor-product box and yield only the modes that
-# satisfy the family-specific admissibility rule.
+# satisfy the family-specific admissibility rule. This is the fallback path for
+# custom basis families.
 function Base.iterate(iterator::BasisModes{D}, state::Int=0) where {D}
   total = iterator.box_count
 
@@ -278,8 +312,22 @@ end
 
 # Mixed-radix utilities and small admissibility helpers.
 
-@inline function _basis_mode_box_count(degrees::NTuple{D,Int}) where {D}
-  return prod(axis -> degrees[axis] + 1, 1:D; init=1)
+function _checked_basis_degrees(degrees::NTuple{D,<:Integer}) where {D}
+  D >= 1 || throw(ArgumentError("basis dimension must be positive"))
+  return _checked_degrees(degrees)
+end
+
+function _checked_basis_mode_box_count(degrees::NTuple{D,Int}) where {D}
+  total = Int128(1)
+
+  for axis in 1:D
+    choices = Int128(degrees[axis]) + 1
+    choices <= typemax(Int) || throw(ArgumentError("basis mode count must be Int-representable"))
+    total *= choices
+    total <= typemax(Int) || throw(ArgumentError("basis mode count must be Int-representable"))
+  end
+
+  return Int(total)
 end
 
 # Decode a mixed-radix linear index into one tensor-product mode tuple, using
@@ -296,7 +344,7 @@ end
 # Quick admissibility test for the axiswise box bounds `0 ≤ mₐ ≤ pₐ`.
 function _mode_within_degrees(degrees::NTuple{D,Int}, mode::NTuple{D,<:Integer}) where {D}
   @inbounds for axis in 1:D
-    value = Int(mode[axis])
+    value = mode[axis]
     0 <= value <= degrees[axis] || return false
   end
 
@@ -308,16 +356,128 @@ end
 @inline _trunk_mode_order(value::Int) = value <= 1 ? 0 : value
 @inline _trunk_retained_order_limit(degrees::NTuple{D,Int}) where {D} = maximum(degrees; init=0)
 
-function _trunk_retained_order(mode::NTuple{D,<:Integer}) where {D}
+# For every `n`, `completion_counts[n+1][r+1]` stores how many assignments on
+# axes `1:n` have retained order at most `r`. The trunk iterator uses these
+# cumulative counts to un-rank active modes without visiting inactive tensor
+# entries.
+function _trunk_mode_count(degrees::NTuple{D,Int}) where {D}
+  limit = _trunk_retained_order_limit(degrees)
+  limit < typemax(Int) || throw(ArgumentError("basis retained-order limit is too large"))
+  current = zeros(Int128, limit + 1)
+  next = zeros(Int128, limit + 1)
+  current[1] = 1
+
+  for axis in 1:D
+    _update_trunk_exact_counts!(next, current, degrees[axis], limit)
+    current, next = next, current
+  end
+
+  return _checked_total_mode_count(current)
+end
+
+function _trunk_completion_counts(degrees::NTuple{D,Int}) where {D}
+  limit = _trunk_retained_order_limit(degrees)
+  limit < typemax(Int) || throw(ArgumentError("basis retained-order limit is too large"))
+  exact = zeros(Int128, limit + 1)
+  exact[1] = 1
+  completion_counts = Vector{Vector{Int}}(undef, D + 1)
+  completion_counts[1] = ones(Int, limit + 1)
+
+  for axis in 1:D
+    next = zeros(Int128, limit + 1)
+    _update_trunk_exact_counts!(next, exact, degrees[axis], limit)
+    exact = next
+    completion_counts[axis+1] = _cumulative_mode_counts(exact)
+  end
+
+  return completion_counts
+end
+
+function _update_trunk_exact_counts!(next::Vector{Int128}, current_counts::Vector{Int128},
+                                     degree::Int, limit::Int)
+  fill!(next, 0)
+  endpoint_choices = degree == 0 ? Int128(1) : Int128(2)
+
+  for retained_order in 0:limit
+    current = current_counts[retained_order+1]
+    current == 0 && continue
+    _add_mode_count!(next, retained_order, current * endpoint_choices)
+
+    for order in 2:min(degree, limit-retained_order)
+      _add_mode_count!(next, retained_order + order, current)
+    end
+  end
+
+  return next
+end
+
+function _add_mode_count!(counts::Vector{Int128}, retained_order::Int, increment::Int128)
+  updated = counts[retained_order+1] + increment
+  updated <= typemax(Int) || throw(ArgumentError("basis mode count must be Int-representable"))
+  counts[retained_order+1] = updated
+  return counts
+end
+
+function _checked_total_mode_count(counts::Vector{Int128})
+  total = Int128(0)
+
+  for count in counts
+    total += count
+    total <= typemax(Int) || throw(ArgumentError("basis mode count must be Int-representable"))
+  end
+
+  return Int(total)
+end
+
+function _cumulative_mode_counts(exact::Vector{Int128})
+  cumulative = Vector{Int}(undef, length(exact))
+  running = Int128(0)
+
+  for index in eachindex(exact)
+    running += exact[index]
+    running <= typemax(Int) || throw(ArgumentError("basis mode count must be Int-representable"))
+    cumulative[index] = Int(running)
+  end
+
+  return cumulative
+end
+
+function _trunk_mode_from_rank(::Val{0}, degrees::NTuple{D,Int}, completion_counts, budget::Int,
+                               rank::Int) where {D}
+  return ()
+end
+
+function _trunk_mode_from_rank(::Val{A}, degrees::NTuple{D,Int}, completion_counts, budget::Int,
+                               rank::Int) where {A,D}
+  for value in _axis_mode_values(degrees[A])
+    order = _trunk_mode_order(value)
+    order <= budget || continue
+    completions = completion_counts[A][budget-order+1]
+
+    if rank < completions
+      return (_trunk_mode_from_rank(Val(A - 1), degrees, completion_counts, budget - order,
+                                    rank)..., value)
+    end
+
+    rank -= completions
+  end
+
+  throw(ArgumentError("invalid trunk basis mode rank"))
+end
+
+function _is_trunk_mode_active(degrees::NTuple{D,Int}, mode::NTuple{D,<:Integer}) where {D}
+  _mode_within_degrees(degrees, mode) || return false
+  limit = _trunk_retained_order_limit(degrees)
   retained_order = 0
 
   @inbounds for axis in 1:D
     value = Int(mode[axis])
-    value >= 0 || throw(ArgumentError("mode[$axis] must be non-negative"))
-    retained_order += _trunk_mode_order(value)
+    order = _trunk_mode_order(value)
+    order <= limit - retained_order || return false
+    retained_order += order
   end
 
-  return retained_order
+  return true
 end
 
 # Enumerate the one-dimensional candidate mode indices on one axis before the

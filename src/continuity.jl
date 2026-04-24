@@ -46,7 +46,7 @@
 # Core data structures shared across the compilation phases.
 
 # Internal continuity-policy abstraction used by space compilation. The public
-# API exposes per-axis `:cg`/`:dg` choices, and the compiler threads the
+# API exposes per-axis `:cg`/`:dg` choices, and the compiler carries the
 # resulting normalized policy explicitly so the same stages handle full and
 # mixed spaces.
 abstract type _AbstractContinuityPolicy end
@@ -150,22 +150,21 @@ end
 # later compilation phases can work with integer interval arithmetic and shared
 # local mode tables.
 function _build_space_state(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                            basis::B,
+                            leaf_to_index::Vector{Int}, basis::B,
                             leaf_degrees::Vector{NTuple{D,Int}}) where {D,T<:AbstractFloat,B}
   grid_data = grid(domain)
   length(leaf_degrees) == length(active) ||
     throw(ArgumentError("leaf degree data must match the active-leaf count"))
   finest_levels = ntuple(axis -> maximum(level(grid_data, leaf, axis) for leaf in active; init=0),
                          D)
-  leaf_to_index = zeros(Int, stored_cell_count(grid_data))
   leaf_patterns = Vector{_LeafPattern{D}}(undef, length(active))
   leaf_lower = Vector{NTuple{D,Int}}(undef, length(active))
   leaf_upper = Vector{NTuple{D,Int}}(undef, length(active))
   pattern_cache = Dict{NTuple{D,Int},_LeafPattern{D}}()
+  sizehint!(pattern_cache, length(active))
 
   for leaf_index in eachindex(active)
     leaf = active[leaf_index]
-    leaf_to_index[leaf] = leaf_index
     degrees = leaf_degrees[leaf_index]
     leaf_patterns[leaf_index] = get!(pattern_cache, degrees) do
       _leaf_pattern(basis, degrees)
@@ -194,9 +193,10 @@ end
 # policy with at least one CG axis introduces provisional variables only for the
 # local modes that actually participate in CG trace coupling.
 function _enumerate_space_modes(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                                basis::B, leaf_degrees::Vector{NTuple{D,Int}},
+                                leaf_to_index::Vector{Int}, basis::B,
+                                leaf_degrees::Vector{NTuple{D,Int}},
                                 continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat,B}
-  state = _build_space_state(domain, active, basis, leaf_degrees)
+  state = _build_space_state(domain, active, leaf_to_index, basis, leaf_degrees)
   _enumerate_trace_modes!(state, continuity_policy)
   return state
 end
@@ -223,6 +223,7 @@ function _build_boundary_variables!(state::_SpaceBuildState{D,T},
 
   for leaf_index in eachindex(state.active_leaves)
     lookup = state.boundary_lookup[leaf_index]
+    sizehint!(lookup, length(state.leaf_patterns[leaf_index].boundary_modes))
 
     for mode in state.leaf_patterns[leaf_index].boundary_modes
       _mode_requires_trace_coupling(continuity_policy, mode) || continue
@@ -263,43 +264,22 @@ function _compile_leaf(state::_SpaceBuildState{D,T}, leaf_index::Int,
   degrees = state.leaf_degrees[leaf_index]
   pattern = state.leaf_patterns[leaf_index]
   support_shape = pattern.support_shape
-  row_terms = Dict{NTuple{D,Int},Dict{Int,T}}()
-
-  for mode in pattern.local_modes
-    # Modes whose endpoint content lies only on DG axes are independent local
-    # unknowns. Only modes that touch at least one CG axis participate in the
-    # trace-coupling algebra.
-    coefficients = _mode_coefficients(state, leaf_index, continuity_policy, mode, T)
-    isempty(coefficients) || (row_terms[mode] = coefficients)
-  end
-
+  mode_total = length(pattern.local_modes)
   local_modes_data = NTuple{D,Int}[]
+  sizehint!(local_modes_data, mode_total)
   term_offsets = Int[1]
+  sizehint!(term_offsets, mode_total + 1)
   term_indices = Int[]
+  sizehint!(term_indices, mode_total)
   term_coefficients = T[]
+  sizehint!(term_coefficients, mode_total)
 
   for mode in pattern.local_modes
-    # Compress the dictionary representation into the sorted sparse arrays used
-    # at runtime by evaluation and assembly.
-    coefficients = get(row_terms, mode, nothing)
-    coefficients === nothing && continue
-    roots = sort!(collect(keys(coefficients)))
-    isempty(roots) && continue
-    push!(local_modes_data, mode)
-
-    for root in roots
-      coefficient = coefficients[root]
-      abs(coefficient) <= _constraint_tolerance(T) && continue
-      push!(term_indices, root)
-      push!(term_coefficients, coefficient)
-    end
-
-    term_offsets[end] <= length(term_indices) + 1 ||
-      throw(ArgumentError("invalid local term ordering"))
-    push!(term_offsets, length(term_indices) + 1)
+    _append_compiled_mode!(local_modes_data, term_offsets, term_indices, term_coefficients, state,
+                           leaf_index, continuity_policy, mode, T)
   end
 
-  mode_lookup = zeros(Int, prod(support_shape))
+  mode_lookup = zeros(Int, _checked_basis_mode_box_count(degrees))
 
   for mode_index in eachindex(local_modes_data)
     mode_lookup[_flatten_mode(local_modes_data[mode_index], support_shape)] = mode_index
@@ -311,6 +291,58 @@ function _compile_leaf(state::_SpaceBuildState{D,T}, leaf_index::Int,
   return _CompiledLeaf(leaf, degrees, support_shape, local_modes_data, mode_lookup, term_offsets,
                        term_indices, term_coefficients, single_term_indices,
                        single_term_coefficients, quadrature_shape)
+end
+
+# Append the finalized global expansion of one local mode directly into the
+# compact runtime arrays. Boundary modes reuse the already eliminated trace
+# expression; interior or DG-only modes receive a fresh scalar dof immediately.
+function _append_compiled_mode!(local_modes_data::Vector{NTuple{D,Int}}, term_offsets::Vector{Int},
+                                term_indices::Vector{Int}, term_coefficients::Vector{T},
+                                state::_SpaceBuildState{D,T}, leaf_index::Int,
+                                continuity_policy::_AxisContinuity{D}, mode::NTuple{D,Int},
+                                ::Type{T}) where {D,T<:AbstractFloat}
+  first_term = length(term_indices) + 1
+
+  if _mode_requires_trace_coupling(continuity_policy, mode)
+    _append_boundary_mode_terms!(term_indices, term_coefficients, state, leaf_index, mode)
+  else
+    _append_independent_mode_terms!(term_indices, term_coefficients, state, T)
+  end
+
+  first_term <= length(term_indices) || return local_modes_data
+  push!(local_modes_data, mode)
+  push!(term_offsets, length(term_indices) + 1)
+  return local_modes_data
+end
+
+# Copy one finalized boundary-variable expansion into the current compiled leaf.
+# Empty expansions represent traces constrained to zero, in which case the local
+# mode is omitted from the active runtime mode table.
+function _append_boundary_mode_terms!(term_indices::Vector{Int}, term_coefficients::Vector{T},
+                                      state::_SpaceBuildState{D,T}, leaf_index::Int,
+                                      mode::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  variable = get(state.boundary_lookup[leaf_index], mode, 0)
+  variable != 0 || throw(ArgumentError("missing boundary variable for local mode"))
+
+  for term in state.boundary_terms[variable]
+    iszero(term.second) && continue
+    push!(term_indices, term.first)
+    push!(term_coefficients, term.second)
+  end
+
+  return term_indices
+end
+
+# Assign one independent global scalar dof to a mode that does not participate in
+# CG trace coupling.
+function _append_independent_mode_terms!(term_indices::Vector{Int}, term_coefficients::Vector{T},
+                                         state::_SpaceBuildState{D,T},
+                                         ::Type{T}) where {D,T<:AbstractFloat}
+  dof = state.next_global_dof
+  state.next_global_dof += 1
+  push!(term_indices, dof)
+  push!(term_coefficients, one(T))
+  return term_indices
 end
 
 # Finalize every active leaf after the continuity algebra has been settled. The
@@ -348,21 +380,25 @@ end
 function _compile_boundary_terms!(state::_SpaceBuildState{D,T},
                                   continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat}
   parent = collect(1:state.boundary_var_count)
-  zeroed = falses(state.boundary_var_count)
   face_pairs = _internal_face_pairs(state, continuity_policy)
 
-  # First collapse all matching-face identities and detect trace variables that
-  # cannot survive because their tangential content is not representable on the
-  # common face space.
-  _merge_matching_faces!(parent, zeroed, state, face_pairs)
+  # First collapse only those matching faces whose trace-variable sets agree
+  # exactly. The returned list contains the geometric hanging faces and
+  # p-mismatched faces that need explicit comparison rows.
+  constraint_face_pairs = _merge_direct_faces!(parent, state, face_pairs)
   roots = _boundary_roots!(parent)
-  zeroed_roots = _zeroed_roots(roots, zeroed)
 
-  # Then assemble explicit linear rows only for genuinely hanging interfaces,
-  # and append one-variable zero rows for trace representatives that were marked
-  # incompatible in the merge pass.
-  rows = _build_hanging_face_rows!(state, roots, face_pairs)
-  _append_zeroed_root_rows!(rows, roots, zeroed_roots, T)
+  # Then assemble explicit linear rows for every non-direct interface. These rows
+  # compare both traces in a common face space and therefore also constrain extra
+  # p-content that only exists on one side.
+  rows = _build_face_constraint_rows!(state, roots, constraint_face_pairs)
+
+  if isempty(rows)
+    free_dofs = _assign_unconstrained_boundary_dofs!(state, roots)
+    _initialize_unconstrained_root_boundary_terms!(state.boundary_terms, roots, free_dofs, T)
+    _propagate_root_boundary_terms!(state.boundary_terms, roots)
+    return state
+  end
 
   # The remaining algebra is solved component-wise on the variable graph. This
   # yields pivot expressions for constrained representatives and identifies the
@@ -371,11 +407,11 @@ function _compile_boundary_terms!(state::_SpaceBuildState{D,T},
   components = findall(!isempty, component_rows)
   pivots, component_orders = _eliminate_boundary_components!(component_rows, components,
                                                              state.boundary_var_count, T)
-  free_dofs = _assign_free_boundary_dofs!(state, roots, zeroed_roots, pivots)
+  free_dofs = _assign_free_boundary_dofs!(state, roots, pivots)
 
   # Finally convert every provisional boundary variable into its explicit sparse
   # expansion in global scalar dofs.
-  _initialize_root_boundary_terms!(state.boundary_terms, roots, zeroed_roots, pivots, free_dofs, T)
+  _initialize_root_boundary_terms!(state.boundary_terms, roots, pivots, free_dofs, T)
   _finalize_boundary_components!(state.boundary_terms, pivots, component_orders, free_dofs, T)
   _propagate_root_boundary_terms!(state.boundary_terms, roots)
   return state
@@ -399,14 +435,14 @@ end
 # interfaces normal to CG axes participate in the continuity algebra.
 function _internal_face_pairs(state::_SpaceBuildState{D},
                               continuity_policy::_AxisContinuity{D}) where {D}
-  pairs = Tuple{Int,Int,Int,Int}[]
+  pairs = Tuple{Int,Int,Int}[]
+  sizehint!(pairs, length(state.active_leaves) * D)
 
   for (leaf, axis, other) in
       _filtered_upper_face_neighbor_specs(state.grid, state.active_leaves, state.leaf_to_index)
     _is_cg_axis(continuity_policy, axis) || continue
     push!(pairs,
-          (@inbounds(state.leaf_to_index[leaf]), @inbounds(state.leaf_to_index[other]), axis,
-           UPPER))
+          (@inbounds(state.leaf_to_index[leaf]), @inbounds(state.leaf_to_index[other]), axis))
   end
 
   return pairs
@@ -417,9 +453,11 @@ end
 # This classification depends only on the basis and the degree tuple, not yet on
 # the later continuity policy.
 function _leaf_pattern(basis::AbstractBasisFamily, degrees::NTuple{D,Int}) where {D}
+  _checked_basis_mode_box_count(degrees)
   support_shape = ntuple(axis -> degrees[axis] + 1, D)
   local_modes = collect(basis_modes(basis, degrees))
   boundary_modes = NTuple{D,Int}[]
+  sizehint!(boundary_modes, length(local_modes))
 
   for mode_index in eachindex(local_modes)
     mode = local_modes[mode_index]
@@ -429,67 +467,67 @@ function _leaf_pattern(basis::AbstractBasisFamily, degrees::NTuple{D,Int}) where
   return _LeafPattern(support_shape, local_modes, boundary_modes)
 end
 
-# Matching-face merge and hanging-face row assembly.
+# Matching-face merge and general face-row assembly.
 
-# Process all interfaces that geometrically coincide face-to-face. Compatible
-# trace variables are merged by union-find, while tangential modes that are not
-# representable in the common face space are marked as zero.
-function _merge_matching_faces!(parent::Vector{Int}, zeroed::BitVector, state::_SpaceBuildState{D},
-                                face_pairs) where {D}
-  for (first_leaf_index, second_leaf_index, axis, first_side) in face_pairs
-    second_side, common_degrees, matching = _face_pair_metadata(state, first_leaf_index,
-                                                                second_leaf_index, axis, first_side)
-    _mark_incompatible_face_modes!(zeroed, state, first_leaf_index, axis, first_side,
-                                   common_degrees)
-    _mark_incompatible_face_modes!(zeroed, state, second_leaf_index, axis, second_side,
-                                   common_degrees)
-    matching || continue
-    _merge_matching_face!(parent, state, first_leaf_index, second_leaf_index, axis, first_side,
-                          second_side, common_degrees)
+# Process all interfaces whose geometric patches and trace-variable sets match
+# exactly. Such faces need no algebraic rows: each upper-side trace variable can
+# be identified directly with the corresponding lower-side variable.
+function _merge_direct_faces!(parent::Vector{Int}, state::_SpaceBuildState{D}, face_pairs) where {D}
+  constraint_face_pairs = Tuple{Int,Int,Int}[]
+  sizehint!(constraint_face_pairs, length(face_pairs))
+
+  for (first_leaf_index, second_leaf_index, axis) in face_pairs
+    if _directly_mergeable_face(state, first_leaf_index, second_leaf_index, axis)
+      _merge_direct_face!(parent, state, first_leaf_index, second_leaf_index, axis)
+    else
+      push!(constraint_face_pairs, (first_leaf_index, second_leaf_index, axis))
+    end
   end
 
-  return parent
+  return constraint_face_pairs
 end
 
-# Build continuity rows for all nonmatching hanging interfaces. Each row states
-# that one trace mode in the common overlap space has identical coefficients
-# when expanded from either side.
-function _build_hanging_face_rows!(state::_SpaceBuildState{D,T}, roots::Vector{Int},
-                                   face_pairs) where {D,T<:AbstractFloat}
-  isempty(face_pairs) && return _ConstraintRow{T}[]
+# Build continuity rows for all interfaces that cannot be represented by direct
+# variable identification. Each row states that one trace mode in the comparison
+# face space has identical coefficients when expanded from either side.
+function _build_face_constraint_rows!(state::_SpaceBuildState{D,T}, roots::Vector{Int},
+                                      constraint_face_pairs) where {D,T<:AbstractFloat}
+  isempty(constraint_face_pairs) && return _ConstraintRow{T}[]
   restriction_cache = Dict{NTuple{4,Int},Matrix{T}}()
   rows = _ConstraintRow{T}[]
 
-  for (first_leaf_index, second_leaf_index, axis, first_side) in face_pairs
-    second_side, common_degrees, matching = _face_pair_metadata(state, first_leaf_index,
-                                                                second_leaf_index, axis, first_side)
-    matching && continue
-    _add_hanging_face_rows!(rows, restriction_cache, roots, state, first_leaf_index,
-                            second_leaf_index, axis, first_side, second_side, common_degrees)
+  for (first_leaf_index, second_leaf_index, axis) in constraint_face_pairs
+    comparison_degrees = _comparison_face_degrees(state, first_leaf_index, second_leaf_index, axis)
+    _add_face_constraint_rows!(rows, restriction_cache, roots, state, first_leaf_index,
+                               second_leaf_index, axis, comparison_degrees)
   end
 
   return rows
 end
 
-# Assemble all continuity rows contributed by one nonmatching face pair. The two
-# traces are both restricted to the same overlap patch and then tested against
-# the basis of the common face space.
-function _add_hanging_face_rows!(rows::Vector{_ConstraintRow{T}},
-                                 restriction_cache::Dict{NTuple{4,Int},Matrix{T}},
-                                 roots::Vector{Int}, state::_SpaceBuildState{D,T},
-                                 first_leaf_index::Int, second_leaf_index::Int, axis::Int,
-                                 first_side::Int, second_side::Int,
-                                 common_degrees::NTuple{D,Int}) where {D,T<:AbstractFloat}
-  piece = _face_piece(state, first_leaf_index, second_leaf_index, axis, first_side)
+# Assemble all continuity rows contributed by one non-direct face pair. The two
+# traces are both expanded into the same full tensor comparison face space. This
+# covers hanging geometry and p-mismatch, including the case where a degree-zero
+# trace factor represents a constant rather than an endpoint function.
+function _add_face_constraint_rows!(rows::Vector{_ConstraintRow{T}},
+                                    restriction_cache::Dict{NTuple{4,Int},Matrix{T}},
+                                    roots::Vector{Int}, state::_SpaceBuildState{D,T},
+                                    first_leaf_index::Int, second_leaf_index::Int, axis::Int,
+                                    comparison_degrees::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  piece = _face_piece(state, first_leaf_index, second_leaf_index, axis, UPPER)
+  row_capacity = length(_face_boundary_modes(state, first_leaf_index, axis, UPPER)) +
+                 length(_face_boundary_modes(state, second_leaf_index, axis, LOWER))
 
-  # Each basis mode of the common face space contributes one scalar continuity
+  # Each basis mode of the comparison face space contributes one scalar continuity
   # equation equating the restricted coefficient seen from the two sides.
-  for common_mode in basis_modes(state.basis, common_degrees)
+  for comparison_mode in basis_modes(FullTensorBasis(), comparison_degrees)
     row = _ConstraintRow{T}(Int[], T[])
-    _accumulate_face_row!(row, restriction_cache, roots, state, first_leaf_index, axis, first_side,
-                          piece, common_degrees, common_mode, one(T))
-    _accumulate_face_row!(row, restriction_cache, roots, state, second_leaf_index, axis,
-                          second_side, piece, common_degrees, common_mode, -one(T))
+    sizehint!(row.variables, row_capacity)
+    sizehint!(row.coefficients, row_capacity)
+    _accumulate_face_row!(row, restriction_cache, roots, state, first_leaf_index, axis, UPPER,
+                          piece, comparison_degrees, comparison_mode, one(T))
+    _accumulate_face_row!(row, restriction_cache, roots, state, second_leaf_index, axis, LOWER,
+                          piece, comparison_degrees, comparison_mode, -one(T))
     _cleanup_boundary_row!(row, T)
     _row_isempty(row) || push!(rows, row)
   end
@@ -497,44 +535,22 @@ function _add_hanging_face_rows!(rows::Vector{_ConstraintRow{T}},
   return rows
 end
 
-# On a geometrically matching face, continuity is enforced by simple variable
+# On a directly mergeable face, continuity is enforced by simple variable
 # identification: the same trace mode on both sides is the same global unknown.
-function _merge_matching_face!(parent::Vector{Int}, state::_SpaceBuildState{D},
-                               first_leaf_index::Int, second_leaf_index::Int, axis::Int,
-                               first_side::Int, second_side::Int,
-                               common_degrees::NTuple{D,Int}) where {D}
-  first_lookup = state.boundary_lookup[first_leaf_index]
+function _merge_direct_face!(parent::Vector{Int}, state::_SpaceBuildState{D}, first_leaf_index::Int,
+                             second_leaf_index::Int, axis::Int) where {D}
   second_lookup = state.boundary_lookup[second_leaf_index]
-  first_side_mode = _side_mode(first_side)
-  second_side_mode = _side_mode(second_side)
+  second_side_mode = _side_mode(LOWER)
 
-  for common_mode in basis_modes(state.basis, common_degrees)
-    first_mode = ntuple(current_axis -> current_axis == axis ? first_side_mode :
-                                        common_mode[current_axis], D)
-    second_mode = ntuple(current_axis -> current_axis == axis ? second_side_mode :
-                                         common_mode[current_axis], D)
-    first_variable = get(first_lookup, first_mode, 0)
+  for boundary_variable in _face_boundary_modes(state, first_leaf_index, axis, UPPER)
+    first_mode = boundary_variable.mode
+    second_mode = _opposite_face_mode(first_mode, axis, second_side_mode)
     second_variable = get(second_lookup, second_mode, 0)
-    (first_variable == 0 || second_variable == 0) && continue
-    _union_boundary_variables!(parent, first_variable, second_variable)
+    second_variable != 0 || throw(ArgumentError("missing matching trace variable"))
+    _union_boundary_variables!(parent, boundary_variable.variable, second_variable)
   end
 
   return parent
-end
-
-# Any local face mode whose tangential content lies outside the common face
-# space cannot participate in a continuous trace across that interface, so its
-# coefficient must vanish there.
-function _mark_incompatible_face_modes!(zeroed::BitVector, state::_SpaceBuildState{D},
-                                        leaf_index::Int, axis::Int, side::Int,
-                                        common_degrees::NTuple{D,Int}) where {D}
-  for boundary_variable in _face_boundary_modes(state, leaf_index, axis, side)
-    _compatible_face_mode(state.basis, common_degrees, axis, boundary_variable.mode) === nothing ||
-      continue
-    zeroed[boundary_variable.variable] = true
-  end
-
-  return zeroed
 end
 
 # Add one side of one hanging-face continuity equation to a sparse row. The
@@ -544,34 +560,17 @@ end
 function _accumulate_face_row!(row::_ConstraintRow{T},
                                restriction_cache::Dict{NTuple{4,Int},Matrix{T}}, roots::Vector{Int},
                                state::_SpaceBuildState{D,T}, leaf_index::Int, face_axis::Int,
-                               side::Int, piece::_FacePiece{D}, common_degrees::NTuple{D,Int},
-                               common_mode::NTuple{D,Int}, sign::T) where {D,T<:AbstractFloat}
+                               side::Int, piece::_FacePiece{D}, comparison_degrees::NTuple{D,Int},
+                               comparison_mode::NTuple{D,Int}, sign::T) where {D,T<:AbstractFloat}
   for boundary_variable in _face_boundary_modes(state, leaf_index, face_axis, side)
     mode = boundary_variable.mode
-    _compatible_face_mode(state.basis, common_degrees, face_axis, mode) === nothing && continue
     coefficient = _face_restriction_coefficient(restriction_cache, state, leaf_index, face_axis,
-                                                piece, mode, common_mode, common_degrees)
-    abs(coefficient) <= _constraint_tolerance(T) && continue
+                                                piece, mode, comparison_mode, comparison_degrees)
+    iszero(coefficient) && continue
     _row_add!(row, roots[boundary_variable.variable], sign * coefficient)
   end
 
   return row
-end
-
-# Recover the already finalized expansion of one provisional boundary variable.
-# A copy is returned because the caller may combine or filter coefficients when
-# assembling the local sparse representation of a compiled leaf.
-function _boundary_mode_terms(state::_SpaceBuildState{D,T}, leaf_index::Int,
-                              mode::NTuple{D,Int}) where {D,T<:AbstractFloat}
-  variable = get(state.boundary_lookup[leaf_index], mode, 0)
-  variable != 0 || throw(ArgumentError("missing boundary variable for local mode"))
-  terms = Dict{Int,T}()
-
-  for term in state.boundary_terms[variable]
-    terms[term.first] = term.second
-  end
-
-  return terms
 end
 
 # Decide whether one local tensor-product mode really needs the boundary-trace
@@ -585,24 +584,6 @@ end
   end
 
   return false
-end
-
-@inline function _independent_mode_terms(state::_SpaceBuildState{D,T}, ::NTuple{D,<:Integer},
-                                         ::Type{T}) where {D,T<:AbstractFloat}
-  dof = state.next_global_dof
-  state.next_global_dof += 1
-  return Dict{Int,T}(dof => one(T))
-end
-
-# Resolve one local mode either through the compiled boundary-variable expansion
-# or, if it never participates in a CG trace, by assigning it a fresh
-# independent scalar dof directly.
-function _mode_coefficients(state::_SpaceBuildState{D,T}, leaf_index::Int,
-                            continuity_policy::_AxisContinuity{D}, mode::NTuple{D,Int},
-                            ::Type{T}) where {D,T<:AbstractFloat}
-  _mode_requires_trace_coupling(continuity_policy, mode) ||
-    return _independent_mode_terms(state, mode, T)
-  return _boundary_mode_terms(state, leaf_index, mode)
 end
 
 # Compute the exact logical overlap patch of two adjacent faces on the common
@@ -635,60 +616,36 @@ end
 function _face_restriction_coefficient(restriction_cache::Dict{NTuple{4,Int},Matrix{T}},
                                        state::_SpaceBuildState{D,T}, leaf_index::Int,
                                        face_axis::Int, piece::_FacePiece{D}, mode::NTuple{D,Int},
-                                       common_mode::NTuple{D,Int},
-                                       common_degrees::NTuple{D,Int}) where {D,T<:AbstractFloat}
+                                       comparison_mode::NTuple{D,Int},
+                                       comparison_degrees::NTuple{D,Int}) where {D,T<:AbstractFloat}
   coefficient = one(T)
 
   for axis in 1:D
     axis == face_axis && continue
-    column = _dyadic_restriction_column!(restriction_cache, state,
-                                         state.leaf_lower[leaf_index][axis],
-                                         state.leaf_upper[leaf_index][axis], piece.lower[axis],
-                                         piece.upper[axis], mode[axis], common_degrees[axis], axis)
-    coefficient *= column[common_mode[axis]+1]
-    abs(coefficient) <= _constraint_tolerance(T) && return zero(T)
+    coefficient *= _dyadic_restriction_coefficient!(restriction_cache, state,
+                                                    state.leaf_lower[leaf_index][axis],
+                                                    state.leaf_upper[leaf_index][axis],
+                                                    piece.lower[axis], piece.upper[axis],
+                                                    mode[axis],
+                                                    state.leaf_degrees[leaf_index][axis],
+                                                    comparison_degrees[axis], comparison_mode[axis],
+                                                    axis)
+    iszero(coefficient) && return zero(T)
   end
 
   return coefficient
 end
 
-# Determine whether a boundary mode can appear in the common face space and, if
-# so, return the corresponding tangential mode tuple. The face-normal component
-# is replaced by `0` as a placeholder because the common trace space lives only
-# in the tangential directions.
-function _compatible_face_mode(basis::AbstractBasisFamily, common_degrees::NTuple{D,Int},
-                               face_axis::Int, mode::NTuple{D,Int}) where {D}
-  for axis in 1:D
-    axis == face_axis && continue
-    mode[axis] <= common_degrees[axis] || return nothing
-  end
-
-  common_mode = ntuple(axis -> axis == face_axis ? 0 : mode[axis], D)
-  return is_active_mode(basis, common_degrees, common_mode) ? common_mode : nothing
-end
-
-# Shared metadata for one active face pair. Both the matching-face merge pass
-# and the hanging-face row builder need the opposite side, common face degrees,
-# and the matching-vs-hanging classification.
-function _face_pair_metadata(state::_SpaceBuildState{D}, first_leaf_index::Int,
-                             second_leaf_index::Int, axis::Int, first_side::Int) where {D}
-  second_side = _opposite_side(first_side)
-  common_degrees = _common_face_degrees(state, first_leaf_index, second_leaf_index, axis)
-  matching = _matching_face(state, first_leaf_index, second_leaf_index, axis)
-  return second_side, common_degrees, matching
-end
-
 # Sparse row algebra for boundary constraints.
 
-@inline _pivot_expression(pivots::Dict{Int,_ConstraintRow{T}}, variable::Int) where {T<:AbstractFloat} = get(pivots,
-                                                                                                             variable,
-                                                                                                             nothing)
-@inline _pivot_expression(pivots::AbstractVector{<:Union{Nothing,_ConstraintRow{T}}}, variable::Int) where {T<:AbstractFloat} = pivots[variable]
+@inline function _pivot_expression(pivots::Dict{Int,_ConstraintRow{T}},
+                                   variable::Int) where {T<:AbstractFloat}
+  return get(pivots, variable, nothing)
+end
 
-# Expand one pivot expression into `row` with the given coefficient factor.
-function _accumulate_scaled_row!(row::_ConstraintRow{T}, expression::_ConstraintRow{T},
-                                 factor::T) where {T<:AbstractFloat}
-  return _accumulate_row!(row, expression, factor)
+@inline function _pivot_expression(pivots::AbstractVector{<:Union{Nothing,_ConstraintRow{T}}},
+                                   variable::Int) where {T<:AbstractFloat}
+  return pivots[variable]
 end
 
 # Replace the first pivot variable still present in `row` by its stored
@@ -699,7 +656,7 @@ function _substitute_boundary_step!(row::_ConstraintRow{T}, pivots) where {T<:Ab
     expression === nothing && continue
     factor = row.coefficients[index]
     _remove_variable_at!(row, index)
-    _accumulate_scaled_row!(row, expression, factor)
+    _accumulate_row!(row, expression, factor)
     return true
   end
 
@@ -771,7 +728,7 @@ function _finalize_boundary_terms!(expression::_ConstraintRow{T},
   for index in eachindex(expression.variables)
     variable = expression.variables[index]
     factor = expression.coefficients[index]
-    abs(factor) <= _constraint_tolerance(T) && continue
+    iszero(factor) && continue
     terms = boundary_terms[variable]
 
     # An empty term list means the variable was constrained to zero. Otherwise
@@ -792,13 +749,43 @@ end
 
 # Shared face-space metadata.
 
-# The common face space keeps the face-normal direction fixed and uses the
-# minimum tangential degree seen on the two sides, because only that tangential
-# polynomial content can be represented exactly on both traces.
-function _common_face_degrees(state::_SpaceBuildState{D}, first_leaf_index::Int,
-                              second_leaf_index::Int, axis::Int) where {D}
+# A face can be merged by union-find only if the geometric patches coincide and
+# both sides expose exactly the same trace-mode signatures. Otherwise explicit
+# comparison rows are needed, even when the cells are geometrically matching.
+function _directly_mergeable_face(state::_SpaceBuildState{D}, first_leaf_index::Int,
+                                  second_leaf_index::Int, axis::Int) where {D}
+  return _matching_face(state, first_leaf_index, second_leaf_index, axis) &&
+         _same_face_trace_modes(state, first_leaf_index, second_leaf_index, axis)
+end
+
+function _same_face_trace_modes(state::_SpaceBuildState{D}, first_leaf_index::Int,
+                                second_leaf_index::Int, axis::Int) where {D}
+  first_variables = _face_boundary_modes(state, first_leaf_index, axis, UPPER)
+  second_variables = _face_boundary_modes(state, second_leaf_index, axis, LOWER)
+  length(first_variables) == length(second_variables) || return false
+
+  second_lookup = state.boundary_lookup[second_leaf_index]
+  second_side_mode = _side_mode(LOWER)
+
+  for boundary_variable in first_variables
+    second_mode = _opposite_face_mode(boundary_variable.mode, axis, second_side_mode)
+    haskey(second_lookup, second_mode) || return false
+  end
+
+  return true
+end
+
+@inline function _opposite_face_mode(mode::NTuple{D,Int}, face_axis::Int, side_mode::Int) where {D}
+  return ntuple(axis -> axis == face_axis ? side_mode : mode[axis], D)
+end
+
+# The comparison face space keeps the face-normal direction fixed and uses the
+# maximum tangential degree seen on the two sides. Expanding both traces into this
+# space constrains any p-content that only exists on the richer side.
+function _comparison_face_degrees(state::_SpaceBuildState{D}, first_leaf_index::Int,
+                                  second_leaf_index::Int, axis::Int) where {D}
   return ntuple(current_axis -> current_axis == axis ? 0 :
-                                min(state.leaf_degrees[first_leaf_index][current_axis],
+                                max(state.leaf_degrees[first_leaf_index][current_axis],
                                     state.leaf_degrees[second_leaf_index][current_axis]), D)
 end
 
@@ -821,8 +808,8 @@ end
 # Component-wise elimination and finalization of the boundary graph.
 
 # Partition the constraint rows into connected components of the variable graph.
-# Different components can be eliminated independently and, in this file, in
-# parallel.
+# Different components can be eliminated independently, which keeps the local
+# algebra small even though the pass below is serial.
 function _constraint_components(rows::Vector{_ConstraintRow{T}},
                                 variable_count::Int) where {T<:AbstractFloat}
   parent = collect(1:variable_count)
@@ -856,9 +843,9 @@ function _eliminate_boundary_components!(component_rows::Vector{Vector{_Constrai
                                          components::Vector{Int}, variable_count::Int,
                                          ::Type{T}) where {T<:AbstractFloat}
   component_orders = Vector{Vector{Int}}(undef, length(components))
-  component_pivots = Vector{Vector{Pair{Int,_ConstraintRow{T}}}}(undef, length(components))
+  pivots = Vector{Union{Nothing,_ConstraintRow{T}}}(nothing, variable_count)
 
-  Threads.@threads for component_index in eachindex(components)
+  for component_index in eachindex(components)
     local_pivots = Dict{Int,_ConstraintRow{T}}()
     pivot_order = Int[]
 
@@ -883,20 +870,11 @@ function _eliminate_boundary_components!(component_rows::Vector{Vector{_Constrai
       _accumulate_row!(expression, row, scale)
       _cleanup_boundary_row!(expression, T)
       local_pivots[pivot] = expression
+      pivots[pivot] = expression
       push!(pivot_order, pivot)
     end
 
     component_orders[component_index] = pivot_order
-    component_pivots[component_index] = Pair{Int,_ConstraintRow{T}}[pivot => local_pivots[pivot]
-                                                                    for pivot in pivot_order]
-  end
-
-  pivots = Vector{Union{Nothing,_ConstraintRow{T}}}(nothing, variable_count)
-
-  for pairs in component_pivots
-    for pair in pairs
-      pivots[pair.first] = pair.second
-    end
   end
 
   return pivots, component_orders
@@ -909,7 +887,7 @@ function _finalize_boundary_components!(boundary_terms::Vector{Vector{Pair{Int,T
                                         pivots::Vector{Union{Nothing,_ConstraintRow{T}}},
                                         component_orders::Vector{Vector{Int}},
                                         free_dofs::Vector{Int}, ::Type{T}) where {T<:AbstractFloat}
-  Threads.@threads for component_index in eachindex(component_orders)
+  for component_index in eachindex(component_orders)
     for pivot in Iterators.reverse(component_orders[component_index])
       boundary_terms[pivot] = _finalize_boundary_terms!(pivots[pivot]::_ConstraintRow{T},
                                                         boundary_terms, free_dofs, T)
@@ -921,29 +899,38 @@ end
 
 # Root initialization and propagation after elimination.
 
-# Variables that are incompatible with the common face space are constrained to
-# zero by appending explicit one-variable rows for the surviving root
-# representatives.
-function _append_zeroed_root_rows!(rows::Vector{_ConstraintRow{T}}, roots::Vector{Int},
-                                   zeroed_roots::BitVector, ::Type{T}) where {T<:AbstractFloat}
-  for variable in eachindex(roots)
+# Without explicit algebraic rows, every union-find root is a free boundary dof.
+function _assign_unconstrained_boundary_dofs!(state::_SpaceBuildState, roots::Vector{Int})
+  free_dofs = zeros(Int, state.boundary_var_count)
+
+  for variable in 1:state.boundary_var_count
     _is_root_variable(roots, variable) || continue
-    zeroed_roots[variable] || continue
-    push!(rows, _ConstraintRow{T}(Int[variable], T[one(T)]))
+    free_dofs[variable] = state.next_global_dof
+    state.next_global_dof += 1
   end
 
-  return rows
+  return free_dofs
 end
 
-# Every root variable that survives merging, is not zeroed, and is not chosen
-# as an elimination pivot becomes an independent global scalar dof.
+function _initialize_unconstrained_root_boundary_terms!(boundary_terms::Vector{Vector{Pair{Int,T}}},
+                                                        roots::Vector{Int}, free_dofs::Vector{Int},
+                                                        ::Type{T}) where {T<:AbstractFloat}
+  for variable in eachindex(boundary_terms)
+    _is_root_variable(roots, variable) || continue
+    boundary_terms[variable] = Pair{Int,T}[free_dofs[variable] => one(T)]
+  end
+
+  return boundary_terms
+end
+
+# Every root variable that survives merging and is not chosen as an elimination
+# pivot becomes an independent global scalar dof.
 function _assign_free_boundary_dofs!(state::_SpaceBuildState, roots::Vector{Int},
-                                     zeroed_roots::BitVector,
                                      pivots::AbstractVector{<:Union{Nothing,_ConstraintRow}})
   free_dofs = zeros(Int, state.boundary_var_count)
 
   for variable in 1:state.boundary_var_count
-    _is_free_boundary_root(roots, zeroed_roots, pivots, variable) || continue
+    _is_free_boundary_root(roots, pivots, variable) || continue
     free_dofs[variable] = state.next_global_dof
     state.next_global_dof += 1
   end
@@ -955,24 +942,22 @@ end
 # empty constrained expression. Non-root variables are filled later by copying
 # their finalized root expansion.
 function _initialize_root_boundary_terms!(boundary_terms::Vector{Vector{Pair{Int,T}}},
-                                          roots::Vector{Int}, zeroed_roots::BitVector,
+                                          roots::Vector{Int},
                                           pivots::AbstractVector{<:Union{Nothing,_ConstraintRow{T}}},
                                           free_dofs::Vector{Int},
                                           ::Type{T}) where {T<:AbstractFloat}
   for variable in eachindex(boundary_terms)
     _is_root_variable(roots, variable) || continue
-    boundary_terms[variable] = _initial_root_boundary_terms(zeroed_roots, pivots, free_dofs,
-                                                            variable, T)
+    boundary_terms[variable] = _initial_root_boundary_terms(pivots, free_dofs, variable, T)
   end
 
   return boundary_terms
 end
 
-function _initial_root_boundary_terms(zeroed_roots::BitVector,
-                                      pivots::AbstractVector{<:Union{Nothing,_ConstraintRow{T}}},
+function _initial_root_boundary_terms(pivots::AbstractVector{<:Union{Nothing,_ConstraintRow{T}}},
                                       free_dofs::Vector{Int}, variable::Int,
                                       ::Type{T}) where {T<:AbstractFloat}
-  if zeroed_roots[variable] || pivots[variable] !== nothing
+  if pivots[variable] !== nothing
     return Pair{Int,T}[]
   end
 
@@ -995,11 +980,8 @@ end
 
 @inline _row_isempty(row::_ConstraintRow) = isempty(row.variables)
 @inline _is_root_variable(roots::Vector{Int}, variable::Int) = roots[variable] == variable
-@inline function _is_free_boundary_root(roots::Vector{Int}, zeroed_roots::BitVector, pivots,
-                                        variable::Int)
-  return _is_root_variable(roots, variable) &&
-         !zeroed_roots[variable] &&
-         pivots[variable] === nothing
+@inline function _is_free_boundary_root(roots::Vector{Int}, pivots, variable::Int)
+  return _is_root_variable(roots, variable) && pivots[variable] === nothing
 end
 
 # Select the pivot variable for one row. The row is not sorted, so the pivot is
@@ -1076,18 +1058,6 @@ function _union_boundary_variables!(parent::Vector{Int}, first::Int, second::Int
   return root_second
 end
 
-# Lift the variable-level zero flags to their union-find representatives.
-function _zeroed_roots(roots::Vector{Int}, zeroed::BitVector)
-  zeroed_roots = falses(length(zeroed))
-
-  for variable in eachindex(zeroed)
-    zeroed[variable] || continue
-    zeroed_roots[roots[variable]] = true
-  end
-
-  return zeroed_roots
-end
-
 # Compute the union-find representative of every boundary variable.
 function _boundary_roots!(parent::Vector{Int})
   roots = similar(parent)
@@ -1101,27 +1071,28 @@ end
 
 # Dyadic one-dimensional restriction operators for hanging faces.
 
-# Return one cached restriction column that maps a source one-dimensional trace
-# basis function onto the target overlap interval. The cache key is purely
-# dyadic: source basis index, target degree, relative refinement level `δ`, and
-# child offset inside the source interval.
-function _dyadic_restriction_column!(restriction_cache::Dict{NTuple{4,Int},Matrix{T}},
-                                     state::_SpaceBuildState{D,T}, source_lower::Int,
-                                     source_upper::Int, target_lower::Int, target_upper::Int,
-                                     source_index::Int, target_degree::Int,
-                                     axis::Int) where {D,T<:AbstractFloat}
-  source_index <= target_degree ||
+# Return one cached scalar restriction coefficient that maps a source
+# one-dimensional trace basis function onto the target overlap interval. The
+# cache key is purely dyadic plus polynomial order: source degree, target degree,
+# relative refinement level `δ`, and child offset inside the source interval.
+function _dyadic_restriction_coefficient!(restriction_cache::Dict{NTuple{4,Int},Matrix{T}},
+                                          state::_SpaceBuildState{D,T}, source_lower::Int,
+                                          source_upper::Int, target_lower::Int, target_upper::Int,
+                                          source_index::Int, source_degree::Int, target_degree::Int,
+                                          target_index::Int, axis::Int) where {D,T<:AbstractFloat}
+  source_index <= source_degree ||
+    throw(ArgumentError("source index must not exceed the source degree"))
+  source_degree <= target_degree ||
     throw(ArgumentError("target degree must represent the source trace exactly"))
   delta, relative = _relative_interval_position(source_lower, source_upper, target_lower,
                                                 target_upper, state.finest_levels[axis])
-  matrix = get!(restriction_cache, (source_index, target_degree, delta, relative)) do
-    # The cache stores the whole restriction matrix for this dyadic embedding,
-    # even though callers typically request only one source column at a time.
-    # This pays off because many trace modes on the same interface reuse the
-    # same affine subinterval geometry.
-    _affine_restriction_matrix(source_index, target_degree, delta, relative, T)
+  matrix = get!(restriction_cache, (source_degree, target_degree, delta, relative)) do
+    # The cache stores all source columns for this dyadic embedding. Hanging-face
+    # rows request one column at a time, but many trace modes on the same
+    # interface reuse the same affine subinterval geometry.
+    _affine_restriction_matrix(source_degree, target_degree, delta, relative, T)
   end
-  return view(matrix, :, source_index + 1)
+  return @inbounds matrix[target_index+1, source_index+1]
 end
 
 # Describe the target interval as a dyadic subinterval of the source interval.
@@ -1132,7 +1103,11 @@ function _relative_interval_position(source_lower::Int, source_upper::Int, targe
   source_level, source_coord = _interval_level_and_coord(source_lower, source_upper, finest_level)
   target_level, target_coord = _interval_level_and_coord(target_lower, target_upper, finest_level)
   delta = target_level - source_level
-  relative = target_coord - (source_coord << delta)
+  delta >= 0 || throw(ArgumentError("target interval must not be coarser than source interval"))
+  relative_value = Int128(target_coord) - (Int128(source_coord) << delta)
+  0 <= relative_value <= typemax(Int) ||
+    throw(ArgumentError("relative dyadic interval offset must be Int-representable"))
+  relative = Int(relative_value)
   return delta, relative
 end
 
@@ -1146,8 +1121,8 @@ function _interval_level_and_coord(lower::Int, upper::Int, finest_level::Int)
   return level, coord
 end
 
-# Build the one-dimensional affine restriction matrix from a source trace basis
-# on one interval to a target basis on a dyadic subinterval.
+# Build the one-dimensional affine restriction matrix from a source finite-element
+# basis on one interval to a target basis on a dyadic subinterval.
 #
 # If `η ∈ [-1,1]` are target reference coordinates and `ξ` are source reference
 # coordinates, then the subinterval embedding has the affine form
@@ -1162,19 +1137,19 @@ end
 function _affine_restriction_matrix(source_degree::Int, target_degree::Int, delta::Int,
                                     relative::Int, ::Type{T}) where {T<:AbstractFloat}
   scale = ldexp(one(T), -delta)
-  shift = delta == 0 ? zero(T) : muladd(scale, T(2 * relative + 1), -one(T))
-  required_degree = max(1, source_degree)
-  target_degree >= required_degree ||
+  shift = delta == 0 ? zero(T) : muladd(scale, T(2) * T(relative) + one(T), -one(T))
+  target_degree >= source_degree ||
     throw(ArgumentError("target degree must represent the source degree exactly"))
 
   point_total = target_degree + 1
-  rule = gauss_legendre_rule(point_total)
+  rule = gauss_legendre_rule(T, point_total)
   basis_matrix = Matrix{T}(undef, point_total, point_total)
+  values = Vector{T}(undef, point_total)
 
   for point_index in 1:point_total
     # Build the collocation matrix of the target basis on the target reference
     # points once, then reuse its factorization for all source columns.
-    values = integrated_legendre_values(coordinate(rule, point_index, 1), target_degree)
+    _fe_basis_values!(coordinate(rule, point_index, 1), target_degree, values)
 
     for basis_index in 1:point_total
       basis_matrix[point_index, basis_index] = values[basis_index]
@@ -1182,23 +1157,23 @@ function _affine_restriction_matrix(source_degree::Int, target_degree::Int, delt
   end
 
   factorization = lu(basis_matrix)
-  restriction = Matrix{T}(undef, target_degree + 1, source_degree + 1)
+  source_values = Vector{T}(undef, source_degree + 1)
+  source_matrix = Matrix{T}(undef, point_total, source_degree + 1)
 
-  for source_index in 0:source_degree
-    rhs = Vector{T}(undef, point_total)
+  for point_index in 1:point_total
+    η = coordinate(rule, point_index, 1)
+    ξ = muladd(scale, η, shift)
+    # Evaluate the source basis after pulling the target point back to source
+    # reference coordinates. The finite-element basis helper handles degree-zero
+    # DG factors as constants and agrees with the integrated basis for p ≥ 1.
+    _fe_basis_values!(ξ, source_degree, source_values)
 
-    for point_index in 1:point_total
-      η = coordinate(rule, point_index, 1)
-      ξ = muladd(scale, η, shift)
-      # Evaluate the source basis function after pulling the target point back
-      # to source reference coordinates.
-      rhs[point_index] = integrated_legendre_values(ξ, source_index)[source_index+1]
+    for source_index in 1:(source_degree+1)
+      source_matrix[point_index, source_index] = source_values[source_index]
     end
-
-    restriction[:, source_index+1] = factorization \ rhs
   end
 
-  return restriction
+  return factorization \ source_matrix
 end
 
 # Small indexing and tolerance helpers.
@@ -1210,7 +1185,8 @@ end
   return @inbounds state.face_boundary_modes[(((leaf_index-1)*D+(axis-1))<<1)+side]
 end
 
-# Numerical tolerance used to interpret cancellation in the continuity algebra.
+# Numerical tolerance used only to remove roundoff-level cancellation from sparse
+# constraint rows after accumulation and substitution.
 @inline _constraint_tolerance(::Type{T}) where {T<:AbstractFloat} = 1000 * eps(T)
 # A tensor-product mode is a boundary mode if at least one one-dimensional factor
 # is an endpoint mode of the integrated Legendre basis.
@@ -1218,5 +1194,3 @@ end
 # Convert the face side identifier `LOWER/UPPER` to the corresponding endpoint
 # mode index `0/1`.
 @inline _side_mode(side::Int) = side - LOWER
-# Return the opposite face side on the neighboring cell.
-@inline _opposite_side(side::Int) = side == LOWER ? UPPER : LOWER

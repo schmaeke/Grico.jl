@@ -110,10 +110,11 @@ struct VectorField <: AbstractField
 end
 
 function VectorField(space::HpSpace, components::Integer; name::Symbol=:field)
-  return VectorField(_next_field_id(), space, Int(components), name)
+  return VectorField(_next_field_id(), space, _checked_positive(components, "components"), name)
 end
 function VectorField(id::Integer, space::HpSpace, components::Integer, name::Symbol)
-  return VectorField(UInt64(_checked_positive(id, "id")), space, Int(components), name)
+  return VectorField(UInt64(_checked_positive(id, "id")), space,
+                     _checked_positive(components, "components"), name)
 end
 
 scalar_field(space::HpSpace; name::Symbol=:field) = ScalarField(space; name)
@@ -253,9 +254,20 @@ function _validate_field_layout(slots::Vector{_FieldSlot{D,T}},
 end
 
 function FieldLayout(fields)
-  field_vector = AbstractField[field for field in fields]
+  field_vector = _checked_layout_fields(fields)
   length(field_vector) >= 1 || throw(ArgumentError("at least one field is required"))
   return _field_layout(field_vector)
+end
+
+function _checked_layout_fields(fields)
+  field_vector = AbstractField[]
+
+  for field in fields
+    field isa AbstractField || throw(ArgumentError("layout entries must be field descriptors"))
+    push!(field_vector, field)
+  end
+
+  return field_vector
 end
 
 # Build the block layout in user-specified field order. The resulting offset
@@ -284,20 +296,23 @@ function _field_layout(field_vector::Vector{AbstractField})
 end
 
 # Shared reference data that all fields in one layout must match exactly. The
-# active-leaf set, physical box, and periodic axes together identify the common
-# discrete and geometric setting in which all field blocks are interpreted.
-struct _FieldLayoutReference{L,O,E,P}
+# active-leaf set, physical box, periodic axes, and physical-region identity
+# together identify the common discrete and geometric setting in which all field
+# blocks are interpreted.
+struct _FieldLayoutReference{L,O,E,P,R}
   dimension::Int
   scalar_type::DataType
   active_leaves::L
   origin::O
   extent::E
   periodic::P
+  region::R
 end
 
 @inline function _field_layout_reference(space::HpSpace)
   return _FieldLayoutReference(dimension(space), eltype(origin(space)), space.active_leaves,
-                               origin(space), extent(space), periodic_axes(space))
+                               origin(space), extent(space), periodic_axes(space),
+                               _physical_region(domain(space)))
 end
 
 # Check that one field space is compatible with the common layout reference.
@@ -312,6 +327,8 @@ function _check_field_layout_space(space::HpSpace, reference::_FieldLayoutRefere
     throw(ArgumentError("all fields must share the same physical domain"))
   periodic_axes(space) == reference.periodic ||
     throw(ArgumentError("all fields must share the same periodic topology"))
+  _physical_region(domain(space)) === reference.region ||
+    throw(ArgumentError("all fields must share the same physical region"))
   return nothing
 end
 
@@ -376,7 +393,7 @@ end
 @inline _field_slot_range(slot::_FieldSlot) = slot.offset:(slot.offset+slot.dof_count-1)
 
 @inline function _field_component_range(slot::_FieldSlot, field::AbstractField, component::Integer)
-  checked_component = _checked_index(component, component_count(field), "field component")
+  checked_component = _require_index(component, component_count(field), "field component")
   first = slot.offset + (checked_component - 1) * slot.scalar_dof_count
   return first:(first+slot.scalar_dof_count-1)
 end
@@ -453,6 +470,14 @@ end
 
 function State(layout::FieldLayout{D,T}, coefficients::AbstractVector{T}) where {D,T<:AbstractFloat}
   return State{T,typeof(coefficients),typeof(layout)}(layout, coefficients)
+end
+
+function State(layout::FieldLayout{D,T}, coefficients::AbstractVector) where {D,T<:AbstractFloat}
+  eltype(coefficients) == T ||
+    throw(ArgumentError("coefficient vector element type must match the layout scalar type"))
+  length(coefficients) == dof_count(layout) ||
+    throw(ArgumentError("coefficient vector length must match the layout dof count"))
+  throw(ArgumentError("coefficient vector must be an AbstractVector{$T}"))
 end
 
 # Concrete state vectors on validated field layouts.

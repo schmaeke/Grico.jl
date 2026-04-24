@@ -231,8 +231,10 @@ Return the physical quadrature point with one-based index `point_index`.
 For [`InterfaceValues`](@ref), this returns the point on the minus-side trace.
 Use [`plus`](@ref) first when the plus-side point array is needed.
 """
-function point(values::_PointValues, point_index::Integer)
-  @inbounds values.points[_checked_index(point_index, point_count(values), "point")]
+@inline function point(values::_PointValues, point_index::Integer)
+  count = point_count(values)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds values.points[Int(point_index)]
 end
 
 """
@@ -244,8 +246,10 @@ local integration item.
 The weight already includes the geometric measure factor of the corresponding
 cell, face, interface patch, or embedded-surface piece.
 """
-function weight(values::_PointValues, point_index::Integer)
-  @inbounds values.weights[_checked_index(point_index, point_count(values), "point")]
+@inline function weight(values::_PointValues, point_index::Integer)
+  count = point_count(values)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds values.weights[Int(point_index)]
 end
 
 """
@@ -278,10 +282,16 @@ over all quadrature points. For [`SurfaceValues`](@ref), the pointwise form
 returns the unit normal at the requested quadrature point.
 """
 normal(values::_ConstantNormalValues) = values.normal
-normal(values::_ConstantNormalValues, point_index::Integer) = values.normal
 
-function normal(values::SurfaceValues, point_index::Integer)
-  @inbounds values.normals[_checked_index(point_index, point_count(values), "point")]
+@inline function normal(values::_ConstantNormalValues, point_index::Integer)
+  @boundscheck _checked_point_index(values, point_index)
+  return values.normal
+end
+
+@inline function normal(values::SurfaceValues, point_index::Integer)
+  count = point_count(values)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds values.normals[Int(point_index)]
 end
 
 function _interface_side_values(values::InterfaceValues{D,T}, leaf::Int, points,
@@ -379,8 +389,8 @@ end
 # full `CellValues`: adaptivity indicators, state transfer, and VTK export all
 # evaluate modal expansions at many reference points. The helpers below share
 # one allocation-conscious path for that work. Callers prepare component
-# coefficient views once, reuse one basis-vector scratch per worker, and then
-# evaluate scalar components from the compiled local-to-global mode expansion.
+# coefficient views once, reuse one basis-vector scratch, and then evaluate
+# scalar components from the compiled local-to-global mode expansion.
 function _component_coefficient_views(state::State, field::AbstractField)
   return [field_component_values(state, field, component) for component in 1:component_count(field)]
 end
@@ -398,7 +408,7 @@ function _fill_leaf_basis!(basis_values::NTuple{D,Vector{T}}, degrees::NTuple{D,
   for axis in 1:D
     axis_values = basis_values[axis]
     resize!(axis_values, degrees[axis] + 1)
-    _fe_basis_values_and_derivatives!(T(ξ[axis]), degrees[axis], axis_values, nothing)
+    _fe_basis_values!(T(ξ[axis]), degrees[axis], axis_values)
   end
 
   return basis_values
@@ -463,15 +473,15 @@ end
 end
 
 @inline function _checked_point_index(values::_PointValues, point_index::Integer)
-  return _checked_index(point_index, point_count(values), "point")
+  return _require_index(point_index, point_count(values), "point")
 end
 
 @inline function _checked_field_mode(data::_FieldValues, mode_index::Integer)
-  return _checked_index(mode_index, data.local_mode_count, "local mode")
+  return _require_index(mode_index, data.local_mode_count, "local mode")
 end
 
 @inline function _checked_field_component(data::_FieldValues, component::Integer)
-  return _checked_index(component, _field_component_count(data), "field component")
+  return _require_index(component, _field_component_count(data), "field component")
 end
 
 @inline _point_normal(values::FaceValues, point_index::Int) = values.normal
@@ -746,16 +756,21 @@ end
 @inline function _field_value_component(data::_FieldValues{D,T},
                                         state_coefficients::AbstractVector{T}, component::Int,
                                         point_index::Int) where {D,T<:AbstractFloat}
+  term_offsets = data.term_offsets
+  term_indices = data.term_indices
+  term_coefficients = data.term_coefficients
+  single_term_indices = data.single_term_indices
+  single_term_coefficients = data.single_term_coefficients
+  values = data.values
   result = zero(T)
 
-  for mode_index in 1:data.local_mode_count
-    shape = data.values[mode_index, point_index]
+  @inbounds for mode_index in 1:data.local_mode_count
+    shape = values[mode_index, point_index]
     shape == zero(T) && continue
     local_dof = _field_local_dof(data, component, mode_index)
-    amplitude = _term_amplitude(data.term_offsets, data.term_indices, data.term_coefficients,
-                                data.single_term_indices, data.single_term_coefficients,
-                                state_coefficients, local_dof)
-    result += shape * amplitude
+    amplitude = _term_amplitude(term_offsets, term_indices, term_coefficients, single_term_indices,
+                                single_term_coefficients, state_coefficients, local_dof)
+    result = muladd(shape, amplitude, result)
   end
 
   return result
@@ -1061,14 +1076,13 @@ end
   return ntuple(axis -> inv(jacobian_diagonal_from_biunit_cube(domain_data, leaf, axis)), D)
 end
 
-function _compile_item_fields(layout::FieldLayout{D,T}, leaf::Int, points::Vector{NTuple{D,T}},
+function _compile_item_fields(layout::FieldLayout{D,T}, leaf::Int,
                               reference_points::Vector{NTuple{D,T}}, inverse_jacobian::NTuple{D,T},
                               local_offset::Int=1) where {D,T<:AbstractFloat}
   next_offset = local_offset
   field_data = ntuple(index -> begin
-                        data = _compile_field_values(layout.slots[index], leaf, points,
-                                                     reference_points, inverse_jacobian,
-                                                     next_offset)
+                        data = _compile_field_values(layout.slots[index], leaf, reference_points,
+                                                     inverse_jacobian, next_offset)
                         next_offset = last(data.block) + 1
                         data
                       end, field_count(layout))
@@ -1087,11 +1101,8 @@ function _compile_item_collection(compile_item, specs)
   items[1] = first_item
   length(specs) == 1 && return items
 
-  _run_chunks!(length(specs) - 1) do first_spec, last_spec
-    for offset in first_spec:last_spec
-      item_index = offset + 1
-      items[item_index] = compile_item(specs[item_index])
-    end
+  for item_index in 2:length(specs)
+    items[item_index] = compile_item(specs[item_index])
   end
 
   return items
@@ -1102,7 +1113,8 @@ end
 # Compile one `CellValues` item per active leaf, optionally using user-supplied
 # cell quadrature overrides.
 function _compile_cells(layout::FieldLayout{D,T},
-                        overrides::Dict{Int,AbstractQuadrature{D,T}}) where {D,T<:AbstractFloat}
+                        overrides::AbstractDict{Int,<:AbstractQuadrature{D}}) where {D,
+                                                                                     T<:AbstractFloat}
   leaves = layout.slots[1].space.active_leaves
   isempty(leaves) && return CellValues[]
   return _compile_item_collection(leaves) do leaf
@@ -1135,7 +1147,7 @@ function _compile_cell(layout::FieldLayout{D,T}, leaf::Int, override) where {D,T
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, leaf)
-  field_data, _ = _compile_item_fields(layout, leaf, points, reference_points, inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian)
   terms = _compiled_item_terms(field_data)
   interior_local_dofs = _interior_local_dofs(field_data,
                                              _compiled_leaf(layout.slots[1].space, leaf).local_modes)
@@ -1162,26 +1174,20 @@ function _compile_boundary_faces(layout::FieldLayout{D,T}) where {D,T<:AbstractF
 end
 
 # Embedded surfaces may contribute several local quadrature items on one leaf,
-# so compilation first collects worker-owned buffers and then concatenates them.
+# so compilation collects them first and then sorts by leaf.
 function _compile_embedded_surfaces(layout::FieldLayout{D,T},
                                     embedded_surfaces) where {D,T<:AbstractFloat}
   isempty(embedded_surfaces) && return SurfaceValues[]
-  worker_count = max(1, min(Threads.nthreads(), length(embedded_surfaces)))
-  thread_items = [SurfaceValues[] for _ in 1:worker_count]
+  items = nothing
 
-  _run_chunks_with_scratch!(thread_items,
-                            length(embedded_surfaces)) do items, first_surface, last_surface
-    for surface_index in first_surface:last_surface
-      append!(items, _compile_embedded_surface_items(layout, embedded_surfaces[surface_index]))
-    end
+  for surface in embedded_surfaces
+    surface_items = _compile_embedded_surface_items(layout, surface)
+    isempty(surface_items) && continue
+    items === nothing && (items = Vector{eltype(surface_items)}())
+    append!(items, surface_items)
   end
 
-  items = SurfaceValues[]
-
-  for local_items in thread_items
-    append!(items, local_items)
-  end
-
+  items === nothing && return SurfaceValues[]
   sort!(items; by=item -> item.leaf)
   return items
 end
@@ -1207,7 +1213,7 @@ function _compile_boundary_face(layout::FieldLayout{D,T}, leaf::Int, face_axis::
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, leaf)
-  field_data, _ = _compile_item_fields(layout, leaf, points, reference_points, inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian)
   terms = _compiled_item_terms(field_data)
   normal_data = ntuple(axis -> axis == face_axis ? (side == LOWER ? -one(T) : one(T)) : zero(T), D)
   return FaceValues(leaf, face_axis, side, normal_data, points, weights, field_data,
@@ -1247,10 +1253,10 @@ function _compile_interface(layout::FieldLayout{D,T}, minus_leaf::Int, face_axis
   minus_reference_points = [map_to_biunit_cube(domain_data, minus_leaf, point) for point in points]
   plus_reference_points = [map_to_biunit_cube(domain_data, plus_leaf, point)
                            for point in plus_points]
-  minus_fields, next_offset = _compile_item_fields(layout, minus_leaf, points,
-                                                   minus_reference_points, minus_inverse)
-  plus_fields, _ = _compile_item_fields(layout, plus_leaf, plus_points, plus_reference_points,
-                                        plus_inverse, next_offset)
+  minus_fields, next_offset = _compile_item_fields(layout, minus_leaf, minus_reference_points,
+                                                   minus_inverse)
+  plus_fields, _ = _compile_item_fields(layout, plus_leaf, plus_reference_points, plus_inverse,
+                                        next_offset)
   all_fields = (minus_fields..., plus_fields...)
   terms = _compiled_item_terms(all_fields)
   normal_data = ntuple(axis -> axis == face_axis ? one(T) : zero(T), D)
@@ -1278,9 +1284,11 @@ end
 
 function _compile_embedded_surface_items(layout::FieldLayout{D,T}, surface::EmbeddedSurface,
                                          tag::_SurfaceTag) where {D,T<:AbstractFloat}
-  quadratures = surface_quadratures(surface, layout.slots[1].space)
+  space = layout.slots[1].space
+  quadratures = surface_quadratures(surface, space)
   isempty(quadratures) && return SurfaceValues[]
-  return [_compile_surface_quadrature(layout, quadrature, tag) for quadrature in quadratures]
+  return [_compile_surface_quadrature(layout, _checked_surface_quadrature(space, quadrature, D),
+                                      tag) for quadrature in quadratures]
 end
 
 # Compile one embedded-surface quadrature item. Here both the integration
@@ -1307,8 +1315,7 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T}, surface::SurfaceQ
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, surface.leaf)
-  field_data, _ = _compile_item_fields(layout, surface.leaf, points, reference_points,
-                                       inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, surface.leaf, reference_points, inverse_jacobian)
   terms = _compiled_item_terms(field_data)
   return SurfaceValues(surface.leaf, tag, points, weights, normals, field_data, terms.term_offsets,
                        terms.term_indices, terms.term_coefficients, terms.single_term_indices,
@@ -1351,7 +1358,7 @@ end
 # the standard biunit reference cell `[-1, 1]^D`. Plain background domains have
 # no automatic overrides; `PhysicalDomain`s opt in through `_default_cell_quadrature`.
 function _automatic_cell_quadrature_overrides(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
-  overrides = Dict{Int,AbstractQuadrature{D,T}}()
+  overrides = Dict{Int,AbstractQuadrature{D}}()
   space = layout.slots[1].space
 
   for leaf in active_leaves(space)
@@ -1376,7 +1383,7 @@ function _cell_quadrature_overrides(layout::FieldLayout{D,T},
       leaf = attachment.leaf
       quadrature = attachment.quadrature
     elseif attachment isa Pair &&
-           attachment.first isa Int &&
+           attachment.first isa Integer &&
            attachment.second isa AbstractQuadrature
       leaf = attachment.first
       quadrature = attachment.second
@@ -1446,23 +1453,11 @@ end
 
 # Field-local basis tables and sparse local-to-global term maps.
 
-# Convenience entry point when the field uses the default tensor quadrature on
-# the current entity.
-function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
-                               physical_points::Vector{NTuple{D,T}},
-                               quadrature::TensorQuadrature{D,T}, inverse_jacobian::NTuple{D,T},
-                               local_offset::Int) where {D,T<:AbstractFloat}
-  reference_points = [point(quadrature, point_index) for point_index in 1:point_count(quadrature)]
-  return _compile_field_values(slot, leaf, physical_points, reference_points, inverse_jacobian,
-                               local_offset)
-end
-
 # Compile one field block on one local integration item. The basis tables are
 # purely local to the field and leaf, but the term arrays already encode how
 # each local mode expands into the global coefficient vector after continuity
 # constraints have been applied in the `HpSpace`.
 function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
-                               physical_points::Vector{NTuple{D,T}},
                                reference_points::Vector{NTuple{D,T}}, inverse_jacobian::NTuple{D,T},
                                local_offset::Int) where {D,T<:AbstractFloat}
   compiled_leaf = _compiled_leaf(slot.space, leaf)

@@ -59,7 +59,7 @@ which map naturally to VTK curve, quadrilateral, and hexahedral Lagrange cells.
 Higher-dimensional spaces are not representable in the VTK file format used
 here.
 """
-vtk_export_supported(dimension::Integer) = 1 <= Int(dimension) <= 3
+vtk_export_supported(dimension::Integer) = 1 <= dimension <= 3
 
 @inline function _vtk_column_tuple(matrix::AbstractMatrix, index::Int, ::Val{D}) where {D}
   return ntuple(axis -> matrix[axis, index], D)
@@ -142,34 +142,32 @@ function _write_vtk(path::AbstractString, reference; state::Union{Nothing,State}
                     fields=nothing, point_data=(), cell_data=(), field_data=(),
                     subdivisions::Integer=1, export_degree::Integer=1, mesh::Bool=false,
                     vtk_kwargs...)
-  return _with_internal_blas_threads() do
-    reference_domain = _vtk_reference_domain(reference)
-    D = dimension(reference_domain)
-    T = eltype(origin(reference_domain))
-    vtk_export_supported(D) ||
-      throw(ArgumentError("VTK export requires a domain dimension between 1 and 3"))
-    subdivision_count = _checked_positive(subdivisions, "subdivisions")
-    vtk_degree = _checked_positive(export_degree, "export_degree")
-    vtk_fields = _vtk_fields(reference, state, fields)
-    vtk_mesh = _vtk_mesh_data(reference, subdivision_count, vtk_degree)
-    sampled_fields = _sample_vtk_fields(vtk_fields, state, vtk_mesh, T)
-    point_datasets = _vtk_point_datasets(vtk_fields, sampled_fields, point_data, vtk_mesh)
-    cell_datasets = _vtk_cell_datasets(cell_data, vtk_mesh)
-    field_datasets = _checked_vtk_datasets(field_data, "field")
-    _require_vtk_dataset_sizes(point_datasets, size(vtk_mesh.points, 2), "point")
-    _require_vtk_dataset_sizes(cell_datasets, length(vtk_mesh.cells), "cell")
-    grid_kwargs = haskey(vtk_kwargs, :vtkversion) ? (; vtk_kwargs...) :
-                  (; vtk_kwargs..., vtkversion=:latest)
+  reference_domain = _vtk_reference_domain(reference)
+  D = dimension(reference_domain)
+  T = eltype(origin(reference_domain))
+  vtk_export_supported(D) ||
+    throw(ArgumentError("VTK export requires a domain dimension between 1 and 3"))
+  subdivision_count = _checked_positive(subdivisions, "subdivisions")
+  vtk_degree = _checked_positive(export_degree, "export_degree")
+  vtk_fields = _vtk_fields(reference, state, fields)
+  vtk_mesh = _vtk_mesh_data(reference, subdivision_count, vtk_degree)
+  sampled_fields = _sample_vtk_fields(vtk_fields, state, vtk_mesh, T)
+  point_datasets = _vtk_point_datasets(vtk_fields, sampled_fields, point_data, vtk_mesh)
+  cell_datasets = _vtk_cell_datasets(cell_data, vtk_mesh)
+  field_datasets = _checked_vtk_datasets(field_data, "field")
+  _require_vtk_dataset_sizes(point_datasets, size(vtk_mesh.points, 2), "point")
+  _require_vtk_dataset_sizes(cell_datasets, length(vtk_mesh.cells), "cell")
+  grid_kwargs = haskey(vtk_kwargs, :vtkversion) ? (; vtk_kwargs...) :
+                (; vtk_kwargs..., vtkversion=:latest)
 
-    if mesh
-      return _write_vtk_multiblock(path, reference, vtk_mesh, point_datasets, cell_datasets,
-                                   field_datasets, grid_kwargs)
-    end
-
-    saved_files = _write_vtk_solution_grid(path, vtk_mesh, point_datasets, cell_datasets,
-                                           field_datasets, grid_kwargs)
-    return only(saved_files)
+  if mesh
+    return _write_vtk_multiblock(path, reference, vtk_mesh, point_datasets, cell_datasets,
+                                 field_datasets, grid_kwargs)
   end
+
+  saved_files = _write_vtk_solution_grid(path, vtk_mesh, point_datasets, cell_datasets,
+                                         field_datasets, grid_kwargs)
+  return only(saved_files)
 end
 
 # Write the sampled solution grid as one ordinary `.vtu` file. This is the
@@ -243,8 +241,10 @@ function write_pvd(path::AbstractString, vtk_files::AbstractVector{<:AbstractStr
 
     for index in eachindex(vtk_files)
       relative_path = relpath(vtk_files[index], dirname(path))
+      escaped_step = _vtk_xml_attribute(values[index])
+      escaped_path = _vtk_xml_attribute(relative_path)
       println(io,
-              "    <DataSet timestep=\"$(values[index])\" group=\"\" part=\"0\" file=\"$relative_path\"/>")
+              "    <DataSet timestep=\"$escaped_step\" group=\"\" part=\"0\" file=\"$escaped_path\"/>")
     end
 
     println(io, "  </Collection>")
@@ -252,6 +252,14 @@ function write_pvd(path::AbstractString, vtk_files::AbstractVector{<:AbstractStr
   end
 
   return path
+end
+
+function _vtk_xml_attribute(value)
+  text = replace(string(value), "&" => "&amp;")
+  text = replace(text, "\"" => "&quot;")
+  text = replace(text, "<" => "&lt;")
+  text = replace(text, ">" => "&gt;")
+  return replace(text, "'" => "&apos;")
 end
 
 # Field selection and direct sampling of hp state data on VTK points.
@@ -292,6 +300,8 @@ function _vtk_fields(reference, state::Union{Nothing,State}, selected_fields)
   elseif selected_fields isa AbstractField
     AbstractField[selected_fields]
   elseif selected_fields isa Tuple || selected_fields isa AbstractVector
+    all(field -> field isa AbstractField, selected_fields) ||
+      throw(ArgumentError("fields must contain only AbstractField values"))
     AbstractField[field for field in selected_fields]
   else
     throw(ArgumentError("fields must be a field, tuple of fields, vector of fields, or nothing"))
@@ -329,7 +339,7 @@ function _vtk_point_datasets(vtk_fields, sampled_fields, point_data, mesh::_VtkM
     push!(names, name)
   end
 
-  for (name, data) in _vtk_datasets(point_data)
+  for (name, data) in _checked_vtk_datasets(point_data, "point")
     name in names && throw(ArgumentError("duplicate VTK point-data name $name"))
     push!(datasets, name => _vtk_point_dataset(data, sampled_fields, mesh))
     push!(names, name)
@@ -379,18 +389,15 @@ function _sample_vtk_field(field::AbstractField, state::State{T}, mesh::_VtkMesh
   components = component_count(field)
   sampled = _vtk_field_samples(T, components, point_total)
   component_coefficients = _component_coefficient_views(state, field)
-  worker_count = max(1, min(Threads.nthreads(), point_total))
-  scratch = [_VtkFieldSampleScratch(T, Val(D), components) for _ in 1:worker_count]
+  scratch = _VtkFieldSampleScratch(T, Val(D), components)
 
-  _run_chunks_with_scratch!(scratch, point_total) do cache, first_point, last_point
-    for point_index in first_point:last_point
-      ξ = _vtk_column_tuple(mesh.point_references, point_index, Val(D))
-      compiled = _compiled_leaf(field_space(field), mesh.point_leaves[point_index])
-      _fill_leaf_basis!(cache.basis.values, compiled.degrees, ξ)
-      _leaf_component_values!(cache.component_values, compiled, component_coefficients,
-                              cache.basis.values)
-      _vtk_store_field_sample!(sampled, cache.component_values, point_index)
-    end
+  for point_index in 1:point_total
+    ξ = _vtk_column_tuple(mesh.point_references, point_index, Val(D))
+    compiled = _compiled_leaf(field_space(field), mesh.point_leaves[point_index])
+    _fill_leaf_basis!(scratch.basis.values, compiled.degrees, ξ)
+    _leaf_component_values!(scratch.component_values, compiled, component_coefficients,
+                            scratch.basis.values)
+    _vtk_store_field_sample!(sampled, scratch.component_values, point_index)
   end
 
   return sampled
@@ -503,21 +510,34 @@ end
 # The public API accepts several convenient dataset container formats. These
 # helpers normalize them to a common `Vector{Pair{String,Any}}` representation
 # and validate name uniqueness before writing.
-_vtk_datasets(::Nothing) = Pair{String,Any}[]
-_vtk_datasets(data::Pair) = [String(first(data)) => last(data)]
-function _vtk_datasets(data::NamedTuple)
-  [String(name) => getfield(data, name) for name in propertynames(data)]
+_vtk_dataset_name(name::Union{AbstractString,Symbol}, ::AbstractString) = String(name)
+function _vtk_dataset_name(name, location::AbstractString)
+  throw(ArgumentError("VTK $location-data names must be strings or symbols"))
 end
-_vtk_datasets(data::AbstractDict) = [String(name) => value for (name, value) in pairs(data)]
 
-function _vtk_datasets(data::Union{AbstractVector,Tuple})
+_vtk_datasets(::Nothing, ::AbstractString) = Pair{String,Any}[]
+function _vtk_datasets(data::Pair, location::AbstractString)
+  [_vtk_dataset_name(first(data), location) => last(data)]
+end
+function _vtk_datasets(data::NamedTuple, location::AbstractString)
+  [_vtk_dataset_name(name, location) => getfield(data, name) for name in propertynames(data)]
+end
+function _vtk_datasets(data::AbstractDict, location::AbstractString)
+  [_vtk_dataset_name(name, location) => value for (name, value) in pairs(data)]
+end
+
+function _vtk_datasets(data::Union{AbstractVector,Tuple}, location::AbstractString)
   all(item -> item isa Pair, data) ||
-    throw(ArgumentError("VTK datasets must be provided as a NamedTuple, Dict, Pair, or vector/tuple of Pair values"))
-  return [String(first(item)) => last(item) for item in data]
+    throw(ArgumentError("VTK $location-data datasets must be provided as a NamedTuple, Dict, Pair, or vector/tuple of Pair values"))
+  return [_vtk_dataset_name(first(item), location) => last(item) for item in data]
+end
+
+function _vtk_datasets(_, location::AbstractString)
+  throw(ArgumentError("VTK $location-data datasets must be provided as a NamedTuple, Dict, Pair, or vector/tuple of Pair values"))
 end
 
 function _checked_vtk_datasets(data, location::AbstractString)
-  datasets = _vtk_datasets(data)
+  datasets = _vtk_datasets(data, location)
   names = Set{String}()
 
   for (name, _) in datasets
@@ -592,10 +612,8 @@ function _collect_vtk_samples(sample_count::Int, location::AbstractString, sampl
   _vtk_store_collected_sample!(values, first_value, 1, location)
 
   if sample_count > 1
-    _run_chunks!(sample_count - 1) do first_item, last_item
-      for index in (first_item+1):(last_item+1)
-        _vtk_store_collected_sample!(values, sample(index), index, location)
-      end
+    for index in 2:sample_count
+      _vtk_store_collected_sample!(values, sample(index), index, location)
     end
   end
 
@@ -607,13 +625,18 @@ function _vtk_collected_sample_buffer(first_value::Number, sample_count::Int, ::
 end
 
 function _vtk_collected_sample_buffer(first_value::Union{Tuple,AbstractVector}, sample_count::Int,
-                                      ::AbstractString)
-  return Matrix{eltype(first_value)}(undef, length(first_value), sample_count)
+                                      location::AbstractString)
+  !isempty(first_value) ||
+    throw(ArgumentError("$location dataset callables must return at least one tuple/vector component"))
+  return Matrix{_vtk_sample_component_type(first_value)}(undef, length(first_value), sample_count)
 end
 
 function _vtk_collected_sample_buffer(::Any, ::Int, location::AbstractString)
   throw(ArgumentError("$location dataset callables must return scalars, tuples, or vectors"))
 end
+
+_vtk_sample_component_type(first_value::Tuple) = Base.promote_typeof(first_value...)
+_vtk_sample_component_type(first_value::AbstractVector) = eltype(first_value)
 
 @inline function _vtk_store_collected_sample!(values::AbstractVector, current::Number, index::Int,
                                               ::AbstractString)
@@ -670,60 +693,57 @@ function _vtk_mesh_data(domain_data::AbstractDomain{D,T}, leaf_data::AbstractVec
   cells = Vector{typeof(sample_connectivity)}(undef, total_cells)
   point_indices = CartesianIndices(ntuple(_ -> point_stride, D))
   cell_indices = CartesianIndices(ntuple(_ -> subdivisions, D))
-  _run_chunks!(leaf_count) do first_leaf, last_leaf
-    reference_coordinates = Vector{T}(undef, D)
-    cell_reference_coordinates = Vector{T}(undef, D)
-    local_points = Vector{Int}(undef, local_point_count)
+  reference_coordinates = Vector{T}(undef, D)
+  cell_reference_coordinates = Vector{T}(undef, D)
+  local_points = Vector{Int}(undef, local_point_count)
 
-    for leaf_index in first_leaf:last_leaf
-      leaf = leaf_data[leaf_index]
-      point_offset = (leaf_index - 1) * local_point_count
-      cell_offset = (leaf_index - 1) * cells_per_leaf
-      local_point_offset = 1
+  for leaf_index in 1:leaf_count
+    leaf = leaf_data[leaf_index]
+    point_offset = (leaf_index - 1) * local_point_count
+    cell_offset = (leaf_index - 1) * cells_per_leaf
+    local_point_offset = 1
 
-      for I in point_indices
-        @inbounds for axis in 1:D
-          reference_coordinates[axis] = _vtk_reference_coordinate(I[axis], point_resolution, T)
-        end
-
-        mapped = map_from_biunit_cube(domain_data, leaf, Tuple(reference_coordinates))
-        point_index = point_offset + local_point_offset
-        point_leaves[point_index] = leaf
-
-        @inbounds for axis in 1:D
-          points[axis, point_index] = mapped[axis]
-          point_references[axis, point_index] = reference_coordinates[axis]
-        end
-
-        @inbounds for axis in (D+1):3
-          points[axis, point_index] = zero(T)
-        end
-
-        local_points[local_point_offset] = point_index
-        local_point_offset += 1
+    for I in point_indices
+      @inbounds for axis in 1:D
+        reference_coordinates[axis] = _vtk_reference_coordinate(I[axis], point_resolution, T)
       end
 
-      local_cell_offset = 1
+      mapped = map_from_biunit_cube(domain_data, leaf, Tuple(reference_coordinates))
+      point_index = point_offset + local_point_offset
+      point_leaves[point_index] = leaf
 
-      for I in cell_indices
-        cell_index = cell_offset + local_cell_offset
-
-        @inbounds for axis in 1:D
-          cell_reference_coordinates[axis] = _vtk_subcell_center_coordinate(I[axis], subdivisions,
-                                                                            T)
-          cell_references[axis, cell_index] = cell_reference_coordinates[axis]
-        end
-
-        mapped_center = map_from_biunit_cube(domain_data, leaf, Tuple(cell_reference_coordinates))
-
-        @inbounds for axis in 1:D
-          cell_centers[axis, cell_index] = mapped_center[axis]
-        end
-
-        cell_leaves[cell_index] = leaf
-        cells[cell_index] = _vtk_cell(local_points, point_stride, export_degree, I, Val(D))
-        local_cell_offset += 1
+      @inbounds for axis in 1:D
+        points[axis, point_index] = mapped[axis]
+        point_references[axis, point_index] = reference_coordinates[axis]
       end
+
+      @inbounds for axis in (D+1):3
+        points[axis, point_index] = zero(T)
+      end
+
+      local_points[local_point_offset] = point_index
+      local_point_offset += 1
+    end
+
+    local_cell_offset = 1
+
+    for I in cell_indices
+      cell_index = cell_offset + local_cell_offset
+
+      @inbounds for axis in 1:D
+        cell_reference_coordinates[axis] = _vtk_subcell_center_coordinate(I[axis], subdivisions, T)
+        cell_references[axis, cell_index] = cell_reference_coordinates[axis]
+      end
+
+      mapped_center = map_from_biunit_cube(domain_data, leaf, Tuple(cell_reference_coordinates))
+
+      @inbounds for axis in 1:D
+        cell_centers[axis, cell_index] = mapped_center[axis]
+      end
+
+      cell_leaves[cell_index] = leaf
+      cells[cell_index] = _vtk_cell(local_points, point_stride, export_degree, I, Val(D))
+      local_cell_offset += 1
     end
   end
 

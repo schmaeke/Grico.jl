@@ -112,10 +112,34 @@ end
   quadrature = _verification_left_half_reference_quadrature()
 
   @test Grico.l2_error(state, u, 1.0; cell_quadratures=(1 => quadrature,)) ≈ sqrt(0.5) atol = VERIFICATION_TOL
+  @test Grico.l2_error(state, u, 1.0; cell_quadratures=(Int32(1) => quadrature,)) ≈ sqrt(0.5) atol = VERIFICATION_TOL
+  float32_quadrature = Grico.PointQuadrature([(Float32(0.0),)], [Float32(2.0)])
+  @test Grico.l2_error(state, u, 1.0; cell_quadratures=(1 => float32_quadrature,)) ≈ 1.0 atol = VERIFICATION_TOL
   @test Grico.relative_l2_error(state, u, 1.0; cell_quadratures=(1 => quadrature,)) ≈ 1.0 atol = VERIFICATION_TOL
+  @test Grico.l2_error(state, u, [1.0]) ≈ 1.0 atol = VERIFICATION_TOL
+  @test_throws ArgumentError Grico.l2_error(state, u, (1.0, 2.0))
+  @test_throws ArgumentError Grico.l2_error(state, u, [1.0, 2.0])
   @test Grico.relative_l2_error(state, u, 0.0) == 0.0
   Grico.coefficients(state) .= 1.0
   @test Grico.relative_l2_error(state, u, 0.0) == Inf
   @test_throws ArgumentError Grico.l2_error(state, u, 1.0;
                                             cell_quadratures=(1 => quadrature, 1 => quadrature))
+  @test_throws ArgumentError Grico.l2_error(state, u, 1.0; cell_quadratures=(1.5 => quadrature,))
+  wrong_dimension = Grico.PointQuadrature([(0.0, 0.0)], [1.0])
+  @test_throws ArgumentError Grico.l2_error(state, u, 1.0; cell_quadratures=(1 => wrong_dimension,))
+end
+
+@testset "Physical Verification Quadrature Enrichment" begin
+  background = Grico.Domain((0.0,), (1.0,), (1,))
+  domain = Grico.PhysicalDomain(background,
+                                Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=1))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(1)))
+  u = Grico.ScalarField(space; name=:u)
+  state = Grico.State(Grico.FieldLayout((u,)))
+  expected = sqrt(0.5)
+
+  @test Grico.l2_error(state, u, 1.0) ≈ expected atol = VERIFICATION_TOL
+  @test Grico.l2_error(state, u, 1.0; extra_points=1) ≈ expected atol = VERIFICATION_TOL
 end

@@ -49,24 +49,30 @@ struct BoundaryFace
   BoundaryFace(axis::Int, side::Int) = new(_checked_positive(axis, "axis"), _checked_side(side))
 end
 
-BoundaryFace(axis::Integer, side::Integer) = BoundaryFace(Int(axis), Int(side))
+function BoundaryFace(axis::Integer, side::Integer)
+  BoundaryFace(_checked_positive(axis, "axis"), _checked_side(side))
+end
 
 @inline _all_dirichlet_components(field::AbstractField) = ntuple(identity, component_count(field))
 
-function _checked_dirichlet_components(field::AbstractField, components::Tuple{Vararg{Int}})
+function _checked_dirichlet_components(field::AbstractField, components::Tuple{Vararg{Integer}})
   isempty(components) && throw(ArgumentError("Dirichlet component selectors must not be empty"))
   component_total = component_count(field)
   previous = 0
+  checked = Vector{Int}(undef, length(components))
 
-  for component in components
+  for index in eachindex(components)
+    component = components[index]
     1 <= component <= component_total ||
       throw(ArgumentError("Dirichlet component selector $component must lie in 1:$component_total"))
     component > previous ||
       throw(ArgumentError("Dirichlet component selectors must be strictly increasing and unique"))
-    previous = component
+    checked_component = Int(component)
+    checked[index] = checked_component
+    previous = checked_component
   end
 
-  return components
+  return Tuple(checked)
 end
 
 """
@@ -105,8 +111,8 @@ struct Dirichlet
   components::Tuple{Vararg{Int}}
   data
 
-  function Dirichlet(field::AbstractField, boundary::BoundaryFace, components::Tuple{Vararg{Int}},
-                     data)
+  function Dirichlet(field::AbstractField, boundary::BoundaryFace,
+                     components::Tuple{Vararg{Integer}}, data)
     return new(field, boundary, _checked_dirichlet_components(field, components), data)
   end
 end
@@ -115,11 +121,7 @@ function Dirichlet(field::AbstractField, boundary::BoundaryFace, data)
   Dirichlet(field, boundary, _all_dirichlet_components(field), data)
 end
 function Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data)
-  Dirichlet(field, boundary, (Int(component),), data)
-end
-function Dirichlet(field::AbstractField, boundary::BoundaryFace, components::Tuple{Vararg{Integer}},
-                   data)
-  Dirichlet(field, boundary, Tuple(Int(component) for component in components), data)
+  Dirichlet(field, boundary, (component,), data)
 end
 
 """
@@ -360,17 +362,19 @@ field_count(problem::_AbstractProblem) = length(_problem_data(problem).fields)
 
 # Validation helpers for problem containers.
 
-# Validate that a problem is defined on at least one field and that no field
-# descriptor appears more than once. Field identity is tracked by the internal
-# field id rather than by field name.
+# Validate that a problem is defined on at least one mutually compatible field
+# and that no field descriptor appears more than once. Field identity is tracked
+# by the internal field id rather than by field name.
 function _checked_problem_fields(fields::Vector{AbstractField})
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
   seen_ids = Set{UInt64}()
+  reference = _field_layout_reference(field_space(fields[1]))
 
   for field in fields
     !(_field_id(field) in seen_ids) ||
       throw(ArgumentError("fields must be unique problem descriptors"))
     push!(seen_ids, _field_id(field))
+    _check_field_layout_space(field_space(field), reference)
   end
 
   return fields

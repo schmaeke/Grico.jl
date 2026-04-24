@@ -37,6 +37,10 @@ end
   @test Grico.UniformDegree(0) isa Grico.UniformDegree
   @test Grico.AxisDegrees((0, 1)) isa Grico.AxisDegrees{2}
   @test Grico.AxisDegrees{2}((0, 1)) isa Grico.AxisDegrees{2}
+  too_large = big(typemax(Int)) + 1
+  @test_throws ArgumentError Grico.UniformDegree(too_large)
+  @test_throws ArgumentError Grico.AxisDegrees((too_large,))
+  @test_throws ArgumentError Grico.DegreePlusQuadrature(too_large)
   @test_throws ArgumentError Grico.DegreePlusQuadrature(-1)
   @test_throws ArgumentError Grico.SpaceOptions(continuity=:foo)
   @test_throws ArgumentError Grico.SpaceOptions(continuity=(:cg, :foo))
@@ -53,6 +57,38 @@ end
                                                  compiled.single_term_indices,
                                                  compiled.single_term_coefficients, (0,))
   @test_throws ArgumentError Grico.check_space(space)
+
+  lookup_space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(2)))
+  lookup_compiled = only(lookup_space.compiled_leaves)
+  bad_lookup = copy(lookup_compiled.mode_lookup)
+  fill!(bad_lookup, 0)
+  lookup_space.compiled_leaves[1] = Grico._CompiledLeaf(lookup_compiled.leaf,
+                                                        lookup_compiled.degrees,
+                                                        lookup_compiled.support_shape,
+                                                        lookup_compiled.local_modes, bad_lookup,
+                                                        lookup_compiled.term_offsets,
+                                                        lookup_compiled.term_indices,
+                                                        lookup_compiled.term_coefficients,
+                                                        lookup_compiled.single_term_indices,
+                                                        lookup_compiled.single_term_coefficients,
+                                                        lookup_compiled.quadrature_shape)
+  @test_throws ArgumentError Grico.check_space(lookup_space)
+
+  offset_space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(2)))
+  offset_compiled = only(offset_space.compiled_leaves)
+  bad_offsets = copy(offset_compiled.term_offsets)
+  bad_offsets[3] = bad_offsets[2]
+  offset_space.compiled_leaves[1] = Grico._CompiledLeaf(offset_compiled.leaf,
+                                                        offset_compiled.degrees,
+                                                        offset_compiled.support_shape,
+                                                        offset_compiled.local_modes,
+                                                        offset_compiled.mode_lookup, bad_offsets,
+                                                        offset_compiled.term_indices,
+                                                        offset_compiled.term_coefficients,
+                                                        offset_compiled.single_term_indices,
+                                                        offset_compiled.single_term_coefficients,
+                                                        offset_compiled.quadrature_shape)
+  @test_throws ArgumentError Grico.check_space(offset_space)
 end
 
 @testset "Continuity Policy API" begin
@@ -84,6 +120,10 @@ end
   @test Grico.is_continuous_axis(mixed_space, 1)
   @test !Grico.is_continuous_axis(mixed_space, 2)
   @test_throws ArgumentError Grico.continuity_kind(default_space, 3)
+  @test_throws ArgumentError Grico.is_mode_active(default_space, 1, (0,))
+  @test_throws ArgumentError Grico.is_mode_active(default_space, 1, (0, 0.0))
+  @test_throws ArgumentError Grico.mode_terms(default_space, 1, (0,))
+  @test_throws ArgumentError Grico.mode_terms(default_space, 1, [0, 0])
   @test_throws ArgumentError Grico.HpSpace(domain_2d,
                                            Grico.SpaceOptions(degree=Grico.UniformDegree(0),
                                                               continuity=:cg))
@@ -99,6 +139,13 @@ end
   @test_throws ArgumentError Grico.HpSpace(domain_1d,
                                            Grico.SpaceOptions(degree=Grico.UniformDegree(2),
                                                               continuity=(:cg, :cg)))
+
+  snapshot_domain = Grico.Domain((0.0,), (1.0,), (1,))
+  snapshot_space = Grico.HpSpace(snapshot_domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
+  Grico.refine!(Grico.grid(snapshot_domain), 1, 1)
+  @test Grico.active_leaves(snapshot_space) == [1]
+  @test Grico.active_leaves(Grico.grid(snapshot_space)) == [1]
+  @test Grico.check_space(snapshot_space) === nothing
 end
 
 @testset "Physical Domains" begin
@@ -116,6 +163,14 @@ end
   sliver_space = Grico.HpSpace(sliver_domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
 
   @test Grico.active_leaves(sliver_space) == [1, 2]
+
+  shared_region = Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=0)
+  left_domain = Grico.PhysicalDomain(Grico.Domain((0.0,), (1.0,), (1,)), shared_region)
+  shifted_domain = Grico.PhysicalDomain(Grico.Domain((2.0,), (3.0,), (1,)), shared_region)
+
+  @test Grico._domain_active_leaves(left_domain) == [1]
+  @test Grico._domain_active_leaves(copy(left_domain)) == [1]
+  @test_throws ArgumentError Grico._domain_active_leaves(shifted_domain)
 end
 
 @testset "Field And State Validation" begin
@@ -136,16 +191,31 @@ end
   @test collect(Grico.field_values(mixed_state, v)) ≈ collect(0.4:0.1:0.9)
   @test collect(Grico.field_component_values(mixed_state, v, 2)) ≈ collect(0.7:0.1:0.9)
 
+  too_large = big(typemax(Int)) + 1
+  @test_throws ArgumentError Grico.VectorField(space, too_large)
+  @test_throws ArgumentError Grico.VectorField(1, space, too_large, :v)
   @test_throws ArgumentError Grico.VectorField(1, space, 0, :v)
+  @test_throws ArgumentError Grico.FieldLayout((1,))
   @test_throws ArgumentError Grico.FieldLayout((u, u))
   @test_throws ArgumentError typeof(layout)(typeof(layout.slots)(), 0)
   @test_throws ArgumentError typeof(layout)([slot], slot.dof_count - 1)
   @test_throws ArgumentError typeof(layout)([Grico._FieldSlot(slot.field, slot.space, 2,
                                                               slot.scalar_dof_count,
                                                               slot.dof_count)], slot.dof_count)
+  @test_throws ArgumentError Grico.State(layout, [1, 2, 3])
   @test_throws ArgumentError typeof(state)(layout, [0.1, -0.2])
   @test_throws ArgumentError Grico.field_dof_range(layout, v)
   @test_throws ArgumentError Grico.field_values(state, v)
+
+  first_region = Grico.ImplicitRegion(x -> x[1] - 0.25; subdivision_depth=1)
+  second_region = Grico.ImplicitRegion(x -> x[1] - 0.75; subdivision_depth=1)
+  first_physical = Grico.PhysicalDomain(Grico.Domain((0.0,), (1.0,), (1,)), first_region)
+  second_physical = Grico.PhysicalDomain(Grico.Domain((0.0,), (1.0,), (1,)), second_region)
+  first_field = Grico.ScalarField(Grico.HpSpace(first_physical); name=:first)
+  second_field = Grico.ScalarField(Grico.HpSpace(second_physical); name=:second)
+  @test Grico.active_leaves(Grico.field_space(first_field)) ==
+        Grico.active_leaves(Grico.field_space(second_field))
+  @test_throws ArgumentError Grico.FieldLayout((first_field, second_field))
 end
 
 @testset "HpSpace Single Cell" begin
@@ -293,6 +363,24 @@ end
   _test_term_vector(Grico.mode_terms(flipped, 1, (0, 1)), [2 => 1.0])
   _test_term_vector(Grico.mode_terms(flipped, 3, (0, 1)), [5 => 1.0])
   @test Grico.check_space(flipped) === nothing
+
+  mismatch_domain = Grico.Domain((0.0, 0.0), (2.0, 1.0), (2, 1))
+  mismatch_space = Grico.HpSpace(mismatch_domain,
+                                 Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                    degree=Grico.ByLeafDegrees((domain, leaf) -> leaf ==
+                                                                                                 1 ?
+                                                                                                 (1,
+                                                                                                  0) :
+                                                                                                 (1,
+                                                                                                  2)),
+                                                    continuity=(:cg, :dg)))
+  @test Grico.check_space(mismatch_space) === nothing
+  mismatch_coefficients = collect(1.0:Grico.scalar_dof_count(mismatch_space))
+
+  for y in (-1.0, -0.5, 0.0, 0.5, 1.0)
+    @test _space_value(mismatch_space, 1, (1.0, y), mismatch_coefficients) ≈
+          _space_value(mismatch_space, 2, (-1.0, y), mismatch_coefficients) atol = SPACE_TOL
+  end
 end
 
 @testset "Same-Level P Mismatch" begin
@@ -350,6 +438,54 @@ end
 
   for y in (-0.75, -0.25, 0.25, 0.75)
     @test _space_value(space, 1, (1.0, y), coefficients) ≈ wrapped_value(y, coefficients) atol = SPACE_TOL
+  end
+
+  p0_tangential_domain = Grico.Domain((0.0, 0.0), (2.0, 1.0), (2, 1))
+  p0_tangential_grid = Grico.grid(p0_tangential_domain)
+  p0_first_child = Grico.refine!(p0_tangential_grid, 2, 2)
+  p0_space = Grico.HpSpace(p0_tangential_domain,
+                           Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                              degree=Grico.AxisDegrees((1, 0)),
+                                              continuity=(:cg, :dg)))
+  @test Grico.check_space(p0_space) === nothing
+
+  function p0_wrapped_value(y, coefficients)
+    return y < 0 ? _space_value(p0_space, p0_first_child, (-1.0, 2 * y + 1), coefficients) :
+           _space_value(p0_space, p0_first_child + 1, (-1.0, 2 * y - 1), coefficients)
+  end
+
+  p0_coefficients = collect(1.0:Grico.scalar_dof_count(p0_space))
+
+  for y in (-0.75, -0.25, 0.25, 0.75)
+    @test _space_value(p0_space, 1, (1.0, y), p0_coefficients) ≈
+          p0_wrapped_value(y, p0_coefficients) atol = SPACE_TOL
+  end
+end
+
+@testset "Float32 Hanging Continuity" begin
+  constant_restriction = Grico._affine_restriction_matrix(0, 0, 1, 0, Float32)
+  @test constant_restriction isa Matrix{Float32}
+  @test constant_restriction == ones(Float32, 1, 1)
+
+  domain = Grico.Domain((0.0f0, 0.0f0), (2.0f0, 1.0f0), (2, 1))
+  grid = Grico.grid(domain)
+  first_child = Grico.refine!(grid, 2, 2)
+  space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(3)))
+  @test Grico.check_space(space) === nothing
+
+  terms = Grico.mode_terms(space, first_child, (0, 1))
+  @test !isempty(terms)
+  @test all(term -> term.second isa Float32, terms)
+
+  function wrapped_value(y, coefficients)
+    return y < 0 ? _space_value(space, first_child, (-1.0f0, 2 * y + 1), coefficients) :
+           _space_value(space, first_child + 1, (-1.0f0, 2 * y - 1), coefficients)
+  end
+
+  coefficients = Float32.(1:Grico.scalar_dof_count(space))
+
+  for y in Float32[-0.75, -0.25, 0.25, 0.75]
+    @test _space_value(space, 1, (1.0f0, y), coefficients) ≈ wrapped_value(y, coefficients) atol = 5.0e-5
   end
 end
 

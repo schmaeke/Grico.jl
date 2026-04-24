@@ -272,11 +272,6 @@ function _SchwarzPatch(dofs::Vector{Int}, factor::F) where {T<:AbstractFloat,F<:
   return _SchwarzPatch{T,F}(dofs, factor)
 end
 
-struct _SchwarzThreadBuffer{T<:AbstractFloat}
-  output::Vector{T}
-  rhs::Vector{T}
-end
-
 # Prepared two-level additive Schwarz operator built for one assembled system.
 # The coarse factorization and patch factorizations are created lazily and then
 # reused across repeated solves of the same matrix.
@@ -284,7 +279,7 @@ mutable struct _AdditiveSchwarzOperator{T<:AbstractFloat,F,CF} <: _BufferedLinea
   patches::Vector{_SchwarzPatch{T,F}}
   coarse_prolongation::SparseMatrixCSC{T,Int}
   coarse_factor::CF
-  thread_buffers::Vector{_SchwarzThreadBuffer{T}}
+  patch_rhs::Vector{T}
   coarse_rhs::Vector{T}
   coarse_solution::Vector{T}
   apply_rhs::Vector{T}
@@ -384,14 +379,36 @@ function _default_system_linear_solve(system::AffineSystem{T},
                                       initial_solution::Union{Nothing,AbstractVector{T}}=nothing) where {T<:AbstractFloat}
   if _preconditioner_is_applicable(system, preconditioner)
     style = _preconditioned_krylov_style(system, preconditioner)
-    values, converged = _preconditioned_krylov_solve(system, preconditioner, style,
-                                                     initial_solution)
-    converged && return values
-    @warn "$( _preconditioned_krylov_name(preconditioner, style) ) did not converge; falling back to sparse direct solve" reduced_dofs = size(system.matrix,
-                                                                                                                                              1)
+
+    try
+      values, converged = _preconditioned_krylov_solve(system, preconditioner, style,
+                                                       initial_solution)
+      converged && return values
+      _warn_krylov_fallback(system, preconditioner, style)
+    catch error
+      error isa InterruptException && rethrow()
+      _warn_krylov_fallback(system, preconditioner, style, error, catch_backtrace())
+    end
   end
 
   return _default_system_direct_solve(system)
+end
+
+function _warn_krylov_fallback(system::AffineSystem, preconditioner::_AbstractPreconditioner,
+                               style::_KrylovSolveStyle)
+  method = _preconditioned_krylov_name(preconditioner, style)
+  reduced_dofs = size(system.matrix, 1)
+  @warn "$method did not converge; falling back to sparse direct solve" reduced_dofs
+  return nothing
+end
+
+function _warn_krylov_fallback(system::AffineSystem, preconditioner::_AbstractPreconditioner,
+                               style::_KrylovSolveStyle, error, backtrace)
+  method = _preconditioned_krylov_name(preconditioner, style)
+  reduced_dofs = size(system.matrix, 1)
+  exception = (error, backtrace)
+  @warn "$method failed; falling back to sparse direct solve" reduced_dofs exception
+  return nothing
 end
 
 # Direct reduced solve with a cached ordered factorization. The cache lives on
@@ -408,7 +425,7 @@ end
 
 function _direct_operator(system::AffineSystem{T}) where {T<:AbstractFloat}
   return get!(system.preconditioner_cache, _DIRECT_SOLVE_CACHE_KEY) do
-    _build_ordered_direct_operator(system.matrix)
+    _build_ordered_direct_operator(system.matrix, system.ordering, system.inverse_ordering)
   end
 end
 
@@ -474,6 +491,16 @@ end
 
 # Accept either a full-layout initial guess or a reduced one and convert it to
 # reduced-system ordering.
+function _converted_reduced_vector(::Type{T}, values::AbstractVector,
+                                   message::AbstractString) where {T<:AbstractFloat}
+  try
+    return Vector{T}(values)
+  catch error
+    error isa InterruptException && rethrow()
+    throw(ArgumentError(message))
+  end
+end
+
 function _reduced_initial_solution(system::AffineSystem{T},
                                    initial_solution) where {T<:AbstractFloat}
   initial_solution === nothing && return nothing
@@ -484,10 +511,14 @@ function _reduced_initial_solution(system::AffineSystem{T},
   else
     initial_solution
   end
+  initial_values isa AbstractVector ||
+    throw(ArgumentError("initial solution must be a vector or State"))
   reduced = if length(initial_values) == dof_count(system.layout)
-    Vector{T}(initial_values[system.solve_dofs])
+    _converted_reduced_vector(T, initial_values[system.solve_dofs],
+                              "initial solution entries must be convertible to the system scalar type")
   elseif length(initial_values) == length(system.solve_dofs)
-    Vector{T}(initial_values)
+    _converted_reduced_vector(T, initial_values,
+                              "initial solution entries must be convertible to the system scalar type")
   else
     throw(ArgumentError("initial solution length must match either the reduced system or full layout"))
   end
@@ -499,6 +530,15 @@ function _ordered_initial_solution(system::AffineSystem{T},
   reduced = _reduced_initial_solution(system, initial_solution)
   reduced === nothing && return nothing
   return reduced[system.ordering]
+end
+
+function _checked_reduced_solution(system::AffineSystem{T}, values,
+                                   source::AbstractString) where {T<:AbstractFloat}
+  values isa AbstractVector || throw(ArgumentError("$source must return a vector"))
+  length(values) == size(system.matrix, 1) ||
+    throw(ArgumentError("$source must return one value per reduced system dof"))
+  return _converted_reduced_vector(T, values,
+                                   "$source must return values convertible to the system scalar type")
 end
 
 # Public solve entry points.
@@ -538,16 +578,17 @@ function solve(system::AffineSystem; linear_solve=default_linear_solve, precondi
                initial_solution=nothing)
   reduced_values = if linear_solve === default_linear_solve
     resolved_preconditioner = _resolved_preconditioner(system, preconditioner)
-    _with_internal_blas_threads() do
-      _default_system_linear_solve(system, resolved_preconditioner,
-                                   _reduced_initial_solution(system, initial_solution))
-    end
+    _default_system_linear_solve(system, resolved_preconditioner,
+                                 _reduced_initial_solution(system, initial_solution))
   else
     preconditioner === nothing ||
       throw(ArgumentError("package preconditioner configurations are only used by the default solve path"))
     ordered = _ordered_system_data(system)
     ordered_initial = _ordered_initial_solution(system, initial_solution)
-    ordered_values = _call_linear_solve(linear_solve, ordered.matrix, ordered.rhs, ordered_initial)
+    ordered_values = _checked_reduced_solution(system,
+                                               _call_linear_solve(linear_solve, ordered.matrix,
+                                                                  ordered.rhs, ordered_initial),
+                                               "linear_solve")
     _unordered_solution(system, ordered_values)
   end
   return _expand_system_values(system, reduced_values)
@@ -610,18 +651,15 @@ function _preconditioned_krylov_solve(system::AffineSystem{T},
                                       preconditioner::_AbstractPreconditioner,
                                       style::_KrylovSolveStyle,
                                       initial_solution::Union{Nothing,AbstractVector{T}}=nothing) where {T<:AbstractFloat}
-  try
-    operator = _preconditioner_operator(system, preconditioner)
-    iterate = initial_solution === nothing ? zeros(T, size(system.matrix, 1)) :
-              copy(initial_solution)
-    solution = _run_preconditioned_krylov!(iterate, system, operator, style,
-                                           initial_solution === nothing)
-    converged = _relative_residual_norm(system.matrix, system.rhs, solution) <=
-                _default_krylov_reltol(T)
-    return solution, converged
-  catch
-    return zeros(T, size(system.matrix, 1)), false
+  operator = _preconditioner_operator(system, preconditioner)
+  solution = if initial_solution === nothing
+    _run_krylov_without_initial_guess(style, system, operator)
+  else
+    _run_krylov_with_initial_guess(style, copy(initial_solution), system, operator)
   end
+  converged = _relative_residual_norm(system.matrix, system.rhs, solution) <=
+              _default_krylov_reltol(T)
+  return solution, converged
 end
 
 function _cg_krylov_options(system::AffineSystem{T}, preconditioner) where {T<:AbstractFloat}
@@ -634,35 +672,33 @@ function _gmres_krylov_options(system::AffineSystem{T}, preconditioner) where {T
           memory=_default_gmres_restart(system), itmax=_default_krylov_maxiter(system))
 end
 
-function _run_preconditioned_krylov!(iterate::AbstractVector{T}, system::AffineSystem{T},
-                                     preconditioner, style::_KrylovSolveStyle,
-                                     initially_zero::Bool) where {T<:AbstractFloat}
-  solution, _ = initially_zero ? _run_krylov_without_initial_guess(style, system, preconditioner) :
-                _run_krylov_with_initial_guess(style, iterate, system, preconditioner)
-  return solution
-end
-
 function _run_krylov_without_initial_guess(::_SymmetricKrylovStyle, system::AffineSystem{T},
                                            preconditioner) where {T<:AbstractFloat}
-  return cg(Symmetric(system.matrix), system.rhs; _cg_krylov_options(system, preconditioner)...)
+  solution, _ = cg(Symmetric(system.matrix), system.rhs;
+                   _cg_krylov_options(system, preconditioner)...)
+  return solution
 end
 
 function _run_krylov_with_initial_guess(::_SymmetricKrylovStyle, iterate::AbstractVector{T},
                                         system::AffineSystem{T},
                                         preconditioner) where {T<:AbstractFloat}
-  return cg(Symmetric(system.matrix), system.rhs, iterate;
-            _cg_krylov_options(system, preconditioner)...)
+  solution, _ = cg(Symmetric(system.matrix), system.rhs, iterate;
+                   _cg_krylov_options(system, preconditioner)...)
+  return solution
 end
 
 function _run_krylov_without_initial_guess(::_GeneralKrylovStyle, system::AffineSystem{T},
                                            preconditioner) where {T<:AbstractFloat}
-  return gmres(system.matrix, system.rhs; _gmres_krylov_options(system, preconditioner)...)
+  solution, _ = gmres(system.matrix, system.rhs; _gmres_krylov_options(system, preconditioner)...)
+  return solution
 end
 
 function _run_krylov_with_initial_guess(::_GeneralKrylovStyle, iterate::AbstractVector{T},
                                         system::AffineSystem{T},
                                         preconditioner) where {T<:AbstractFloat}
-  return gmres(system.matrix, system.rhs, iterate; _gmres_krylov_options(system, preconditioner)...)
+  solution, _ = gmres(system.matrix, system.rhs, iterate;
+                      _gmres_krylov_options(system, preconditioner)...)
+  return solution
 end
 
 function _relative_residual_norm(matrix_data::SparseMatrixCSC{T,Int}, rhs_data::AbstractVector{T},
@@ -931,19 +967,34 @@ end
 # Build a small ordered direct solve for a block matrix. The explicit ordering
 # keeps block factorizations aligned with the package-wide direct-solve policy
 # while still allowing repeated `ldiv!` applications without allocation.
-function _build_ordered_factor_operator(factor,
-                                        matrix_data::SparseMatrixCSC{T,Int}) where {T<:AbstractFloat}
-  ordering, inverse_ordering = _solve_ordering(matrix_data)
-  ordered_matrix = matrix_data[ordering, ordering]
+function _build_ordered_factor_operator(factor, matrix_data::SparseMatrixCSC{T,Int},
+                                        ordering::Vector{Int},
+                                        inverse_ordering::Vector{Int}) where {T<:AbstractFloat}
+  cached_ordering = copy(ordering)
+  cached_inverse_ordering = copy(inverse_ordering)
+  ordered_matrix = matrix_data[cached_ordering, cached_ordering]
   ordered_rhs = zeros(T, size(matrix_data, 1))
   ordered_solution = zeros(T, size(matrix_data, 1))
   apply_rhs = zeros(T, size(matrix_data, 1))
-  return _OrderedFactorOperator(factor(ordered_matrix), ordering, inverse_ordering, ordered_rhs,
-                                ordered_solution, apply_rhs)
+  return _OrderedFactorOperator(factor(ordered_matrix), cached_ordering, cached_inverse_ordering,
+                                ordered_rhs, ordered_solution, apply_rhs)
+end
+
+function _build_ordered_factor_operator(factor,
+                                        matrix_data::SparseMatrixCSC{T,Int}) where {T<:AbstractFloat}
+  ordering, inverse_ordering = _solve_ordering(matrix_data)
+  return _build_ordered_factor_operator(factor, matrix_data, ordering, inverse_ordering)
 end
 
 function _build_ordered_direct_operator(matrix_data::SparseMatrixCSC{T,Int}) where {T<:AbstractFloat}
   return _build_ordered_factor_operator(matrix_data) do ordered_matrix
+    _factorize_sparse_direct(ordered_matrix, _matrix_krylov_style(matrix_data))
+  end
+end
+
+function _build_ordered_direct_operator(matrix_data::SparseMatrixCSC{T,Int}, ordering::Vector{Int},
+                                        inverse_ordering::Vector{Int}) where {T<:AbstractFloat}
+  return _build_ordered_factor_operator(matrix_data, ordering, inverse_ordering) do ordered_matrix
     _factorize_sparse_direct(ordered_matrix, _matrix_krylov_style(matrix_data))
   end
 end
@@ -976,22 +1027,20 @@ end
 # index motion explicit avoids temporary views and keeps the operator
 # application logic readable.
 function _gather_entries!(target::AbstractVector, source::AbstractVector, indices::Vector{Int})
-  length(target) == length(indices) ||
-    throw(ArgumentError("gather target length must match the index count"))
-
-  for local_index in eachindex(indices)
-    target[local_index] = source[indices[local_index]]
+  @inbounds begin
+    for local_index in eachindex(indices)
+      target[local_index] = source[indices[local_index]]
+    end
   end
 
   return target
 end
 
 function _scatter_entries!(target::AbstractVector, source::AbstractVector, indices::Vector{Int})
-  length(source) == length(indices) ||
-    throw(ArgumentError("scatter source length must match the index count"))
-
-  for local_index in eachindex(indices)
-    target[indices[local_index]] = source[local_index]
+  @inbounds begin
+    for local_index in eachindex(indices)
+      target[indices[local_index]] = source[local_index]
+    end
   end
 
   return target
@@ -1006,14 +1055,12 @@ function _build_two_level_additive_schwarz(matrix_data::SparseMatrixCSC{T,Int},
   patches = _build_schwarz_patches(matrix_data, topology.leaf_patches, style)
   coarse_prolongation = _independent_coarse_prolongation(topology.coarse_prolongation)
   coarse_factor = _build_schwarz_coarse_factor(matrix_data, coarse_prolongation, style)
-  worker_count = max(1, min(Threads.nthreads(), length(patches)))
   max_patch_size = isempty(patches) ? 1 : maximum(length(patch.dofs) for patch in patches)
-  thread_buffers = [_SchwarzThreadBuffer(zeros(T, size(matrix_data, 1)), zeros(T, max_patch_size))
-                    for _ in 1:worker_count]
+  patch_rhs = zeros(T, max_patch_size)
   coarse_rhs = zeros(T, size(coarse_prolongation, 2))
   coarse_solution = zeros(T, size(coarse_prolongation, 2))
   apply_rhs = zeros(T, size(matrix_data, 1))
-  return _AdditiveSchwarzOperator(patches, coarse_prolongation, coarse_factor, thread_buffers,
+  return _AdditiveSchwarzOperator(patches, coarse_prolongation, coarse_factor, patch_rhs,
                                   coarse_rhs, coarse_solution, apply_rhs)
 end
 
@@ -1052,24 +1099,16 @@ function _empty_schwarz_patches(::Type{T}, style::_KrylovSolveStyle) where {T<:A
   return _SchwarzPatch{T,_schwarz_patch_factor_type(T, style)}[]
 end
 
-# Build all patch factorizations, in parallel when worthwhile.
+# Build all patch factorizations.
 function _build_schwarz_patches(matrix_data::SparseMatrixCSC{T,Int},
                                 raw_patches::Vector{Vector{Int}},
                                 style::_KrylovSolveStyle) where {T<:AbstractFloat}
   active = [patch for patch in raw_patches if !isempty(patch)]
   isempty(active) && return _empty_schwarz_patches(T, style)
-  worker_count = min(Threads.nthreads(), length(active))
-  built = [_empty_schwarz_patches(T, style) for _ in 1:worker_count]
-  _run_chunks_with_scratch!(built, length(active)) do worker_patches, first_patch, last_patch
-    for patch_index in first_patch:last_patch
-      push!(worker_patches, _build_schwarz_patch(matrix_data, active[patch_index], style))
-    end
-  end
-
   patches = _empty_schwarz_patches(T, style)
 
-  for worker_patches in built
-    append!(patches, worker_patches)
+  for patch in active
+    push!(patches, _build_schwarz_patch(matrix_data, patch, style))
   end
 
   return patches
@@ -1078,15 +1117,11 @@ end
 # Factor one dense patch matrix for later repeated preconditioner application.
 function _factorize_dense_patch!(block::Matrix{T}, ::_SymmetricKrylovStyle) where {T<:AbstractFloat}
   _symmetrize_dense!(block)
-  return _with_serialized_blas() do
-    cholesky!(Symmetric(block))
-  end
+  return cholesky!(Symmetric(block))
 end
 
 function _factorize_dense_patch!(block::Matrix{T}, ::_GeneralKrylovStyle) where {T<:AbstractFloat}
-  return _with_serialized_blas() do
-    lu!(block)
-  end
+  return lu!(block)
 end
 
 function _build_schwarz_patch(matrix_data::SparseMatrixCSC{T,Int}, dofs::Vector{Int},
@@ -1152,51 +1187,23 @@ end
 function _apply_schwarz_patches!(result::AbstractVector{T},
                                  preconditioner::_AdditiveSchwarzOperator{T},
                                  rhs_data::AbstractVector{T}) where {T<:AbstractFloat}
-  patch_count = length(preconditioner.patches)
-  patch_count == 0 && return result
-  worker_count = min(length(preconditioner.thread_buffers), patch_count)
+  patch_rhs = preconditioner.patch_rhs
 
-  if worker_count == 1
-    buffer = preconditioner.thread_buffers[1]
-    _apply_schwarz_patch_range!(result, rhs_data, preconditioner.patches, 1, patch_count,
-                                buffer.rhs)
-    return result
-  end
+  for patch in preconditioner.patches
+    local_rhs = view(patch_rhs, 1:length(patch.dofs))
 
-  for worker in 1:worker_count
-    fill!(preconditioner.thread_buffers[worker].output, zero(T))
-  end
-
-  _run_chunks_with_scratch!(preconditioner.thread_buffers,
-                            patch_count) do buffer, first_patch, last_patch
-    _apply_schwarz_patch_range!(buffer.output, rhs_data, preconditioner.patches, first_patch,
-                                last_patch, buffer.rhs)
-  end
-
-  for worker in 1:worker_count
-    result .+= preconditioner.thread_buffers[worker].output
-  end
-
-  return result
-end
-
-function _apply_schwarz_patch_range!(result::AbstractVector{T}, rhs_data::AbstractVector{T},
-                                     patches, first_patch::Int, last_patch::Int,
-                                     rhs_buffer::Vector{T}) where {T<:AbstractFloat}
-  for patch_index in first_patch:last_patch
-    patch = patches[patch_index]
-    local_rhs = view(rhs_buffer, 1:length(patch.dofs))
-
-    for local_index in eachindex(patch.dofs)
-      local_rhs[local_index] = rhs_data[patch.dofs[local_index]]
+    @inbounds begin
+      for local_index in eachindex(patch.dofs)
+        local_rhs[local_index] = rhs_data[patch.dofs[local_index]]
+      end
     end
 
-    _with_serialized_blas() do
-      ldiv!(patch.factor, local_rhs)
-    end
+    ldiv!(patch.factor, local_rhs)
 
-    for local_index in eachindex(patch.dofs)
-      result[patch.dofs[local_index]] += local_rhs[local_index]
+    @inbounds begin
+      for local_index in eachindex(patch.dofs)
+        result[patch.dofs[local_index]] += local_rhs[local_index]
+      end
     end
   end
 

@@ -32,6 +32,44 @@ benchmark reports stay untracked.
 - Do not leave stale comments behind. If implementation and prose disagree, the
   prose is wrong until it is updated.
 
+## Validation and Internal Checks
+
+Public API boundaries should validate user-supplied arguments explicitly and
+throw named errors such as `ArgumentError` or `DimensionMismatch`. A public
+function should not rely on a later array access to produce a useful error when
+the invalid value has semantic meaning, such as a cell, leaf, axis, component,
+quadrature point, or mode index.
+
+Public functions may accept broad integer arguments such as `::Integer` when
+that matches normal Julia indexing expectations. After validation, normalize
+indices, counts, offsets, and loop-facing values to `Int` before passing them
+into internal code. Validate ranges before converting so oversized integer
+inputs produce the intended user-facing error.
+
+Internal routines that are only called after validation should use concrete
+`Int` arguments for indices, counts, offsets, and dimensions. Hot internal
+functions may assume their callers maintain the documented invariants instead of
+repeating public argument checks.
+
+For array-like accessors, prefer Julia's bounds-checking protocol:
+
+```julia
+@inline function item(container, index::Integer)
+  count = item_count(container)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "item")
+  return @inbounds container.items[Int(index)]
+end
+```
+
+Use `@boundscheck` only for checks that may be elided safely by an enclosing
+`@inbounds` call. Do not hide mandatory semantic validation inside
+`@boundscheck`.
+
+Use `BoundsError` only for low-level collection access where the container
+itself is the API. Use `ArgumentError` for Grico semantic indices such as cells,
+leaves, axes, components, quadrature points, and modes, where a named message
+gives better context than a raw bounds failure.
+
 ## Documentation and Commenting Style
 
 The library should be readable at two levels at once:

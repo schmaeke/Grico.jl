@@ -78,6 +78,10 @@ struct GaussLegendreRule{T<:AbstractFloat} <: AbstractQuadrature{1,T}
   end
 end
 
+function GaussLegendreRule(points::Vector{T}, weights::Vector{T}) where {T<:AbstractFloat}
+  return GaussLegendreRule{T}(points, weights)
+end
+
 """
     TensorQuadrature(shape)
     TensorQuadrature(T, shape)
@@ -190,18 +194,22 @@ For tensor-product rules, points are enumerated in mixed-radix order with axis
 1 varying fastest. This is the same tensor ordering convention used elsewhere
 in the package for local modal and quadrature data.
 """
-function point(rule::GaussLegendreRule{T}, point_index::Integer) where {T}
-  return (@inbounds(rule.points[_checked_index(point_index, point_count(rule), "point")]),)
+@inline function point(rule::GaussLegendreRule{T}, point_index::Integer) where {T}
+  count = point_count(rule)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return (@inbounds(rule.points[Int(point_index)]),)
 end
 
-function point(quadrature::PointQuadrature{D,T}, point_index::Integer) where {D,T}
-  return @inbounds quadrature.points[_checked_index(point_index, point_count(quadrature), "point")]
+@inline function point(quadrature::PointQuadrature{D,T}, point_index::Integer) where {D,T}
+  count = point_count(quadrature)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds quadrature.points[Int(point_index)]
 end
 
 # Tensor points are enumerated in mixed-radix order with axis 1 varying fastest.
 # The precomputed strides invert that numbering without materializing the full
 # tensor-product point array.
-function point(quadrature::TensorQuadrature{D,T}, point_index::Integer) where {D,T}
+@inline function point(quadrature::TensorQuadrature{D,T}, point_index::Integer) where {D,T}
   linear = _tensor_linear_point_index(quadrature, point_index)
   local_indices = _tensor_local_point_indices(quadrature, linear)
   return ntuple(axis -> @inbounds(quadrature.rules[axis].points[local_indices[axis]]), D)
@@ -216,13 +224,17 @@ This is a convenience wrapper around [`point`](@ref) when only a single axis
 coordinate is needed. The specialized tensor-product method avoids constructing
 the full point tuple when a caller only needs one coordinate.
 """
-function coordinate(quadrature::AbstractQuadrature{D}, point_index::Integer,
-                    axis::Integer) where {D}
-  return point(quadrature, point_index)[_checked_index(axis, D, "axis")]
+@inline function coordinate(quadrature::AbstractQuadrature{D}, point_index::Integer,
+                            axis::Integer) where {D}
+  @boundscheck 1 <= axis <= D || _throw_index_error(axis, D, "axis")
+  coordinates = point(quadrature, point_index)
+  return @inbounds coordinates[Int(axis)]
 end
 
-function coordinate(quadrature::TensorQuadrature, point_index::Integer, axis::Integer)
-  checked_axis = _checked_index(axis, dimension(quadrature), "axis")
+@inline function coordinate(quadrature::TensorQuadrature, point_index::Integer, axis::Integer)
+  dimension_count = dimension(quadrature)
+  @boundscheck 1 <= axis <= dimension_count || _throw_index_error(axis, dimension_count, "axis")
+  checked_axis = Int(axis)
   linear = _tensor_linear_point_index(quadrature, point_index)
   local_index = _tensor_local_point_index(quadrature, linear, checked_axis)
   return @inbounds quadrature.rules[checked_axis].points[local_index]
@@ -237,17 +249,21 @@ For tensor-product rules this is the product of the corresponding
 one-dimensional weights; for point-cloud rules it is the stored point weight.
 For Gauss-Legendre rules on `[-1, 1]`, all weights are strictly positive.
 """
-function weight(rule::GaussLegendreRule, point_index::Integer)
-  @inbounds rule.weights[_checked_index(point_index, point_count(rule), "point")]
+@inline function weight(rule::GaussLegendreRule, point_index::Integer)
+  count = point_count(rule)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds rule.weights[Int(point_index)]
 end
 
-function weight(quadrature::PointQuadrature, point_index::Integer)
-  @inbounds quadrature.weights[_checked_index(point_index, point_count(quadrature), "point")]
+@inline function weight(quadrature::PointQuadrature, point_index::Integer)
+  count = point_count(quadrature)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return @inbounds quadrature.weights[Int(point_index)]
 end
 
 # As for the tensor point coordinates, the linear point index is decoded by a
 # mixed-radix traversal and the one-dimensional weights are multiplied.
-function weight(quadrature::TensorQuadrature{D,T}, point_index::Integer) where {D,T}
+@inline function weight(quadrature::TensorQuadrature{D,T}, point_index::Integer) where {D,T}
   linear = _tensor_linear_point_index(quadrature, point_index)
   local_indices = _tensor_local_point_indices(quadrature, linear)
   value = one(T)
@@ -270,7 +286,11 @@ Gauss-Legendre rule on `[-1,1]`.
 The exactness degree is `2 * point_count - 1`.
 """
 function gauss_legendre_exact_degree(point_count::Integer)
-  return 2 * _checked_positive(point_count, "point_count") - 1
+  count = _checked_positive(point_count, "point_count")
+  max_count = typemax(Int) ÷ 2 + 1
+  count <= max_count ||
+    throw(ArgumentError("exact degree for point_count must be Int-representable"))
+  return 2 * (count - 1) + 1
 end
 
 """
@@ -285,7 +305,7 @@ next admissible integer point count. Equivalently, it is the smallest integer
 """
 function minimum_gauss_legendre_points(exact_degree::Integer)
   degree = _checked_nonnegative(exact_degree, "exact_degree")
-  return max(1, (degree + 2) ÷ 2)
+  return degree ÷ 2 + 1
 end
 
 # Gauss-Legendre rule construction.
@@ -408,7 +428,9 @@ end
 # zero-based mixed-radix representation. These helpers convert between those two
 # views without allocating temporary arrays.
 @inline function _tensor_linear_point_index(quadrature::TensorQuadrature, point_index::Integer)
-  return _checked_index(point_index, point_count(quadrature), "point") - 1
+  count = point_count(quadrature)
+  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
+  return Int(point_index) - 1
 end
 
 # Recover one axis-local point index from the zero-based mixed-radix tensor

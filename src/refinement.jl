@@ -47,20 +47,31 @@ Operationally, refinement proceeds in two stages:
 function refine!(grid::CartesianGrid, cell::Integer, axis::Integer)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
-  _require_active_leaf(grid, checked_cell)
+  _require_revision_bump(grid)
   first = _split_leaf!(grid, checked_cell, checked_axis)
   _finish_refinement_update!(grid)
   return first
 end
 
-# Split and collapse of one local tree edge.
-
-# Perform the purely topological part of one binary midpoint split. The caller
-# is responsible for finalizing all derived data structures afterwards.
-function _split_leaf!(grid::CartesianGrid{D}, checked_cell::Int, checked_axis::Int) where {D}
+# Apply one local midpoint split without rebuilding derived topology data.
+# Batched adaptivity uses this primitive to perform several local edits before
+# one final rebuild.
+function _split_leaf!(grid::CartesianGrid, checked_cell::Int, checked_axis::Int)
+  _require_active_leaf(grid, checked_cell)
+  child_level = _require_refinable_axis(grid, checked_cell, checked_axis)
   first = _ensure_child_block!(grid, checked_cell)
+
+  for child in _midpoint_child_block(first)
+    retained_first = _first_child(grid, child)
+    retained_first == NONE || _require_reusable_child_block(grid, child, retained_first)
+  end
+
   _set_parent_split_state!(grid, checked_cell, false, checked_axis)
-  _initialize_midpoint_child_block!(grid, first, checked_cell, checked_axis)
+
+  for child_offset in 0:1
+    _initialize_midpoint_child!(grid, first + child_offset, checked_cell, checked_axis, child_level,
+                                child_offset)
+  end
 
   return first
 end
@@ -85,20 +96,18 @@ records.
 """
 function derefine!(grid::CartesianGrid, cell::Integer)
   checked_cell = _checked_cell(grid, cell)
+  _require_revision_bump(grid)
   _collapse_leaf!(grid, checked_cell)
   _finish_refinement_update!(grid)
   return grid
 end
 
-# Collapse one expanded parent back into an active leaf. This only changes the
-# primary tree state; neighbor tables, active-leaf enumeration, and the revision
-# counter are handled by `_finish_refinement_update!`.
+# Collapse one local midpoint split without rebuilding derived topology data.
 function _collapse_leaf!(grid::CartesianGrid, checked_cell::Int)
-  first = _required_child_block!(grid, checked_cell, "derefine")
+  first = _require_expanded_child_block(grid, checked_cell)
   _require_active_child_block(grid, checked_cell, first)
   _set_parent_split_state!(grid, checked_cell, true, 0)
   _retire_child_block!(grid, first)
-
   return grid
 end
 
@@ -116,24 +125,38 @@ end
 
 # Low-level local helpers and invariants.
 
-@inline _midpoint_child_block(first::Int) = first:(first+_MIDPOINT_CHILD_COUNT-1)
+_midpoint_child_block(first::Int) = first:(first+_MIDPOINT_CHILD_COUNT-1)
 
-@inline function _require_active_leaf(grid::CartesianGrid, checked_cell::Int)
-  is_active_leaf(grid, checked_cell) ||
+function _require_revision_bump(grid::CartesianGrid)
+  grid.revision < typemax(UInt) || throw(ArgumentError("topology revision counter overflow"))
+  return nothing
+end
+
+function _require_refinable_axis(grid::CartesianGrid, checked_cell::Int, checked_axis::Int)
+  current_level = _level(grid, checked_cell, checked_axis)
+  child_level = _checked_refinement_level(current_level, checked_axis)
+  _checked_axis_extent(_root_cell_count(grid, checked_axis), child_level, checked_axis)
+  current_coord = _logical_coordinate(grid, checked_cell, checked_axis)
+  _checked_child_coordinate(current_coord, 0, checked_axis)
+  _checked_child_coordinate(current_coord, 1, checked_axis)
+  return child_level
+end
+
+function _require_active_leaf(grid::CartesianGrid, checked_cell::Int)
+  _is_active_leaf(grid, checked_cell) ||
     throw(ArgumentError("cell $checked_cell is not an active leaf"))
   return checked_cell
 end
 
-@inline function _required_child_block!(grid::CartesianGrid, checked_cell::Int,
-                                        context::AbstractString)
-  is_expanded(grid, checked_cell) || throw(ArgumentError("cell $checked_cell is not expanded"))
-  first = first_child(grid, checked_cell)
-  first != NONE || throw(ArgumentError("$context cell $checked_cell is missing its child block"))
-  return first
+function _require_expanded_child_block(grid::CartesianGrid, checked_cell::Int)
+  _is_expanded(grid, checked_cell) || throw(ArgumentError("cell $checked_cell is not expanded"))
+  first = _first_child(grid, checked_cell)
+  first != NONE || throw(ArgumentError("cell $checked_cell is missing its child block"))
+  return _require_child_block_owner(grid, checked_cell, first)
 end
 
-@inline function _set_parent_split_state!(grid::CartesianGrid, checked_cell::Int, active::Bool,
-                                          split_axis::Int)
+function _set_parent_split_state!(grid::CartesianGrid, checked_cell::Int, active::Bool,
+                                  split_axis::Int)
   @inbounds begin
     grid.active[checked_cell] = active
     grid.split_axis[checked_cell] = split_axis
@@ -142,30 +165,40 @@ end
 end
 
 function _ensure_child_block!(grid::CartesianGrid, checked_cell::Int)
-  first = first_child(grid, checked_cell)
+  first = _first_child(grid, checked_cell)
 
   # Child storage is persistent across derefinement. If this cell was refined
   # before, we can reuse the existing child block instead of allocating again.
   if first == NONE
     first = _append_child_block!(grid)
     grid.first_child[checked_cell] = first
+    return first
+  end
+
+  return _require_reusable_child_block(grid, checked_cell, first)
+end
+
+function _require_child_block_owner(grid::CartesianGrid, checked_cell::Int, first::Int)
+  1 <= first <= stored_cell_count(grid) - _MIDPOINT_CHILD_COUNT + 1 ||
+    throw(ArgumentError("cell $checked_cell has an invalid child block"))
+
+  for child in _midpoint_child_block(first)
+    _parent(grid, child) == checked_cell ||
+      throw(ArgumentError("cell $checked_cell has an inconsistent child block"))
   end
 
   return first
 end
 
-function _initialize_midpoint_child_block!(grid::CartesianGrid{D}, first::Int, checked_cell::Int,
-                                           checked_axis::Int) where {D}
-  # Both children live one dyadic level deeper on the split axis, while all
-  # tangential levels are inherited unchanged from the parent.
-  child_level = level(grid, checked_cell, checked_axis) + 1
+function _require_reusable_child_block(grid::CartesianGrid, checked_cell::Int, first::Int)
+  _require_child_block_owner(grid, checked_cell, first)
 
-  for (child_offset, child) in enumerate(_midpoint_child_block(first))
-    _initialize_midpoint_child!(grid, child, checked_cell, checked_axis, child_level,
-                                child_offset - 1)
+  for child in _midpoint_child_block(first)
+    _is_tree_cell(grid, child) &&
+      throw(ArgumentError("cell $checked_cell has live retained children"))
   end
 
-  return nothing
+  return first
 end
 
 function _initialize_midpoint_child!(grid::CartesianGrid{D}, child::Int, checked_cell::Int,
@@ -173,7 +206,6 @@ function _initialize_midpoint_child!(grid::CartesianGrid{D}, child::Int, checked
                                      child_offset::Int) where {D}
   @inbounds begin
     grid.parent[child] = checked_cell
-    grid.first_child[child] = NONE
     grid.split_axis[child] = 0
     grid.active[child] = true
   end
@@ -199,7 +231,7 @@ function _require_active_child_block(grid::CartesianGrid, checked_cell::Int, fir
   # of the tree. If any child has been refined further, collapsing the parent
   # would discard a nontrivial subtree.
   for child in _midpoint_child_block(first)
-    is_active_leaf(grid, child) ||
+    _is_active_leaf(grid, child) ||
       throw(ArgumentError("cell $checked_cell cannot be derefined because child $child is not an active leaf"))
   end
 

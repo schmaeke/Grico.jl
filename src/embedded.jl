@@ -92,7 +92,8 @@ const _EMBEDDED_SURFACE_TOLERANCE = T -> T(64) * eps(T)
 
 function SurfaceQuadrature(leaf::Integer, quadrature::PointQuadrature{D,T},
                            normals) where {D,T<:AbstractFloat}
-  return SurfaceQuadrature{D,T,typeof(quadrature)}(Int(leaf), quadrature, normals)
+  return SurfaceQuadrature{D,T,typeof(quadrature)}(_checked_positive(leaf, "leaf"), quadrature,
+                                                   normals)
 end
 
 function SurfaceQuadrature(leaf::Integer, quadrature::PointQuadrature{D,T},
@@ -103,8 +104,7 @@ end
 function SegmentMesh(points, segments)
   length(points) >= 2 || throw(ArgumentError("segment meshes require at least two points"))
   !isempty(segments) || throw(ArgumentError("segment meshes require at least one segment"))
-  T = float(mapreduce(point -> promote_type(typeof(point[1]), typeof(point[2])), promote_type,
-                      points))
+  T = float(mapreduce(_segment_point_scalar_type, promote_type, points))
   checked_points = Vector{NTuple{2,T}}(undef, length(points))
 
   for index in eachindex(points)
@@ -121,8 +121,10 @@ function SegmentMesh(points, segments)
   return SegmentMesh{T}(checked_points, checked_segments)
 end
 
-function EmbeddedSurface(geometry::G; point_count::Integer=2) where {G}
-  return EmbeddedSurface{G}(geometry, Int(point_count))
+function EmbeddedSurface(geometry::G; point_count=2) where {G}
+  point_count isa Integer ||
+    throw(ArgumentError("point_count must be a positive Int-representable integer"))
+  return EmbeddedSurface{G}(geometry, _checked_positive(point_count, "point_count"))
 end
 
 dimension(::SegmentMesh) = 2
@@ -192,7 +194,8 @@ indeed lie in the standard reference cell `[-1, 1]^D`.
 """
 function add_cell_quadrature!(problem::_AbstractProblem, leaf::Integer,
                               quadrature::AbstractQuadrature)
-  push!(problem.cell_quadratures, _CellQuadratureAttachment(Int(leaf), quadrature))
+  push!(problem.cell_quadratures,
+        _CellQuadratureAttachment(_checked_positive(leaf, "leaf"), quadrature))
   return problem
 end
 
@@ -235,17 +238,30 @@ quadrature shape already compiled for the leaf, so the default embedded-surface
 resolution tracks the local integration order of the space.
 """
 function implicit_surface_quadrature(space::HpSpace{D,T}, leaf::Integer, classifier;
-                                     subdivision_depth::Integer=2,
-                                     surface_point_count::Integer=maximum(cell_quadrature_shape(space,
-                                                                                                Int(leaf)))) where {D,
-                                                                                                                    T<:AbstractFloat}
-  return implicit_surface_quadrature(domain(space), leaf, classifier; subdivision_depth,
-                                     surface_point_count)
+                                     subdivision_depth=2,
+                                     surface_point_count=nothing) where {D,T<:AbstractFloat}
+  checked_leaf, leaf_index = _checked_active_leaf_index(grid(space), space.leaf_to_index, leaf,
+                                                        "embedded surface")
+  subdivision_depth isa Integer ||
+    throw(ArgumentError("subdivision_depth must be a non-negative Int-representable integer"))
+  point_count_value = if surface_point_count === nothing
+    maximum(space.compiled_leaves[leaf_index].quadrature_shape)
+  else
+    surface_point_count isa Integer ||
+      throw(ArgumentError("surface_point_count must be a positive Int-representable integer"))
+    surface_point_count
+  end
+  return implicit_surface_quadrature(domain(space), checked_leaf, classifier; subdivision_depth,
+                                     surface_point_count=point_count_value)
 end
 
 function implicit_surface_quadrature(domain::AbstractDomain{D,T}, leaf::Integer, classifier;
-                                     subdivision_depth::Integer=2,
-                                     surface_point_count::Integer=2) where {D,T<:AbstractFloat}
+                                     subdivision_depth=2,
+                                     surface_point_count=2) where {D,T<:AbstractFloat}
+  subdivision_depth isa Integer ||
+    throw(ArgumentError("subdivision_depth must be a non-negative Int-representable integer"))
+  surface_point_count isa Integer ||
+    throw(ArgumentError("surface_point_count must be a positive Int-representable integer"))
   checked_leaf = _checked_cell(grid(domain), leaf)
   _is_domain_active_leaf(domain, checked_leaf) ||
     throw(ArgumentError("embedded surfaces can only be built on active leaves"))
@@ -274,7 +290,10 @@ function _append_embedded_surface_subcells!(points::Vector{NTuple{D,T}}, weights
                                             domain::AbstractDomain{D,T}, leaf::Int, classifier,
                                             rule, lower::NTuple{D,T}, upper::NTuple{D,T},
                                             depth::Int, max_depth::Int) where {D,T<:AbstractFloat}
-  _embedded_surface_state(domain, leaf, classifier, lower, upper, T) == :uniform && return nothing
+  state = _embedded_surface_state(domain, leaf, classifier, lower, upper, T)
+  state == :uniform && return nothing
+  state == :degenerate &&
+    throw(ArgumentError("embedded-surface classifier is degenerate on a sampled subcell"))
 
   if depth >= max_depth
     _append_terminal_embedded_surface!(points, weights, normals, domain, leaf, classifier, rule,
@@ -304,6 +323,7 @@ function _embedded_surface_state(domain::AbstractDomain{D,T}, leaf::Int, classif
   tolerance = _EMBEDDED_SURFACE_TOLERANCE(T)
   minimum_value > tolerance && return :uniform
   maximum_value < -tolerance && return :uniform
+  abs(minimum_value) <= tolerance && abs(maximum_value) <= tolerance && return :degenerate
   return :cut
 end
 
@@ -596,37 +616,19 @@ end
 function _segment_mesh_surface_quadratures(mesh::SegmentMesh, domain::AbstractDomain{2,T},
                                            leaves::AbstractVector{<:Integer}, point_count::Int,
                                            ::Type{T}) where {T<:AbstractFloat}
-  worker_count = max(1, min(Threads.nthreads(), length(mesh.segments)))
-  thread_entries = [Tuple{Int,SurfaceQuadrature}[] for _ in 1:worker_count]
-
-  _run_chunks_with_scratch!(thread_entries,
-                            length(mesh.segments)) do entries, first_segment, last_segment
-    for segment_index in first_segment:last_segment
-      segment = mesh.segments[segment_index]
-      first_point = ntuple(axis -> T(mesh.points[segment[1]][axis]), 2)
-      second_point = ntuple(axis -> T(mesh.points[segment[2]][axis]), 2)
-
-      for leaf in leaves
-        quadrature = _segment_leaf_surface_quadrature(domain, leaf, first_point, second_point,
-                                                      point_count, T)
-        quadrature === nothing && continue
-        push!(entries, (segment_index, quadrature))
-      end
-    end
-  end
-
-  segment_quadratures = [SurfaceQuadrature[] for _ in eachindex(mesh.segments)]
-
-  for entries in thread_entries
-    for (segment_index, quadrature) in entries
-      push!(segment_quadratures[segment_index], quadrature)
-    end
-  end
-
   quadratures = SurfaceQuadrature[]
 
-  for local_quadratures in segment_quadratures
-    append!(quadratures, local_quadratures)
+  for segment_index in eachindex(mesh.segments)
+    segment = mesh.segments[segment_index]
+    first_point = ntuple(axis -> T(mesh.points[segment[1]][axis]), 2)
+    second_point = ntuple(axis -> T(mesh.points[segment[2]][axis]), 2)
+
+    for leaf in leaves
+      quadrature = _segment_leaf_surface_quadrature(domain, leaf, first_point, second_point,
+                                                    point_count, T)
+      quadrature === nothing && continue
+      push!(quadratures, quadrature)
+    end
   end
 
   return quadratures
@@ -747,6 +749,13 @@ end
 
 # Validate and convert one segment-mesh point to the internal floating-point
 # storage type.
+function _segment_point_scalar_type(point)
+  length(point) == 2 || throw(ArgumentError("segment-mesh points must be two-dimensional"))
+  point[1] isa Real && point[2] isa Real ||
+    throw(ArgumentError("segment-mesh point coordinates must be Real values"))
+  return promote_type(typeof(point[1]), typeof(point[2]))
+end
+
 function _checked_segment_point(point, ::Type{T}) where {T<:AbstractFloat}
   length(point) == 2 || throw(ArgumentError("segment-mesh points must be two-dimensional"))
   values = ntuple(axis -> T(point[axis]), 2)
@@ -758,8 +767,10 @@ end
 function _checked_segment(segment, point_count::Int)
   length(segment) == 2 ||
     throw(ArgumentError("segment-mesh segments must connect two point indices"))
-  first_index = _checked_index(segment[1], point_count, "segment point")
-  second_index = _checked_index(segment[2], point_count, "segment point")
+  segment[1] isa Integer && segment[2] isa Integer ||
+    throw(ArgumentError("segment-mesh segment indices must be integers"))
+  first_index = _require_index(segment[1], point_count, "segment point")
+  second_index = _require_index(segment[2], point_count, "segment point")
   first_index != second_index ||
     throw(ArgumentError("segment-mesh segments must have distinct endpoints"))
   return (first_index, second_index)
@@ -801,6 +812,10 @@ end
 function _checked_surface_normal(normal, dimension_count::Int, ::Type{T}) where {T<:AbstractFloat}
   length(normal) == dimension_count ||
     throw(ArgumentError("surface-quadrature normals must match the spatial dimension"))
+  for axis in 1:dimension_count
+    normal[axis] isa Real ||
+      throw(ArgumentError("surface-quadrature normals must contain Real values"))
+  end
   values = ntuple(axis -> T(normal[axis]), dimension_count)
   magnitude = sqrt(sum(values[axis]^2 for axis in 1:dimension_count))
   isfinite(magnitude) || throw(ArgumentError("surface-quadrature normals must be finite"))

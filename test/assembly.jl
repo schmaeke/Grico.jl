@@ -5,6 +5,14 @@ using Grico
 
 const ASSEMBLY_TOL = 1.0e-10
 
+struct OutOfReferenceEmbeddedGeometry end
+
+function Grico._space_surface_quadratures(surface::Grico.EmbeddedSurface{OutOfReferenceEmbeddedGeometry},
+                                          space::Grico.HpSpace{1,T}) where {T<:AbstractFloat}
+  quadrature = Grico.PointQuadrature([(T(2),)], [one(T)])
+  return [Grico.SurfaceQuadrature(1, quadrature, [(one(T),)])]
+end
+
 struct Diffusion{F,T}
   field::F
   coefficient::T
@@ -486,6 +494,8 @@ end
   Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), 0.0))
 
   plan = Grico.compile(problem)
+  face = first(plan.integration.boundary_faces)
+  @test_throws ArgumentError Grico.normal(face, 0)
   system = Grico.assemble(plan)
   state = Grico.State(plan, Grico.solve(system))
 
@@ -511,6 +521,8 @@ end
   @test interface.plus_leaf == 2
   @test Grico.face_axis(interface) == 1
   @test Grico.normal(interface) == (1.0,)
+  @test_throws ArgumentError Grico.normal(interface, 0)
+  @test_throws ArgumentError Grico.normal(Grico.minus(interface), 0)
   system = Grico.assemble(plan)
   assembled = Matrix(Grico.matrix(system))
   assembled_rhs = Grico.rhs(system)
@@ -1021,6 +1033,30 @@ end
   end
 end
 
+@testset "Mean Value Constraint On Physical Domain" begin
+  background = Grico.Domain((0.0,), (1.0,), (1,))
+  domain = Grico.PhysicalDomain(background,
+                                Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=1))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(1)))
+  u = Grico.ScalarField(space; name=:u)
+  problem = Grico.AffineProblem(u)
+  Grico.add_cell!(problem, Diffusion(u, 1.0))
+  Grico.add_constraint!(problem, Grico.MeanValue(u, 2.0))
+
+  plan = Grico.compile(problem)
+  system = Grico.assemble(plan)
+  state = Grico.State(plan, Grico.solve(system))
+  cell = only(plan.integration.cells)
+  measure = sum(Grico.weight(cell, point_index) for point_index in 1:Grico.point_count(cell))
+  average = sum(Grico.value(cell, state, u, point_index) * Grico.weight(cell, point_index)
+                for point_index in 1:Grico.point_count(cell)) / measure
+
+  @test measure ≈ 0.5 atol = ASSEMBLY_TOL
+  @test average ≈ 2.0 atol = ASSEMBLY_TOL
+end
+
 @testset "Custom Linear Solve Hook" begin
   domain = Grico.Domain((0.0,), (1.0,), (2,))
   space = Grico.HpSpace(domain,
@@ -1048,6 +1084,9 @@ end
   @test_throws ArgumentError Grico.FieldSplitSchurPreconditioner((u,), (u,))
   @test_throws ArgumentError Grico.solve(system; linear_solve=(A, b) -> A \ b,
                                          preconditioner=Grico.AdditiveSchwarzPreconditioner())
+  @test_throws ArgumentError Grico.solve(system; linear_solve=(A, b) -> 1.0)
+  @test_throws ArgumentError Grico.solve(system; linear_solve=(A, b) -> zeros(size(A, 1) + 1))
+  @test_throws ArgumentError Grico.solve(system; linear_solve=(A, b) -> fill("bad", size(A, 1)))
   @test_throws ArgumentError Grico.solve(system;
                                          preconditioner=Grico.FieldSplitSchurPreconditioner((u,),
                                                                                             (Grico.ScalarField(space;
@@ -1096,6 +1135,8 @@ end
                                              end))
   @test seen[] ≈ expected atol = ASSEMBLY_TOL
   @test Grico.coefficients(state_from_state) ≈ Grico.coefficients(state) atol = ASSEMBLY_TOL
+  @test_throws ArgumentError Grico.solve(system; initial_solution=1.0)
+  @test_throws ArgumentError Grico.solve(system; initial_solution=fill("bad", length(full_guess)))
 
   compact_domain = Grico.Domain((0.0,), (1.0,), (1,))
   compact_space = Grico.HpSpace(compact_domain,
@@ -1459,6 +1500,29 @@ end
   @test reference_second_moment ≈ 1 / 3 atol = ASSEMBLY_TOL
   @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> 2.0 - x[1]; subdivision_depth=1) ===
         nothing
+  @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> 0.0; subdivision_depth=1) === nothing
+
+  boundary_sample = Grico.finite_cell_quadrature(domain, 1, (1,), x -> x[1] - 0.5;
+                                                 subdivision_depth=0)
+  @test boundary_sample !== nothing
+  @test sum(Grico.weight(boundary_sample, i) for i in 1:Grico.point_count(boundary_sample)) < 2.0
+
+  bool_quadrature = Grico.finite_cell_quadrature(domain, 1, (1,), _ -> true)
+  @test bool_quadrature isa Grico.PointQuadrature{1,Float64}
+  @test sum(Grico.weight(bool_quadrature, i) for i in 1:Grico.point_count(bool_quadrature)) ≈ 2.0 atol = ASSEMBLY_TOL
+  @test Grico.finite_cell_quadrature(domain, 1, (1,), _ -> false) === nothing
+
+  shared_region = Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=1)
+  q64 = Grico._cut_cell_quadrature(shared_region, domain, 1, (2,))
+  domain32 = Grico.Domain((0.0f0,), (1.0f0,), (1,))
+  q32 = Grico._cut_cell_quadrature(shared_region, domain32, 1, (2,))
+  @test q64 isa Grico.PointQuadrature{1,Float64}
+  @test q32 isa Grico.PointQuadrature{1,Float32}
+
+  @test !Base.ismutable(shared_region)
+  @test Grico._subcell_corner_count(Val(2)) == 4
+  @test Grico._subcell_sample_count(Val(2)) == 5
+  @test_throws ArgumentError Grico._subcell_corner_count(Val(Sys.WORD_SIZE - 1))
 end
 
 @testset "Physical Domain Compile" begin
@@ -1543,6 +1607,7 @@ end
   @test Grico.add_surface_quadrature!(tagged_problem, :left, left_surface) === tagged_problem
   @test Grico.add_surface_quadrature!(tagged_problem, :right, right_surface) === tagged_problem
   tagged_plan = Grico.compile(tagged_problem)
+  @test isconcretetype(eltype(tagged_plan.integration.embedded_surfaces))
   @test [item.tag for item in tagged_plan.integration.embedded_surfaces] == [:left, :right]
   tagged_system = Grico.assemble(tagged_plan)
   @test Grico.rhs(tagged_system) ≈ [1.0, 2.5, 1.5] atol = ASSEMBLY_TOL
@@ -1613,6 +1678,7 @@ end
   items = plan.integration.embedded_surfaces
 
   @test length(items) == 1
+  @test isconcretetype(eltype(items))
   item = only(items)
   @test item.tag == :segment
   @test sum(Grico.weight(item, point_index) for point_index in 1:Grico.point_count(item)) ≈ 0.8 atol = ASSEMBLY_TOL
@@ -1645,19 +1711,43 @@ end
 
 @testset "Embedded Validation" begin
   mesh = Grico.SegmentMesh([(0.0, 0.0), (1.0, 0.0)], [(1, 2)])
+  huge_index = big(typemax(Int)) + 1
   @test_throws ArgumentError Grico.SegmentMesh{Float64}([(0.0, 0.0)], NTuple{2,Int}[(1, 1)])
   @test_throws ArgumentError Grico.SegmentMesh{Float64}([(0.0, 0.0), (1.0, 0.0)],
                                                         NTuple{2,Int}[(1, 1)])
+  @test_throws ArgumentError Grico.SegmentMesh([(0.0,), (1.0,)], [(1, 2)])
+  @test_throws ArgumentError Grico.SegmentMesh([("bad", 0.0), (1.0, 0.0)], [(1, 2)])
+  @test_throws ArgumentError Grico.SegmentMesh([(0.0, 0.0), (1.0, 0.0)], [(1.5, 2)])
   @test_throws ArgumentError Grico.EmbeddedSurface{typeof(mesh)}(mesh, 0)
+  @test_throws ArgumentError Grico.EmbeddedSurface(mesh; point_count=huge_index)
+  @test_throws ArgumentError Grico.EmbeddedSurface(mesh; point_count=1.5)
 
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   @test_throws ArgumentError Grico.implicit_surface_quadrature(domain, 1, _ -> true)
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(domain, 1, _ -> 0.0)
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(domain, 1, x -> x[1];
+                                                               subdivision_depth=1.5)
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(domain, 1, x -> x[1];
+                                                               surface_point_count=1.5)
 
   space = Grico.HpSpace(domain,
                         Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                            degree=Grico.UniformDegree(1)))
   u = Grico.ScalarField(space; name=:u)
   problem = Grico.AffineProblem(u)
+  line_quadrature = Grico.PointQuadrature([(0.0,)], [1.0])
+  @test_throws ArgumentError Grico.SurfaceQuadrature(huge_index, line_quadrature, [(1.0,)])
+  @test_throws ArgumentError Grico.SurfaceQuadrature(1, line_quadrature, [("bad",)])
+  @test_throws ArgumentError Grico.add_cell_quadrature!(problem, huge_index, line_quadrature)
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(space, huge_index, x -> x[1])
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(space, 1, x -> x[1];
+                                                               subdivision_depth=1.5)
+  @test_throws ArgumentError Grico.implicit_surface_quadrature(space, 1, x -> x[1];
+                                                               surface_point_count=1.5)
+  bad_surface_problem = Grico.AffineProblem(u)
+  Grico.add_embedded_surface!(bad_surface_problem,
+                              Grico.EmbeddedSurface(OutOfReferenceEmbeddedGeometry()))
+  @test_throws ArgumentError Grico.compile(bad_surface_problem)
   quadrature = Grico.PointQuadrature([(0.0, 0.0)], [1.0])
   Grico.add_surface_quadrature!(problem, Grico.SurfaceQuadrature(1, quadrature, [(1.0, 0.0)]))
   @test_throws ArgumentError Grico.compile(problem)
@@ -1678,11 +1768,21 @@ end
                               Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                                  degree=Grico.UniformDegree(1)))
   v = Grico.ScalarField(other_space; name=:v)
+  incompatible_domain = Grico.Domain((0.0,), (2.0,), (1,))
+  incompatible_space = Grico.HpSpace(incompatible_domain,
+                                     Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                        degree=Grico.UniformDegree(1)))
+  incompatible = Grico.ScalarField(incompatible_space; name=:incompatible)
   vec = Grico.VectorField(space, 2; name=:vec)
 
+  huge_index = big(typemax(Int)) + 1
   @test_throws ArgumentError Grico.BoundaryFace(0, Grico.LOWER)
+  @test_throws ArgumentError Grico.BoundaryFace(huge_index, Grico.LOWER)
+  @test_throws ArgumentError Grico.BoundaryFace(1, huge_index)
   @test_throws ArgumentError Grico.AffineProblem(u, u)
   @test_throws ArgumentError Grico.ResidualProblem(u, u)
+  @test_throws ArgumentError Grico.AffineProblem(u, incompatible)
+  @test_throws ArgumentError Grico.ResidualProblem(u, incompatible)
 
   problem = Grico.AffineProblem(u)
   @test_throws ArgumentError Grico.add_boundary!(problem, Grico.BoundaryFace(2, Grico.LOWER),
@@ -1700,10 +1800,23 @@ end
   @test_throws ArgumentError Grico.Dirichlet(v, Grico.BoundaryFace(1, Grico.LOWER), 2, 0.0)
   @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), 0, 0.0)
   @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), 3, 0.0)
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), huge_index,
+                                             0.0)
+  @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (huge_index,),
+                                             0.0)
   @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (2, 1),
                                              (0.0, 0.0))
   @test_throws ArgumentError Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (1, 1),
                                              (0.0, 0.0))
+  bad_dirichlet_problem = Grico.AffineProblem(u)
+  Grico.add_constraint!(bad_dirichlet_problem,
+                        Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.LOWER), "bad"))
+  @test_throws ArgumentError Grico.compile(bad_dirichlet_problem)
+  bad_vector_dirichlet_problem = Grico.AffineProblem(vec)
+  Grico.add_constraint!(bad_vector_dirichlet_problem,
+                        Grico.Dirichlet(vec, Grico.BoundaryFace(1, Grico.LOWER), (1, 2),
+                                        (0.0, "bad")))
+  @test_throws ArgumentError Grico.compile(bad_vector_dirichlet_problem)
   mixed_domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   mixed_space = Grico.HpSpace(mixed_domain,
                               Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
@@ -1724,6 +1837,12 @@ end
   @test_throws ArgumentError Grico.add_constraint!(problem, Grico.MeanValue(v, 0.0))
   @test Grico.constrain!(problem, Grico.MeanValue(u, 0.0)) === problem
   @test only(problem.mean_constraints).target == 0.0
+  bad_mean_problem = Grico.AffineProblem(u)
+  Grico.add_constraint!(bad_mean_problem, Grico.MeanValue(u, "bad"))
+  @test_throws ArgumentError Grico.compile(bad_mean_problem)
+  bad_vector_mean_problem = Grico.AffineProblem(vec)
+  Grico.add_constraint!(bad_vector_mean_problem, Grico.MeanValue(vec, (0.0, "bad")))
+  @test_throws ArgumentError Grico.compile(bad_vector_mean_problem)
 
   raw = Grico.AffineProblem(Grico.AbstractField[u], Any[], Grico._BoundaryContribution[], Any[],
                             Grico._SurfaceContribution[], Grico._CellQuadratureAttachment[],
@@ -1783,13 +1902,4 @@ end
 
   @test_throws ArgumentError Grico.residual(plan, foreign_state)
   @test_throws ArgumentError Grico.tangent(plan, foreign_state)
-end
-
-@testset "Assembly Scheduler Helpers" begin
-  weighted = Grico._weighted_batch_work_estimate([10, 1, 1, 1])
-  @test Grico._weighted_chunk_starts(weighted, 4, 2) == [1, 2, 5]
-  @test Grico._weighted_chunk_starts(weighted, 4, 4) == [1, 2, 2, 2, 5]
-
-  matched = Grico._weighted_batch_work_estimate([2, 1, 1])
-  @test Grico._weighted_chunk_starts(matched, 3, 2) == [1, 2, 4]
 end

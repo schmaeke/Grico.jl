@@ -118,15 +118,15 @@ struct Domain{D,T<:AbstractFloat} <: AbstractDomain{D,T}
   end
 end
 
-function Geometry(origin::NTuple{D,<:Real}, extent::NTuple{D,<:Real}) where {D}
-  T = float(promote_type(eltype(origin), eltype(extent)))
+function Geometry(origin::Tuple{Vararg{Real,D}}, extent::Tuple{Vararg{Real,D}}) where {D}
+  T = float(promote_type(typeof.(origin)..., typeof.(extent)...))
   return Geometry{D,T}(ntuple(axis -> T(origin[axis]), D), ntuple(axis -> T(extent[axis]), D))
 end
 
 # Convenience constructor that builds the root grid and the affine box together.
 # The `periodic` keyword is forwarded directly to the underlying `CartesianGrid`.
-function Domain(origin::NTuple{D,<:Real}, extent::NTuple{D,<:Real},
-                root_counts::NTuple{D,<:Integer}; periodic=false) where {D}
+function Domain(origin::Tuple{Vararg{Real,D}}, extent::Tuple{Vararg{Real,D}},
+                root_counts::Tuple{Vararg{Integer,D}}; periodic=false) where {D}
   return Domain(CartesianGrid(root_counts; periodic=periodic), Geometry(origin, extent))
 end
 
@@ -185,8 +185,10 @@ The origin is the lower corner `x₀` of the rectangular domain
 """
 origin(geometry::Geometry) = geometry.origin
 origin(domain::AbstractDomain) = origin(geometry(domain))
-function origin(geometry::Geometry, axis::Integer)
-  geometry.origin[_checked_index(axis, dimension(geometry), "axis")]
+@inline function origin(geometry::Geometry, axis::Integer)
+  dimension_count = dimension(geometry)
+  @boundscheck 1 <= axis <= dimension_count || _throw_index_error(axis, dimension_count, "axis")
+  return @inbounds geometry.origin[Int(axis)]
 end
 origin(domain::AbstractDomain, axis::Integer) = origin(geometry(domain), axis)
 
@@ -203,8 +205,10 @@ The extent stores the side lengths `Lₐ` of the rectangular domain.
 """
 extent(geometry::Geometry) = geometry.extent
 extent(domain::AbstractDomain) = extent(geometry(domain))
-function extent(geometry::Geometry, axis::Integer)
-  geometry.extent[_checked_index(axis, dimension(geometry), "axis")]
+@inline function extent(geometry::Geometry, axis::Integer)
+  dimension_count = dimension(geometry)
+  @boundscheck 1 <= axis <= dimension_count || _throw_index_error(axis, dimension_count, "axis")
+  return @inbounds geometry.extent[Int(axis)]
 end
 extent(domain::AbstractDomain, axis::Integer) = extent(geometry(domain), axis)
 
@@ -414,7 +418,7 @@ end
 Write the image of `ξ ∈ [0,1]^D` in `cell` into the preallocated vector `x`.
 
 This is the allocation-free counterpart of [`map_from_unit_cube`](@ref). The
-length of `x` must equal the spatial dimension.
+length of `x` must be at least the spatial dimension.
 """
 function map_from_unit_cube!(x::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                              ξ::NTuple{D,<:Real}) where {D}
@@ -427,7 +431,7 @@ end
 Write the image of `ξ ∈ [-1,1]^D` in `cell` into the preallocated vector `x`.
 
 This is the allocation-free counterpart of [`map_from_biunit_cube`](@ref). The
-length of `x` must equal the spatial dimension.
+length of `x` must be at least the spatial dimension.
 """
 function map_from_biunit_cube!(x::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                                ξ::NTuple{D,<:Real}) where {D}
@@ -441,7 +445,7 @@ Write the inverse biunit reference coordinates of the physical point `x` in
 `cell` into the preallocated vector `ξ`.
 
 This is the allocation-free counterpart of [`map_to_biunit_cube`](@ref). The
-length of `ξ` must equal the spatial dimension.
+length of `ξ` must be at least the spatial dimension.
 """
 function map_to_biunit_cube!(ξ::AbstractVector, domain::AbstractDomain{D}, cell::Integer,
                              x::NTuple{D,<:Real}) where {D}
@@ -458,6 +462,7 @@ end
 # one axis, the root cell size is `extent/root_count`, and each refinement level
 # divides that length by `2`. `ldexp` expresses this dyadic scaling exactly.
 function cell_size(geometry::Geometry, grid::CartesianGrid, cell::Integer, axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_size_checked(geometry, grid, checked_cell, checked_axis)
@@ -465,12 +470,14 @@ end
 
 # The lower corner is the origin shifted by the logical cell index times the
 # physical cell size on each axis.
-function cell_lower(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer) where {D,T}
+function cell_lower(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> _cell_lower_checked(geometry, grid, checked_cell, axis), D)
 end
 
 function cell_lower(geometry::Geometry, grid::CartesianGrid, cell::Integer, axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_lower_checked(geometry, grid, checked_cell, checked_axis)
@@ -478,12 +485,14 @@ end
 
 # The upper corner uses the same affine formula as the lower corner, shifted by
 # one cell width on the logical lattice.
-function cell_upper(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer) where {D,T}
+function cell_upper(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> _cell_upper_checked(geometry, grid, checked_cell, axis), D)
 end
 
 function cell_upper(geometry::Geometry, grid::CartesianGrid, cell::Integer, axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_upper_checked(geometry, grid, checked_cell, checked_axis)
@@ -491,12 +500,14 @@ end
 
 # For an affine Cartesian cell, the center is obtained by adding half a cell
 # size to the lower bound on each axis.
-function cell_center(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer) where {D,T}
+function cell_center(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> _cell_center_checked(geometry, grid, checked_cell, axis), D)
 end
 
 function cell_center(geometry::Geometry, grid::CartesianGrid, cell::Integer, axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_center_checked(geometry, grid, checked_cell, checked_axis)
@@ -505,6 +516,7 @@ end
 # Cell measure is the product of the diagonal affine scaling factors because the
 # geometry is axis-aligned and has no cross-axis distortion.
 function cell_volume(geometry::Geometry, grid::CartesianGrid, cell::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return _cell_size_product_checked(geometry, grid, checked_cell)
 end
@@ -512,6 +524,7 @@ end
 # A face normal to one axis has measure equal to the product of the tangential
 # cell sizes only.
 function face_measure(geometry::Geometry, grid::CartesianGrid, cell::Integer, axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_size_product_checked(geometry, grid, checked_cell, checked_axis)
@@ -519,8 +532,9 @@ end
 
 # Map `[0,1]^D` into the physical cell by scaling each reference coordinate with
 # the corresponding cell size and shifting by the lower corner.
-function map_from_unit_cube(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer,
+function map_from_unit_cube(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer,
                             ξ::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> begin
                   lower, size = _cell_affine_axis_data(geometry, grid, checked_cell, axis)
@@ -529,8 +543,9 @@ function map_from_unit_cube(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cel
 end
 
 # Map `[-1,1]^D` into the physical cell using the cell center and half-widths.
-function map_from_biunit_cube(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer,
+function map_from_biunit_cube(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer,
                               ξ::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> begin
                   center, half_size = _cell_center_and_half_size(geometry, grid, checked_cell, axis)
@@ -540,8 +555,9 @@ end
 
 # Invert the biunit affine map axis by axis. The diagonal Jacobian means each
 # reference coordinate can be recovered independently.
-function map_to_biunit_cube(geometry::Geometry{D,T}, grid::CartesianGrid{D}, cell::Integer,
+function map_to_biunit_cube(geometry::Geometry{D,T}, grid::CartesianGrid, cell::Integer,
                             x::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return ntuple(axis -> begin
                   center, half_size = _cell_center_and_half_size(geometry, grid, checked_cell, axis)
@@ -553,6 +569,7 @@ end
 # physical cell sizes.
 function jacobian_diagonal_from_unit_cube(geometry::Geometry, grid::CartesianGrid, cell::Integer,
                                           axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return _cell_size_checked(geometry, grid, checked_cell, checked_axis)
@@ -562,29 +579,34 @@ end
 # additional factor `1/2`.
 function jacobian_diagonal_from_biunit_cube(geometry::Geometry, grid::CartesianGrid, cell::Integer,
                                             axis::Integer)
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   return last(_cell_center_and_half_size(geometry, grid, checked_cell, checked_axis))
 end
 
 function jacobian_determinant_from_unit_cube(geometry::Geometry, grid::CartesianGrid, cell::Integer)
-  return cell_volume(geometry, grid, cell)
+  _require_matching_geometry_grid(geometry, grid)
+  checked_cell = _checked_cell(grid, cell)
+  return _cell_size_product_checked(geometry, grid, checked_cell)
 end
 
 # The determinant for `[-1,1]^D` is obtained by halving every diagonal Jacobian
 # entry, hence the factor `2^{-D}`.
-function jacobian_determinant_from_biunit_cube(geometry::Geometry, grid::CartesianGrid,
-                                               cell::Integer)
-  return ldexp(cell_volume(geometry, grid, cell), -dimension(grid))
+function jacobian_determinant_from_biunit_cube(geometry::Geometry{D}, grid::CartesianGrid,
+                                               cell::Integer) where {D}
+  _require_matching_geometry_grid(geometry, grid)
+  checked_cell = _checked_cell(grid, cell)
+  return ldexp(_cell_size_product_checked(geometry, grid, checked_cell), -D)
 end
 
 # Allocation-free mapping wrappers.
 
-# The mutating mapping routines are thin allocation-free wrappers around the
-# tuple-returning maps. They keep the geometric formulas centralized while still
-# supporting high-frequency quadrature code.
-function map_from_unit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid{D},
+# The mutating mapping routines fill caller-provided vectors directly from the
+# same axis-local affine data as the tuple-returning maps.
+function map_from_unit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid,
                              cell::Integer, ξ::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return _write_checked_axis_values!(x, D, "x") do axis
     lower, size = _cell_affine_axis_data(geometry, grid, checked_cell, axis)
@@ -592,8 +614,9 @@ function map_from_unit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid::C
   end
 end
 
-function map_from_biunit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid{D},
+function map_from_biunit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid,
                                cell::Integer, ξ::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return _write_checked_axis_values!(x, D, "x") do axis
     center, half_size = _cell_center_and_half_size(geometry, grid, checked_cell, axis)
@@ -601,8 +624,9 @@ function map_from_biunit_cube!(x::AbstractVector, geometry::Geometry{D,T}, grid:
   end
 end
 
-function map_to_biunit_cube!(ξ::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid{D},
+function map_to_biunit_cube!(ξ::AbstractVector, geometry::Geometry{D,T}, grid::CartesianGrid,
                              cell::Integer, x::NTuple{D,<:Real}) where {D,T}
+  _require_matching_geometry_grid(geometry, grid)
   checked_cell = _checked_cell(grid, cell)
   return _write_checked_axis_values!(ξ, D, "ξ") do axis
     center, half_size = _cell_center_and_half_size(geometry, grid, checked_cell, axis)
@@ -612,19 +636,29 @@ end
 
 # Shared axis-local affine data and tiny helpers.
 
+@inline function _require_matching_geometry_grid(geometry::Geometry, grid::CartesianGrid)
+  dimension(geometry) == dimension(grid) || _throw_geometry_grid_dimension_error(geometry, grid)
+  return nothing
+end
+
+@noinline function _throw_geometry_grid_dimension_error(geometry::Geometry, grid::CartesianGrid)
+  throw(ArgumentError("geometry dimension $(dimension(geometry)) must match grid dimension " *
+                      "$(dimension(grid))"))
+end
+
 # All cell-local geometric queries derive from the same axis-local affine data:
 # the physical lower bound and cell size along one axis.
 @inline function _cell_affine_axis_data(geometry::Geometry, grid::CartesianGrid, checked_cell::Int,
                                         axis::Int)
   size = _cell_size_checked(geometry, grid, checked_cell, axis)
-  lower = geometry.origin[axis] + size * logical_coordinate(grid, checked_cell, axis)
+  lower = @inbounds geometry.origin[axis] + size * _logical_coordinate(grid, checked_cell, axis)
   return lower, size
 end
 
 @inline function _cell_size_checked(geometry::Geometry, grid::CartesianGrid, checked_cell::Int,
                                     checked_axis::Int)
-  return ldexp(geometry.extent[checked_axis] / grid.root_counts[checked_axis],
-               -level(grid, checked_cell, checked_axis))
+  root_size = @inbounds geometry.extent[checked_axis] / _root_cell_count(grid, checked_axis)
+  return ldexp(root_size, -_level(grid, checked_cell, checked_axis))
 end
 
 @inline function _cell_lower_checked(geometry::Geometry, grid::CartesianGrid, checked_cell::Int,

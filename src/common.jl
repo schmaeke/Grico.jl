@@ -1,165 +1,32 @@
 # This file collects small internal utilities that are shared across several
-# layers of the library. They are intentionally kept low-level: thread/chunk
-# scheduling helpers, basic argument validation, and compact sparse-term
-# evaluation utilities. Centralizing them here avoids repeating the same
-# defensive checks and tight inner-loop patterns throughout topology, assembly,
-# adaptivity, and post-processing code.
-
-# These three globals implement a reentrant guard that temporarily forces BLAS
-# to run single-threaded while Grico.jl is already parallelizing over Julia
-# threads. Without this guard, nested parallelism would oversubscribe the CPU:
-# each Julia worker could spawn several BLAS threads again inside dense linear
-# algebra kernels, which usually hurts performance rather than helping.
-const _INTERNAL_BLAS_GUARD_LOCK = ReentrantLock()
-const _INTERNAL_BLAS_GUARD_DEPTH = Ref(0)
-const _INTERNAL_BLAS_SAVED_THREADS = Ref(1)
-const _INTERNAL_BLAS_CALL_LOCK = ReentrantLock()
-
-# Small lock wrapper used by the BLAS guards below. Keeping the lock/unlock
-# pattern in one place makes the guard code easier to read and harder to get
-# subtly wrong when nested guard logic changes.
-function _with_lock(f::F, lock_object) where {F}
-  lock(lock_object)
-
-  try
-    return f()
-  finally
-    unlock(lock_object)
-  end
-end
-
-# Execute `f()` with BLAS thread count reduced to one whenever the surrounding
-# Grico.jl algorithm is already running multi-threaded. The guard is reference
-# counted so nested calls remain safe and restore the original BLAS thread count
-# only when the outermost guarded region exits.
-function _with_internal_blas_threads(f::F) where {F}
-  if Threads.nthreads() == 1
-    return f()
-  end
-
-  _with_lock(_INTERNAL_BLAS_GUARD_LOCK) do
-    if _INTERNAL_BLAS_GUARD_DEPTH[] == 0
-      _INTERNAL_BLAS_SAVED_THREADS[] = BLAS.get_num_threads()
-      _INTERNAL_BLAS_SAVED_THREADS[] == 1 || BLAS.set_num_threads(1)
-    end
-
-    _INTERNAL_BLAS_GUARD_DEPTH[] += 1
-  end
-
-  try
-    return f()
-  finally
-    _with_lock(_INTERNAL_BLAS_GUARD_LOCK) do
-      _INTERNAL_BLAS_GUARD_DEPTH[] -= 1
-
-      if _INTERNAL_BLAS_GUARD_DEPTH[] == 0
-        saved = _INTERNAL_BLAS_SAVED_THREADS[]
-        saved == 1 || BLAS.set_num_threads(saved)
-      end
-    end
-  end
-end
-
-# Some OpenBLAS builds also limit how many distinct caller threads may enter the
-# library concurrently, even when BLAS itself is configured to use one worker
-# thread. Serializing the actual BLAS/LAPACK entry keeps Grico's outer Julia-level
-# parallelism while avoiding allocator corruption on such builds.
-function _with_serialized_blas(f::F) where {F}
-  if Threads.nthreads() == 1
-    return _with_internal_blas_threads(f)
-  end
-
-  return _with_lock(_INTERNAL_BLAS_CALL_LOCK) do
-    return _with_internal_blas_threads(f)
-  end
-end
-
-# Run `f(first, last)` on chunks of `1:item_count`, using an atomic next-item
-# counter so the same helper works both for balanced and mildly irregular work.
-# The chunk size is chosen dynamically to trade scheduling overhead against load
-# balancing; the sequential path still goes through the same chunk logic so both
-# code paths follow the same semantics.
-function _run_chunks!(f::F, item_count::Int) where {F}
-  item_count == 0 && return nothing
-  worker_count = min(Threads.nthreads(), item_count)
-  chunk_size = _dynamic_chunk_size(item_count, worker_count)
-  next_item = Threads.Atomic{Int}(1)
-
-  if worker_count == 1
-    return _run_chunk_loop!(f, item_count, chunk_size, next_item)
-  end
-
-  @sync for _ in 1:worker_count
-    Threads.@spawn _run_chunk_loop!(f, item_count, chunk_size, next_item)
-  end
-
-  return nothing
-end
-
-function _run_chunk_loop!(f::F, item_count::Int, chunk_size::Int,
-                          next_item::Threads.Atomic{Int}) where {F}
-  while true
-    first_item = Threads.atomic_add!(next_item, chunk_size)
-    first_item > item_count && return nothing
-    last_item = min(item_count, first_item + chunk_size - 1)
-    f(first_item, last_item)
-  end
-end
-
-# Variant of the chunk runner that gives each spawned worker task its own
-# scratch object. This is the right tool when the callback needs mutable local
-# buffers, because the scratch ownership follows the spawned task directly
-# instead of depending on `Threads.threadid()` remaining stable.
-function _run_chunks_with_scratch!(f::F, scratch::AbstractVector, item_count::Int) where {F}
-  item_count == 0 && return nothing
-  worker_count = min(length(scratch), Threads.nthreads(), item_count)
-  chunk_size = _dynamic_chunk_size(item_count, worker_count)
-  next_item = Threads.Atomic{Int}(1)
-
-  if worker_count == 1
-    return _run_chunk_loop_with_scratch!(f, scratch[1], item_count, chunk_size, next_item)
-  end
-
-  @sync for worker in 1:worker_count
-    Threads.@spawn _run_chunk_loop_with_scratch!(f, scratch[worker], item_count, chunk_size,
-                                                 next_item)
-  end
-
-  return nothing
-end
-
-function _run_chunk_loop_with_scratch!(f::F, scratch, item_count::Int, chunk_size::Int,
-                                       next_item::Threads.Atomic{Int}) where {F}
-  while true
-    first_item = Threads.atomic_add!(next_item, chunk_size)
-    first_item > item_count && return nothing
-    last_item = min(item_count, first_item + chunk_size - 1)
-    f(scratch, first_item, last_item)
-  end
-end
-
-_dynamic_chunk_size(item_count::Int, worker_count::Int) = max(1, cld(item_count, 8 * worker_count))
+# layers of the library. They are intentionally kept low-level: basic argument
+# validation and compact sparse-term evaluation utilities. Centralizing them
+# here avoids repeating the same defensive checks and tight inner-loop patterns
+# throughout topology, assembly, adaptivity, and post-processing code.
 
 # The checked-value helpers below normalize common integer preconditions at the
 # API boundary so the rest of the code can work with plain `Int` values and
 # assume non-negativity, positivity, or bounds validity without repeating the
 # same checks.
 @inline function _checked_nonnegative(value::Integer, name::AbstractString)
-  checked = Int(value)
-  checked >= 0 || throw(ArgumentError("$name must be non-negative"))
-  return checked
+  0 <= value <= typemax(Int) ||
+    throw(ArgumentError("$name must be a non-negative Int-representable integer"))
+  return Int(value)
 end
 
 @inline function _checked_positive(value::Integer, name::AbstractString)
-  checked = Int(value)
-  checked >= 1 || throw(ArgumentError("$name must be positive"))
-  return checked
+  1 <= value <= typemax(Int) ||
+    throw(ArgumentError("$name must be a positive Int-representable integer"))
+  return Int(value)
 end
 
-@inline function _checked_index(index::Integer, upper::Integer, name::AbstractString)
-  checked = Int(index)
-  1 <= checked <= upper || throw(BoundsError(Base.OneTo(upper), checked))
-  return checked
+@noinline function _throw_index_error(index::Integer, upper::Integer, name::AbstractString)
+  throw(ArgumentError("$name must be an index in 1:$upper; got $index"))
+end
+
+@inline function _require_index(index::Integer, upper::Integer, name::AbstractString)
+  1 <= index <= upper || _throw_index_error(index, upper, name)
+  return Int(index)
 end
 
 function _checked_degrees(degrees::NTuple{D,<:Integer}) where {D}

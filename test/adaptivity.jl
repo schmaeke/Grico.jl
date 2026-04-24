@@ -271,6 +271,8 @@ end
   @test all(cell_degrees(offset_plan, leaf) == (2,) for leaf in active_leaves(offset_plan))
   @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
                                                      degree_offset=(0, 0))
+  @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
+                                                     degree_offset=big(typemax(Int)) + 1)
 end
 
 @testset "Mixed-Space State Transfer" begin
@@ -308,6 +310,9 @@ end
 
   @test_throws ArgumentError transfer_state((velocity_plan,), state)
   @test_throws ArgumentError transfer_state((velocity_plan, pressure_plan, pressure_plan), state)
+  @test_throws ArgumentError adapted_field(velocity_transition, pressure)
+  @test_throws ArgumentError adapted_fields(velocity_transition, (velocity, "bad"))
+  @test_throws ArgumentError transfer_state(velocity_transition, state, ("bad",), (new_velocity,))
 end
 
 @testset "Mixed Hp Transfer" begin
@@ -458,14 +463,20 @@ end
   refine_transition = transition(refine_plan)
   refined = target_space(refine_transition)
   refined_u = adapted_field(refine_transition, u)
-  calls = Threads.Atomic{Int}(0)
+  calls = Ref(0)
   refined_state = transfer_state(refine_transition, state, u, refined_u;
                                  linear_solve=(A, b) -> begin
-                                   Threads.atomic_add!(calls, 1)
+                                   calls[] += 1
                                    return A \ b
                                  end)
 
   @test calls[] == active_leaf_count(refined)
+  @test_throws ArgumentError transfer_state(refine_transition, state, u, refined_u;
+                                            linear_solve=(A, b) -> 1.0)
+  @test_throws ArgumentError transfer_state(refine_transition, state, u, refined_u;
+                                            linear_solve=(A, b) -> zeros(size(A, 1) + 1))
+  @test_throws ArgumentError transfer_state(refine_transition, state, u, refined_u;
+                                            linear_solve=(A, b) -> fill("bad", size(A, 1)))
   for x in ((0.0,), (0.2,), (0.5,), (0.8,), (1.0,))
     @test _field_value_at_point(refined_u, refined_state, x) ≈ 2.5 atol = ADAPTIVITY_TOL
   end
@@ -725,6 +736,7 @@ end
   @test_throws ArgumentError AdaptivityLimits(1; min_p=2, max_p=1)
   @test_throws ArgumentError AdaptivityPlan(space, domain, NTuple{1,Int}[])
   @test_throws ArgumentError AdaptivityPlan(space, domain, [(0,)])
+  @test_throws ArgumentError Grico.HCoarseningCandidate(big(typemax(Int)) + 1, 1, (1, 2), (1,))
   dg_space = HpSpace(domain,
                      SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
   @test AdaptivityPlan(dg_space, domain, [(0,)]) isa AdaptivityPlan
@@ -734,6 +746,19 @@ end
   @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=NaN)
   @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=-1.0)
   @test_throws ArgumentError adaptivity_plan(state, u; limits=AdaptivityLimits(2))
+
+  revision_limited_domain = Domain((0.0,), (1.0,), (1,))
+  revision_limited_space = HpSpace(revision_limited_domain,
+                                   SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  Grico.grid(revision_limited_space).revision = typemax(UInt)
+  @test_throws ArgumentError Grico._batched_adaptivity_plan(revision_limited_space, [(0,)],
+                                                            [(false,)],
+                                                            Grico.HCoarseningCandidate{1}[])
+
+  overflow_plan = AdaptivityPlan(space)
+  @test_throws ArgumentError request_p_refinement!(overflow_plan, 1, 1; increment=typemax(Int))
+  @test_throws ArgumentError request_p_refinement!(overflow_plan, 1, (typemax(Int),))
+  @test_throws ArgumentError request_p_derefinement!(overflow_plan, 1, 1; decrement=typemax(Int))
 
   plan = AdaptivityPlan(space)
   request_h_refinement!(plan, 1, 1)

@@ -37,7 +37,7 @@ end
 
 struct CellwiseMassInverse{B,V}
   blocks::B
-  workspaces::V
+  workspace::V
 end
 
 # On a DG mesh, the mass matrix is block diagonal by cell. We exploit that
@@ -84,34 +84,30 @@ function build_cellwise_mass_inverse(plan, field)
     max_local_dofs = max(max_local_dofs, length(local_dofs))
   end
 
-  workspaces = [zeros(T, max_local_dofs) for _ in 1:Threads.maxthreadid()]
-  return CellwiseMassInverse(blocks, workspaces)
+  workspace = zeros(T, max_local_dofs)
+  return CellwiseMassInverse(blocks, workspace)
 end
 
 # Apply the precomputed cellwise inverse to the assembled residual to obtain
-# the time derivative `dq_h/dt`. Each DG cell block is independent, so the
-# block solves can run in parallel as long as each worker owns its RHS buffer
-# and BLAS is kept single-threaded inside the threaded region.
+# the time derivative `dq_h/dt`. Each DG cell block is independent, and the
+# serial traversal reuses one local RHS buffer for all dense solves.
 function apply_mass_inverse!(du, mass_inverse::CellwiseMassInverse, rhs)
   fill!(du, zero(eltype(du)))
   blocks = mass_inverse.blocks
-  workspaces = mass_inverse.workspaces
+  workspace = mass_inverse.workspace
 
-  Grico._with_internal_blas_threads() do
-    Threads.@threads :static for block_index in eachindex(blocks)
-      block = blocks[block_index]
-      local_dof_count = length(block.global_dofs)
-      local_rhs = view(workspaces[Threads.threadid()], 1:local_dof_count)
+  for block in blocks
+    local_dof_count = length(block.global_dofs)
+    local_rhs = view(workspace, 1:local_dof_count)
 
-      for local_dof in 1:local_dof_count
-        local_rhs[local_dof] = rhs[block.global_dofs[local_dof]]
-      end
+    for local_dof in 1:local_dof_count
+      local_rhs[local_dof] = rhs[block.global_dofs[local_dof]]
+    end
 
-      ldiv!(block.factorization, local_rhs)
+    ldiv!(block.factorization, local_rhs)
 
-      for local_dof in 1:local_dof_count
-        du[block.global_dofs[local_dof]] = local_rhs[local_dof]
-      end
+    for local_dof in 1:local_dof_count
+      du[block.global_dofs[local_dof]] = local_rhs[local_dof]
     end
   end
 
