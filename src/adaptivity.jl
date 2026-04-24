@@ -2592,7 +2592,8 @@ function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
     for face_axis in 1:D
       for side in (LOWER, UPPER)
         for neighbor_leaf in opposite_active_leaves(grid_data, leaf, face_axis, side)
-          neighbor_index = _active_leaf_index(space, neighbor_leaf)
+          neighbor_index = @inbounds space.leaf_to_index[neighbor_leaf]
+          neighbor_index == 0 && continue
           neighbor_levels = level(grid_data, neighbor_leaf)
           current = expanded[neighbor_index]
 
@@ -2645,7 +2646,9 @@ function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
     for axis in 1:D
       for side in (LOWER, UPPER)
         for neighbor_leaf in opposite_active_leaves(grid_data, leaf, axis, side)
-          blocked[_active_leaf_index(space, neighbor_leaf)] = true
+          neighbor_index = @inbounds space.leaf_to_index[neighbor_leaf]
+          neighbor_index == 0 && continue
+          blocked[neighbor_index] = true
         end
       end
     end

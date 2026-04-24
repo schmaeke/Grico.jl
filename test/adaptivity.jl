@@ -78,6 +78,12 @@ end
   @test summary.marked_leaf_count == 1
   @test summary.h_refinement_leaf_count == 1
   @test active_leaves(refined) == [1, 4]
+
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((u,)), collect(1.0:scalar_dof_count(space)))
+  automatic_plan = adaptivity_plan(state, u; tolerance=0.0,
+                                   limits=AdaptivityLimits(space; min_p=1, max_p=1, max_h_level=1))
+  @test active_leaves(target_space(transition(automatic_plan))) == [4, 5, 6]
 end
 
 @testset "Periodic Transition" begin
