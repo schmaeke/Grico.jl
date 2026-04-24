@@ -10,6 +10,10 @@ Manifest.toml
 /benchmark/*.md
 /benchmark/*.toml
 !/benchmark/Project.toml
+/benchmark/*.csv
+/benchmark/*.pdf
+/benchmark/*.png
+/benchmark/*.svg
 /benchmark/*.txt
 
 # Generated output directories.
