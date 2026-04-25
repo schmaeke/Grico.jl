@@ -1545,6 +1545,36 @@ end
   @test sum(plan.integration.cells[2].weights) ≈ 0.5 atol = ASSEMBLY_TOL
 end
 
+@testset "Finite Cell Extension Measure" begin
+  background = Grico.Domain((0.0,), (1.0,), (1,))
+  region = Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=1)
+  physical_domain = Grico.PhysicalDomain(background, region)
+  extended_domain = Grico.PhysicalDomain(background, region;
+                                         cell_measure=Grico.FiniteCellExtension(0.2))
+
+  @test_throws ArgumentError Grico.FiniteCellExtension(-0.1)
+  @test_throws ArgumentError Grico.FiniteCellExtension(1.1)
+  @test_throws ArgumentError Grico.FiniteCellExtension(Inf)
+
+  physical_space = Grico.HpSpace(physical_domain,
+                                 Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                    degree=Grico.UniformDegree(1)))
+  extended_space = Grico.HpSpace(extended_domain,
+                                 Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                    degree=Grico.UniformDegree(1)))
+  physical_field = Grico.ScalarField(physical_space; name=:u)
+  extended_field = Grico.ScalarField(extended_space; name=:u)
+  physical_problem = Grico.AffineProblem(physical_field)
+  extended_problem = Grico.AffineProblem(extended_field)
+  Grico.add_cell!(physical_problem, MassCoupling(physical_field, physical_field, 1.0))
+  Grico.add_cell!(extended_problem, MassCoupling(extended_field, extended_field, 1.0))
+  physical_plan = Grico.compile(physical_problem)
+  extended_plan = Grico.compile(extended_problem)
+
+  @test sum(physical_plan.integration.cells[1].weights) ≈ 0.5 atol = ASSEMBLY_TOL
+  @test sum(extended_plan.integration.cells[1].weights) ≈ 0.6 atol = ASSEMBLY_TOL
+end
+
 @testset "Finite Cell Default Backend Assembly" begin
   domain = Grico.Domain((0.0,), (1.0,), (1,))
   space = Grico.HpSpace(domain,

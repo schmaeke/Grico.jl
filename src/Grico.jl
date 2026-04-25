@@ -127,7 +127,7 @@ export AbstractBasisFamily, FullTensorBasis, TrunkBasis, basis_mode_count, basis
        is_active_mode
 
 include("regions.jl")
-export ImplicitRegion, PhysicalDomain, finite_cell_quadrature
+export FiniteCellExtension, ImplicitRegion, PhysicalDomain, PhysicalMeasure, finite_cell_quadrature
 
 include("continuity.jl")
 

@@ -142,4 +142,19 @@ end
 
   @test Grico.l2_error(state, u, 1.0) ≈ expected atol = VERIFICATION_TOL
   @test Grico.l2_error(state, u, 1.0; extra_points=1) ≈ expected atol = VERIFICATION_TOL
+
+  extended_domain = Grico.PhysicalDomain(background,
+                                         Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=1);
+                                         cell_measure=Grico.FiniteCellExtension(0.2))
+  extended_space = Grico.HpSpace(extended_domain,
+                                 Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                                    degree=Grico.UniformDegree(1)))
+  extended_field = Grico.ScalarField(extended_space; name=:u)
+  problem = Grico.AffineProblem(extended_field)
+  plan = Grico.compile(problem)
+  extended_state = Grico.State(plan)
+
+  @test sum(plan.integration.cells[1].weights) ≈ 0.6 atol = VERIFICATION_TOL
+  @test Grico.l2_error(extended_state, extended_field, 1.0; plan) ≈ expected atol = VERIFICATION_TOL
+  @test Grico.l2_error(extended_state, extended_field, 1.0; extra_points=1) ≈ expected atol = VERIFICATION_TOL
 end

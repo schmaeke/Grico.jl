@@ -237,19 +237,20 @@ function _target_leaf_lookup(grid_data::CartesianGrid, active::AbstractVector{<:
 end
 
 # Adaptivity plans may only change refinement and degree data, not the physical
-# geometry or root-grid layout. This helper enforces that source and target
-# domains describe the same physical box and periodic topology, so state
-# transfer can be defined by overlap on a common geometric domain. For
-# `PhysicalDomain`s the region test is intentionally object identity: copied
-# domains share one region object and therefore one classification/quadrature
-# cache, while independently constructed regions are treated as distinct
-# physical descriptions.
+# geometry, cell-measure policy, or root-grid layout. This helper enforces that
+# source and target domains describe the same physical box and periodic
+# topology, so state transfer can be defined by overlap on a common geometric
+# domain. For `PhysicalDomain`s the region test is intentionally object
+# identity: copied domains share one region object and therefore one
+# classification/quadrature cache, while independently constructed regions are
+# treated as distinct physical descriptions.
 function _same_adaptivity_geometry(source_domain::AbstractDomain, target_domain::AbstractDomain)
   root_cell_counts(grid(source_domain)) == root_cell_counts(grid(target_domain)) || return false
   origin(source_domain) == origin(target_domain) || return false
   extent(source_domain) == extent(target_domain) || return false
   periodic_axes(source_domain) == periodic_axes(target_domain) || return false
   _physical_region(source_domain) === _physical_region(target_domain) || return false
+  _cell_measure(source_domain) == _cell_measure(target_domain) || return false
   return true
 end
 

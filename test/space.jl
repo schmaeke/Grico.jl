@@ -166,11 +166,19 @@ end
 
   shared_region = Grico.ImplicitRegion(x -> x[1] - 0.5; subdivision_depth=0)
   left_domain = Grico.PhysicalDomain(Grico.Domain((0.0,), (1.0,), (1,)), shared_region)
+  extended_domain = Grico.PhysicalDomain(Grico.Domain((0.0,), (1.0,), (1,)), shared_region;
+                                         cell_measure=Grico.FiniteCellExtension(0.1))
   shifted_domain = Grico.PhysicalDomain(Grico.Domain((2.0,), (3.0,), (1,)), shared_region)
 
   @test Grico._domain_active_leaves(left_domain) == [1]
   @test Grico._domain_active_leaves(copy(left_domain)) == [1]
+  @test Grico._cell_measure(copy(extended_domain)) == Grico.FiniteCellExtension(0.1)
   @test_throws ArgumentError Grico._domain_active_leaves(shifted_domain)
+
+  left_space = Grico.HpSpace(left_domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
+  extended_space = Grico.HpSpace(extended_domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
+  @test_throws ArgumentError Grico.FieldLayout((Grico.ScalarField(left_space),
+                                                Grico.ScalarField(extended_space)))
 end
 
 @testset "Field And State Validation" begin

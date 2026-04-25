@@ -299,7 +299,7 @@ end
 # active-leaf set, physical box, periodic axes, and physical-region identity
 # together identify the common discrete and geometric setting in which all field
 # blocks are interpreted.
-struct _FieldLayoutReference{L,O,E,P,R}
+struct _FieldLayoutReference{L,O,E,P,R,M}
   dimension::Int
   scalar_type::DataType
   active_leaves::L
@@ -307,12 +307,13 @@ struct _FieldLayoutReference{L,O,E,P,R}
   extent::E
   periodic::P
   region::R
+  cell_measure::M
 end
 
 @inline function _field_layout_reference(space::HpSpace)
   return _FieldLayoutReference(dimension(space), eltype(origin(space)), space.active_leaves,
                                origin(space), extent(space), periodic_axes(space),
-                               _physical_region(domain(space)))
+                               _physical_region(domain(space)), _cell_measure(domain(space)))
 end
 
 # Check that one field space is compatible with the common layout reference.
@@ -329,6 +330,8 @@ function _check_field_layout_space(space::HpSpace, reference::_FieldLayoutRefere
     throw(ArgumentError("all fields must share the same periodic topology"))
   _physical_region(domain(space)) === reference.region ||
     throw(ArgumentError("all fields must share the same physical region"))
+  _cell_measure(domain(space)) == reference.cell_measure ||
+    throw(ArgumentError("all fields must share the same cell-measure policy"))
   return nothing
 end
 

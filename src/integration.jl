@@ -1356,7 +1356,8 @@ end
 # Parse and validate per-cell quadrature overrides attached to a problem. The
 # reference-point checks below enforce that custom rules are still defined on
 # the standard biunit reference cell `[-1, 1]^D`. Plain background domains have
-# no automatic overrides; `PhysicalDomain`s opt in through `_default_cell_quadrature`.
+# no automatic overrides; `PhysicalDomain`s opt in through their cell-measure
+# policy.
 function _automatic_cell_quadrature_overrides(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
   overrides = Dict{Int,AbstractQuadrature{D}}()
   space = layout.slots[1].space
@@ -1364,7 +1365,7 @@ function _automatic_cell_quadrature_overrides(layout::FieldLayout{D,T}) where {D
   for leaf in active_leaves(space)
     quadrature_shape = ntuple(axis -> maximum(cell_quadrature_shape(slot.space, leaf)[axis]
                                               for slot in layout.slots), D)
-    quadrature = _default_cell_quadrature(domain(space), leaf, quadrature_shape)
+    quadrature = _assembly_cell_quadrature(domain(space), leaf, quadrature_shape)
     quadrature === nothing || (overrides[leaf] = quadrature)
   end
 

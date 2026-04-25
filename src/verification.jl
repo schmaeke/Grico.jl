@@ -39,13 +39,15 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
   overrides = Dict{Int,AbstractQuadrature{D}}()
 
   if extra == 0
-    for (leaf, quadrature) in _automatic_cell_quadrature_overrides(layout)
-      overrides[leaf] = quadrature
+    for leaf in active_leaves(space)
+      shape = _verification_quadrature_shape(layout, leaf, extra)
+      quadrature = _physical_cell_quadrature(domain_data, leaf, shape)
+      quadrature === nothing || (overrides[leaf] = quadrature)
     end
   else
     for leaf in active_leaves(space)
       shape = _verification_quadrature_shape(layout, leaf, extra)
-      quadrature = _default_cell_quadrature(domain_data, leaf, shape)
+      quadrature = _physical_cell_quadrature(domain_data, leaf, shape)
       overrides[leaf] = quadrature === nothing ? TensorQuadrature(T, shape) : quadrature
     end
   end
@@ -74,17 +76,22 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
 end
 
 # Build the cell-evaluation data used for verification. By default this uses
-# the layout's normal cell quadrature, including domain-specific physical-cell
-# overrides. Users may request a uniformly enriched quadrature rule via
-# `extra_points` or override individual leaves explicitly through
-# `cell_quadratures`. This is useful when the verification integral should be
-# more accurate than the quadrature that was chosen for assembly.
+# the layout's physical cell quadrature. This is intentionally distinct from
+# assembly on a [`PhysicalDomain`](@ref) with a stabilized cell-measure policy:
+# error norms are physical diagnostics by default and should not include
+# fictitious-domain volume unless the caller supplies explicit
+# `cell_quadratures`. Users may request a uniformly enriched quadrature rule
+# via `extra_points` or override individual leaves explicitly.
 function _rebuild_verification_cells(layout::FieldLayout{D,T}; extra_points::Integer=0,
                                      cell_quadratures=()) where {D,T<:AbstractFloat}
   extra = _checked_verification_extra(extra_points)
   overrides = _verification_cell_overrides(layout, extra, cell_quadratures)
   return _compile_cells(layout, overrides)
 end
+
+@inline _uses_physical_cell_measure(::Domain) = true
+@inline _uses_physical_cell_measure(domain::PhysicalDomain) = domain.cell_measure isa
+                                                              PhysicalMeasure
 
 # Decide which compiled cell data to use for the verification integral. If the
 # caller passes an assembly/verification plan and does not request modified
@@ -101,7 +108,10 @@ function _verification_cells(state::State, field::AbstractField, plan; extra_poi
     field_dof_range(plan.layout, field)
   end
 
-  if plan !== nothing && extra == 0 && isempty(cell_quadratures)
+  if plan !== nothing &&
+     extra == 0 &&
+     isempty(cell_quadratures) &&
+     _uses_physical_cell_measure(domain(state.layout.slots[1].space))
     return plan.integration.cells
   end
 
