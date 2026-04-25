@@ -706,8 +706,9 @@ function _checked_h_coarsening_candidate(space::HpSpace{D},
   expected_children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
   candidate.children == expected_children ||
     throw(ArgumentError("candidate children do not match the children of cell $checked_cell"))
-  all(is_active_leaf(grid(space), child) for child in expected_children) ||
-    throw(ArgumentError("candidate cell $checked_cell cannot be derefined because not all children are active leaves"))
+  all(child -> is_active_leaf(grid(space), child) && space.leaf_to_index[child] != 0,
+      expected_children) ||
+    throw(ArgumentError("candidate cell $checked_cell cannot be derefined because not all children are active space leaves"))
   expected_degrees = _candidate_target_degrees(space, expected_children)
   candidate.target_degrees == expected_degrees ||
     throw(ArgumentError("candidate target degrees do not match the merged child degrees"))
@@ -762,7 +763,8 @@ function h_coarsening_candidates(space::HpSpace{D}; limits=AdaptivityLimits(spac
     first = first_child(grid(space), cell)
     first == NONE && continue
     children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
-    all(is_active_leaf(grid(space), child) for child in children) || continue
+    all(child -> is_active_leaf(grid(space), child) && space.leaf_to_index[child] != 0, children) ||
+      continue
     push!(candidates,
           HCoarseningCandidate(cell, axis, children, _candidate_target_degrees(space, children)))
   end
