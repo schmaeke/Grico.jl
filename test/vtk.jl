@@ -1,5 +1,6 @@
 using Test
 using Grico
+using WriteVTK
 
 function vtk_xml_attribute(xml::AbstractString, name::AbstractString)
   match_data = match(Regex("$(name)=\"([^\"]+)\""), xml)
@@ -21,11 +22,6 @@ function vtk_data_array(xml::AbstractString, name::AbstractString, ::Type{T}) wh
 end
 
 @testset "VTK Export" begin
-  @test vtk_export_supported(1)
-  @test vtk_export_supported(3)
-  @test !vtk_export_supported(4)
-  @test !vtk_export_supported(big(typemax(Int)) + 1)
-
   domain = Domain((0.0,), (1.0,), (1,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
   u = ScalarField(space; name=:u)
@@ -40,7 +36,7 @@ end
     path = write_vtk(joinpath(directory, "grid"), domain; point_data=(marker=x -> x[1],),
                      cell_data=(leaf=leaf -> Float64(leaf),
                                 pair=leaf -> (Float64(leaf), Float64(leaf + 1))),
-                     field_data=(time=1.5,), subdivisions=2, export_degree=2, append=false,
+                     field_data=(time=1.5,), subdivisions=2, sample_degree=2, append=false,
                      ascii=true)
     xml = read(path, String)
 
@@ -65,7 +61,7 @@ end
                                 centered_cell=(leaf, x) -> leaf + x[1],
                                 contextual_cell=(leaf, x, ξ) -> leaf + x[1] + ξ[1],
                                 tuple_cell=(leaf, x) -> (leaf, x[1])), field_data=(time=1.5,),
-                     subdivisions=2, export_degree=2, append=false, ascii=true)
+                     subdivisions=2, sample_degree=2, append=false, ascii=true)
     xml = read(path, String)
 
     @test isfile(path)
@@ -112,9 +108,20 @@ end
     @test occursin("Name=\"v\"", xml)
   end
 
+  mktempdir() do directory
+    sampled = sample_postprocess(state; subdivisions=2, sample_degree=2)
+    path = write_vtk(joinpath(directory, "sampled"), sampled; append=false, ascii=true)
+    xml = read(path, String)
+
+    @test isfile(path)
+    @test occursin("Name=\"u\"", xml)
+    @test vtk_xml_attribute(xml, "NumberOfPoints") == "5"
+    @test vtk_xml_attribute(xml, "NumberOfCells") == "2"
+  end
+
   hex_domain = Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1, 1, 1))
   mktempdir() do directory
-    path = write_vtk(joinpath(directory, "hex"), hex_domain; subdivisions=1, export_degree=2,
+    path = write_vtk(joinpath(directory, "hex"), hex_domain; subdivisions=1, sample_degree=2,
                      append=false, ascii=true)
     xml = read(path, String)
 
@@ -134,7 +141,7 @@ end
 
   mktempdir() do directory
     path = write_vtk(joinpath(directory, "quad"), refined_domain; state=refined_state, fields=(v,),
-                     export_degree=4, append=false, ascii=true)
+                     sample_degree=4, append=false, ascii=true)
     xml = read(path, String)
 
     @test occursin("NumberOfPoints=\"50\"", xml)
@@ -146,7 +153,7 @@ end
 
   mktempdir() do directory
     path = write_vtk(joinpath(directory, "quad_with_mesh"), refined_domain; state=refined_state,
-                     fields=(v,), subdivisions=2, export_degree=1, mesh=true, append=false,
+                     fields=(v,), subdivisions=2, sample_degree=1, mesh=true, append=false,
                      ascii=true)
     solution_path = joinpath(directory, "quad_with_mesh_solution.vtu")
     mesh_path = joinpath(directory, "quad_with_mesh_mesh.vtu")
@@ -253,7 +260,7 @@ end
                                          point_data=(bad=(() -> 1.0),), append=false, ascii=true)
     @test_throws ArgumentError write_vtk(joinpath(directory, "badsub"), domain; subdivisions=0,
                                          append=false, ascii=true)
-    @test_throws ArgumentError write_vtk(joinpath(directory, "baddegree"), domain; export_degree=0,
+    @test_throws ArgumentError write_vtk(joinpath(directory, "baddegree"), domain; sample_degree=0,
                                          append=false, ascii=true)
   end
 end

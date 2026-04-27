@@ -6,12 +6,15 @@
 # - outer loop: adapt the mesh a few times,
 # - inner loop: converge the Picard iteration on the current mesh.
 function run_lid_driven_cavity_example(; max_iters=PICARD_MAX_ITERS, tol=PICARD_TOL,
-                                       linear_solve=direct_sparse_solve, write_vtk=WRITE_VTK)
+                                       linear_solve=direct_sparse_solve, write_vtk=WRITE_VTK,
+                                       write_plots=WRITE_PLOTS)
   print_lid_driven_cavity_header()
   context = build_lid_driven_cavity_context()
   final_update = Inf
   iteration_count = 0
   adaptive_step_count = 0
+  vtk_path = nothing
+  plot_path = nothing
 
   for adaptive_step in 0:ADAPTIVE_STEPS
     # On intermediate adaptive meshes we allow a looser nonlinear tolerance so
@@ -47,6 +50,11 @@ function run_lid_driven_cavity_example(; max_iters=PICARD_MAX_ITERS, tol=PICARD_
     println("  vtk  $vtk_path")
   end
 
+  if write_plots
+    plot_path = write_lid_driven_cavity_plot(context, iteration_count, final_update)
+    println("  plot $plot_path")
+  end
+
   @printf("  active leaves       : %d\n", active_leaf_count(context.velocity_space))
   @printf("  scalar dofs         : %d\n", scalar_dof_count(context.velocity_space))
   @printf("  mixed dofs          : %d\n", length(coefficients(context.flow_state)))
@@ -55,5 +63,5 @@ function run_lid_driven_cavity_example(; max_iters=PICARD_MAX_ITERS, tol=PICARD_
   @printf("  final rel. update   : %.6e\n", final_update)
   @printf("  dg mass monitor l2  : %.6e\n",
           dg_mass_monitor_l2(context.plan, context.flow_state, context.velocity))
-  return (; context, iteration_count, final_update)
+  return (; context, iteration_count, final_update, vtk_path, plot_path)
 end

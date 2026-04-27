@@ -32,7 +32,8 @@ framework. Its core model is affine Cartesian geometry with anisotropic dyadic
 - State transfer across adaptive space changes.
 - Embedded geometry support through finite-cell quadrature, implicit surface
   quadrature, and explicit segment-mesh surfaces.
-- `L²` and relative `L²` verification helpers, plus VTK/PVD export.
+- `L²` and relative `L²` verification helpers, backend-neutral
+  postprocessing samples, and optional VTK/PVD export through `WriteVTK`.
 
 ## Installation
 
@@ -62,7 +63,7 @@ generated benchmark reports stay untracked.
 3. Define fields and add local operators to an `AffineProblem` or
    `ResidualProblem`.
 4. `compile`, `assemble`, and `solve`.
-5. Optionally verify, export, or build a new adaptive space with
+5. Optionally verify, sample/export, or build a new adaptive space with
    `adaptivity_plan`.
 
 ## Minimal Example
@@ -134,4 +135,13 @@ state = State(plan, solve(assemble(plan)))
 
 - Grico is currently built around axis-aligned affine Cartesian geometry.
 - Continuity policies are currently package-level `:cg` and `:dg`.
-- VTK export is intended for 1D, 2D, and 3D output.
+- Postprocessing samples and VTK export are intended for 1D, 2D, and 3D output.
+- VTK/PVD output is provided by an optional package extension; add `WriteVTK`
+  to the active environment and load it before calling `write_vtk` or
+  `write_pvd`.
+- Makie figure output is provided by an optional package extension; add and
+  load a Makie backend such as `CairoMakie` before calling `plot_field` or
+  `plot_mesh`.
+- Output backends share the same postprocessing inputs: a state or geometric
+  reference, optional point/cell/field datasets, and the sampling controls
+  `subdivisions` and `sample_degree`.

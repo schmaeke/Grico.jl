@@ -26,7 +26,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
                                             difference_step=NEWTON_DIFFERENCE_STEP,
                                             linear_solve=newton_fractal_direct_solve,
                                             output_directory=joinpath(@__DIR__, "output"),
-                                            write_vtk=WRITE_VTK, export_degree=EXPORT_DEGREE,
+                                            write_vtk=WRITE_VTK, sample_degree=EXPORT_DEGREE,
                                             print_summary=true)
   context = build_newton_fractal_poisson_context(; max_h_level, initial_degree, min_degree,
                                                  max_degree, quadrature_extra_points,
@@ -122,7 +122,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
                                                                                                            leaf)))),
                                  field_data=(step=Float64(step), max_h_level=Float64(current_max_h),
                                              relative_l2_error=error_value),
-                                 subdivisions=EXPORT_SUBDIVISIONS, export_degree=export_degree,
+                                 subdivisions=EXPORT_SUBDIVISIONS, sample_degree=sample_degree,
                                  append=true, compress=true, ascii=false)
       push!(vtk_files, vtk_path)
       push!(vtk_steps, step)

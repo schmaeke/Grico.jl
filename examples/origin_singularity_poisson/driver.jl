@@ -1,5 +1,6 @@
 using Printf
 using Grico
+using WriteVTK
 import Grico: cell_matrix!, cell_rhs!
 
 # This example is meant to be the simplest "read it from top to bottom" tour of

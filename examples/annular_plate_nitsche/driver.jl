@@ -1,5 +1,6 @@
 using Printf
 using Grico
+using WriteVTK
 import Grico: cell_matrix!, surface_matrix!, surface_rhs!
 
 # This example is the compact "unfitted methods" tour of the package.

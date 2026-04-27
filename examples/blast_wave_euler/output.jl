@@ -69,7 +69,7 @@ function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__
                               refinement_indicator=refinement_indicator,
                               refinement_indicator_norm=refinement_indicator_norm),
                    field_data=(time=entry.time, dt=entry.dt), subdivisions=EXPORT_SUBDIVISIONS,
-                   export_degree=EXPORT_DEGREE, append=true, compress=true, ascii=false)
+                   sample_degree=EXPORT_DEGREE, append=true, compress=true, ascii=false)
 end
 
 # Print a compact run header so the solver configuration is visible without

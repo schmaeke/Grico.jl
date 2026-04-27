@@ -20,7 +20,7 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
                                     level=leaf -> Float64.(level(current_grid, leaf)),
                                     degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
                          field_data=(relative_l2_error=error_value,),
-                         subdivisions=EXPORT_SUBDIVISIONS, export_degree=EXPORT_DEGREE, append=true,
+                         subdivisions=EXPORT_SUBDIVISIONS, sample_degree=EXPORT_DEGREE, append=true,
                          compress=true, ascii=false)
     print_summary && println("  vtk  $vtk_path")
   end

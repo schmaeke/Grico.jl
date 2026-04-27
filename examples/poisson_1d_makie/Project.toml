@@ -1,0 +1,6 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Grico = "1ea28d43-a4e3-46f0-9b23-78fc8e1c719b"
+
+[sources]
+Grico = {path = "../.."}

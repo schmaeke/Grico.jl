@@ -1,5 +1,6 @@
 using Printf
 using Grico
+using WriteVTK
 import Grico: cell_matrix!, cell_rhs!
 
 # This example solves a manufactured Poisson problem on the unit square,

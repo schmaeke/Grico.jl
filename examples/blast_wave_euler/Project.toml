@@ -3,6 +3,7 @@ Grico = "1ea28d43-a4e3-46f0-9b23-78fc8e1c719b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [sources]
 Grico = {path = "../.."}

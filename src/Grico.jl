@@ -56,8 +56,10 @@ The source tree is easiest to understand in the following conceptual blocks:
    quadrature constructions, compiled local evaluation data, assembly plans,
    global systems, built-in solve support, and space transitions under
    adaptivity.
-6. `verification.jl`, `vtk.jl`
-   Postprocessing helpers for error measurement and visualization/export.
+6. `verification.jl`, `postprocess.jl`
+   Postprocessing helpers for error measurement and backend-neutral sampling.
+   Concrete output backends such as VTK and plotting packages are integrated
+   through package extensions.
 
 # Public Workflow
 
@@ -84,8 +86,6 @@ using AlgebraicMultigrid: aspreconditioner, smoothed_aggregation
 using IncompleteLU: ilu
 using Krylov: cg, gmres
 using SymRCM: symrcm
-using WriteVTK: MeshCell, VTKCellData, VTKCellTypes, VTKFieldData, VTKPointData,
-                multiblock_add_block, vtk_grid, vtk_multiblock
 
 # Part I. Internal utilities shared throughout the implementation. This file is
 # intentionally included first because nearly every later layer depends on its
@@ -160,9 +160,9 @@ export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, ad
 
 include("integration.jl")
 export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_side, jump,
-       local_dof_index, normal, normal_component, normal_gradient, gradient, InterfaceValues, minus,
-       plus, shape_gradient, shape_gradients, shape_normal_gradient, shape_value, shape_values,
-       value
+       local_dof_index, normal, normal_component, normal_gradient, gradient, field_gradient,
+       InterfaceValues, minus, plus, shape_gradient, shape_gradients, shape_normal_gradient,
+       shape_value, shape_values, value
 
 include("plans.jl")
 export AssemblyPlan, compile
@@ -184,7 +184,9 @@ export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, adapted_field, adap
 include("verification.jl")
 export l2_error, relative_l2_error
 
-include("vtk.jl")
-export vtk_export_supported, write_pvd, write_vtk
+include("postprocess.jl")
+export SampledMesh, SampledMeshSkeleton, SampledPostprocess, plot_field, plot_field!, plot_mesh,
+       plot_mesh!, postprocess_supported, sample_mesh_skeleton, sample_postprocess, write_pvd,
+       write_vtk
 
 end

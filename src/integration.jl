@@ -450,6 +450,91 @@ function _leaf_component_values!(result::AbstractVector{T}, compiled::_CompiledL
   return result
 end
 
+"""
+    field_gradient(state, field, leaf, ξ)
+    field_gradient(state, field, component, leaf, ξ)
+
+Evaluate the physical-space gradient of a discrete field at one leaf-local
+biunit reference coordinate `ξ ∈ [-1, 1]^D`.
+
+This is the pointwise companion of [`gradient`](@ref) for postprocessing and
+adaptivity code that works with explicit leaf/reference samples rather than a
+compiled quadrature item. For scalar fields the component-free form returns one
+`D`-tuple. For vector fields it returns one `D`-tuple per component; the
+component method selects a single component.
+"""
+function field_gradient(state::State{T}, field::AbstractField, leaf::Integer,
+                        ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
+  component_total = component_count(field)
+  component_total == 1 && return field_gradient(state, field, 1, leaf, ξ)
+  return ntuple(component -> field_gradient(state, field, component, leaf, ξ), component_total)
+end
+
+function field_gradient(state::State{T}, field::AbstractField, component::Integer, leaf::Integer,
+                        ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
+  space = field_space(field)
+  dimension(space) == D ||
+    throw(ArgumentError("field gradient reference coordinate dimension must match the field space"))
+  checked_component = _require_index(component, component_count(field), "field component")
+  checked_ξ = _checked_biunit_coordinate(T, ξ)
+  compiled = _compiled_leaf(space, leaf)
+  inverse_jacobian = _inverse_jacobian(space.domain, compiled.leaf)
+  component_values = field_component_values(state, field, checked_component)
+  return _leaf_component_gradient(compiled, component_values, checked_ξ, inverse_jacobian)
+end
+
+function _checked_biunit_coordinate(::Type{T}, ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
+  return ntuple(axis -> begin
+                  value = T(ξ[axis])
+                  isfinite(value) ||
+                    throw(ArgumentError("reference coordinate ξ[$axis] must be finite"))
+                  -one(T) <= value <= one(T) ||
+                    throw(ArgumentError("reference coordinate ξ[$axis] must lie in [-1, 1]"))
+                  value
+                end, D)
+end
+
+function _leaf_component_gradient(compiled::_CompiledLeaf{D,T}, coefficients::AbstractVector{T},
+                                  ξ::NTuple{D,T},
+                                  inverse_jacobian::NTuple{D,T}) where {D,T<:AbstractFloat}
+  axis_values = ntuple(axis -> Vector{T}(undef, compiled.degrees[axis] + 1), D)
+  axis_derivatives = ntuple(axis -> Vector{T}(undef, compiled.degrees[axis] + 1), D)
+
+  for axis in 1:D
+    _fe_basis_values_and_derivatives!(ξ[axis], compiled.degrees[axis], axis_values[axis],
+                                      axis_derivatives[axis])
+  end
+
+  return ntuple(axis -> _leaf_component_gradient_axis(compiled, coefficients, axis_values,
+                                                      axis_derivatives, inverse_jacobian, axis), D)
+end
+
+function _leaf_component_gradient_axis(compiled::_CompiledLeaf{D,T}, coefficients,
+                                       axis_values::NTuple{D,Vector{T}},
+                                       axis_derivatives::NTuple{D,Vector{T}},
+                                       inverse_jacobian::NTuple{D,T},
+                                       axis::Int) where {D,T<:AbstractFloat}
+  result = zero(T)
+
+  for mode_index in eachindex(compiled.local_modes)
+    mode = compiled.local_modes[mode_index]
+    derivative = inverse_jacobian[axis] * axis_derivatives[axis][mode[axis]+1]
+
+    for other_axis in 1:D
+      other_axis == axis && continue
+      derivative *= axis_values[other_axis][mode[other_axis]+1]
+    end
+
+    derivative == zero(T) && continue
+    amplitude = _term_amplitude(compiled.term_offsets, compiled.term_indices,
+                                compiled.term_coefficients, compiled.single_term_indices,
+                                compiled.single_term_coefficients, coefficients, mode_index)
+    result = muladd(derivative, amplitude, result)
+  end
+
+  return result
+end
+
 # Field-local numbering and basis-table queries.
 
 # Resolve one field descriptor to the precomputed local basis tables and local-

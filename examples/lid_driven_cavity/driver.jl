@@ -1,6 +1,7 @@
 using LinearAlgebra
 using Printf
 using Grico
+using WriteVTK
 import Grico: cell_matrix!, face_matrix!, face_rhs!, interface_matrix!
 
 # This is the package's main discontinuous Galerkin flow example.
@@ -45,7 +46,7 @@ import Grico: cell_matrix!, face_matrix!, face_rhs!, interface_matrix!
 # - `oseen_operator.jl` defines the cell, interface, and boundary terms for one Oseen step.
 # - `diagnostics.jl` computes the kinetic-energy and DG incompressibility monitors.
 # - `spaces_and_picard.jl` builds spaces, fields, compiled plans, Picard updates, and adaptation.
-# - `output.jl` prints the run header and writes the final VTK data.
+# - `output.jl` prints the run header and writes final VTK/figure data.
 # - `picard_driver.jl` runs the adaptive Picard loop.
 
 # ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ import Grico: cell_matrix!, face_matrix!, face_rhs!, interface_matrix!
 # singularities automatically while keeping the polynomial degree fixed.
 const ROOT_COUNTS = (16, 16)
 const ADAPTIVE_STEPS = 4
-const ADAPTIVITY_TOLERANCE = 5.0e-2
+const ADAPTIVITY_TOLERANCE = 5.0e-3
 const MAX_H_LEVEL = 3
 const VELOCITY_DEGREE = 2
 const PRESSURE_DEGREE = 1
@@ -78,8 +79,11 @@ const PICARD_TOL = 1.0e-6
 const ADAPTIVE_PICARD_TOL = 1.0e-4
 const PICARD_RELAXATION = 0.85
 
-# Optional VTK output settings.
+# Optional postprocessing output settings. Direct runs in the example
+# environment produce both VTK data and a CairoMakie PDF figure. Lean
+# environments that do not carry CairoMakie skip figure output by default.
 const WRITE_VTK = true
+const WRITE_PLOTS = Base.find_package("CairoMakie") !== nothing
 const EXPORT_SUBDIVISIONS = 1
 const EXPORT_DEGREE = 3
 

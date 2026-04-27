@@ -1,6 +1,7 @@
 using LinearAlgebra
 using Printf
 using Grico
+using WriteVTK
 import OrdinaryDiffEq
 import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!,
               interface_residual!

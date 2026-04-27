@@ -27,6 +27,10 @@ using Grico
       include("verification.jl")
     end
 
+    @testset "Postprocess" begin
+      include("postprocess.jl")
+    end
+
     @testset "VTK" begin
       include("vtk.jl")
     end
