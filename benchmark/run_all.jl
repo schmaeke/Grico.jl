@@ -23,7 +23,7 @@ const BENCHMARKS = (;
 
 const SHARED_VALUE_OPTIONS = Set(["--cycles", "--root-cells", "--degree", "--quadrature-extra",
                                   "--max-h-level", "--tolerance", "--smoothness-threshold"])
-const SHARED_FLAG_OPTIONS = Set(["--unrestricted-h"])
+const SHARED_FLAG_OPTIONS = Set(["--unrestricted-h", "--compact-transition"])
 
 _benchmark_names_text() = join((String(name) for name in keys(BENCHMARKS)), ", ")
 
@@ -58,7 +58,7 @@ function _print_help()
 $(_benchmark_descriptions_text())
   Shared benchmark options are forwarded when present:
     --cycles, --root-cells, --degree, --quadrature-extra, --max-h-level,
-    --unrestricted-h, --tolerance, --smoothness-threshold
+    --unrestricted-h, --tolerance, --smoothness-threshold, --compact-transition
 
   Arguments after -- are forwarded to every selected benchmark without
   validation. Use that for benchmark-specific options only when the selected

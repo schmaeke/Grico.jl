@@ -178,6 +178,14 @@ function Base.copy(domain::PhysicalDomain{D,T}) where {D,T<:AbstractFloat}
   return PhysicalDomain(copy(domain.background), domain.region; cell_measure=domain.cell_measure)
 end
 
+function compact(domain::PhysicalDomain{D,T},
+                 active_snapshot::GridSnapshot{D}) where {D,T<:AbstractFloat}
+  compact_background, compact_snapshot, old_to_new = compact(domain.background, active_snapshot)
+  compact_domain = PhysicalDomain(compact_background, domain.region;
+                                  cell_measure=domain.cell_measure)
+  return compact_domain, compact_snapshot, old_to_new
+end
+
 @inline _background_domain(domain::Domain) = domain
 @inline _background_domain(domain::PhysicalDomain) = domain.background
 
@@ -222,7 +230,9 @@ end
 # default quadrature on every cut leaf that remains active.
 _domain_active_leaves(domain::Domain) = active_leaves(grid(domain))
 
-@inline _is_domain_active_leaf(domain::Domain, leaf::Int) = is_active_leaf(grid(domain), leaf)
+@inline _is_domain_active_leaf(domain::Domain, leaf::Int) = 1 <=
+                                                            leaf <=
+                                                            stored_cell_count(grid(domain))
 
 function _domain_active_leaves(domain::PhysicalDomain{D,T}) where {D,T<:AbstractFloat}
   grid_data = grid(domain)
@@ -246,8 +256,6 @@ function _classify_leaf(region::ImplicitRegion, domain::AbstractDomain{D,T},
                         leaf::Integer) where {D,T<:AbstractFloat}
   grid_data = grid(domain)
   checked_leaf = _checked_cell(grid_data, leaf)
-  is_active_leaf(grid_data, checked_leaf) ||
-    throw(ArgumentError("physical-region queries require active background leaves"))
   signature = _leaf_signature(domain, checked_leaf)
   cached = _cached_leaf_classification(region, signature)
   cached === nothing || return cached
@@ -262,8 +270,6 @@ function _cut_cell_quadrature(region::ImplicitRegion, domain::AbstractDomain{D,T
                               quadrature_shape::NTuple{D,<:Integer}) where {D,T<:AbstractFloat}
   grid_data = grid(domain)
   checked_leaf = _checked_cell(grid_data, leaf)
-  is_active_leaf(grid_data, checked_leaf) ||
-    throw(ArgumentError("finite-cell quadrature can only be built on active leaves"))
   checked_shape = ntuple(axis -> _checked_positive(quadrature_shape[axis],
                                                    "quadrature_shape[$axis]"), D)
   classification = _classify_leaf(region, domain, checked_leaf)

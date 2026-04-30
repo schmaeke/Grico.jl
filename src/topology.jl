@@ -15,9 +15,9 @@
 #
 # A few representation choices are central to the rest of the implementation:
 # - refinement is anisotropic and always bisects exactly one axis at a time,
-# - direct neighbor tables store only same-level tree neighbors,
+# - same-level neighbors are derived from logical cell signatures on demand,
 # - higher-level queries recover coverings and active opposite leaves from those
-#   same-level tables,
+#   derived same-level relations,
 # - active leaves are stored explicitly in deterministic sorted order,
 # - expanded ancestors remain stored in the tree, while derefined retired cells
 #   may remain in storage but no longer belong to the live tree.
@@ -73,10 +73,11 @@ midpoint bisection.
 
 `CartesianGrid` stores only combinatorial information: the root mesh counts,
 per-axis refinement levels `ℓₐ`, logical coordinates `iₐ`, parent/child links,
-active-leaf flags, same-level direct neighbors, periodic wrapping, and a
-revision counter. Physical coordinates and measures are handled separately by
-`Geometry` and `Domain`; this type represents the discrete refinement topology
-on which continuity, interface, and adaptivity logic operate.
+active-leaf flags, periodic wrapping, and a revision counter. Same-level direct
+neighbors are derived from the logical tree when queried instead of being stored
+per cell. Physical coordinates and measures are handled separately by `Geometry`
+and `Domain`; this type represents the discrete refinement topology on which
+continuity, interface, and adaptivity logic operate.
 
 Along axis `a`, a cell at level `ℓₐ` occupies one interval in a logical lattice
 with `root_counts[a] * 2^ℓₐ` intervals. Refinement splits one axis at a
@@ -101,8 +102,6 @@ mutable struct CartesianGrid{D}
   split_axis::Vector{Int}
   active::BitVector
   active_leaves::Vector{Int}
-  neighbor_lower::NTuple{D,Vector{Int}}
-  neighbor_upper::NTuple{D,Vector{Int}}
   periodic::NTuple{D,Bool}
   revision::UInt
 
@@ -112,33 +111,19 @@ mutable struct CartesianGrid{D}
   function CartesianGrid{D}(root_counts::NTuple{D,Int}, levels::NTuple{D,Vector{Int}},
                             coords::NTuple{D,Vector{Int}}, parent::Vector{Int},
                             first_child::Vector{Int}, split_axis::Vector{Int}, active::BitVector,
-                            active_leaves::Vector{Int}, neighbor_lower::NTuple{D,Vector{Int}},
-                            neighbor_upper::NTuple{D,Vector{Int}}, periodic::NTuple{D,Bool},
+                            active_leaves::Vector{Int}, periodic::NTuple{D,Bool},
                             revision::UInt) where {D}
     D >= 1 || throw(ArgumentError("dimension must be positive"))
     checked_counts = ntuple(axis -> _checked_positive(root_counts[axis], "root_counts[$axis]"), D)
     grid = new{D}(checked_counts, levels, coords, parent, first_child, split_axis, active,
-                  active_leaves, neighbor_lower, neighbor_upper, periodic, revision)
+                  active_leaves, periodic, revision)
     check_topology(grid)
     return grid
   end
 end
 
-# Backward-compatible internal constructor that defaults to a nonperiodic root
-# grid when periodic metadata are not supplied explicitly.
-function CartesianGrid{D}(root_counts::NTuple{D,Int}, levels::NTuple{D,Vector{Int}},
-                          coords::NTuple{D,Vector{Int}}, parent::Vector{Int},
-                          first_child::Vector{Int}, split_axis::Vector{Int}, active::BitVector,
-                          active_leaves::Vector{Int}, neighbor_lower::NTuple{D,Vector{Int}},
-                          neighbor_upper::NTuple{D,Vector{Int}}, revision::UInt) where {D}
-  return CartesianGrid{D}(root_counts, levels, coords, parent, first_child, split_axis, active,
-                          active_leaves, neighbor_lower, neighbor_upper, ntuple(_ -> false, D),
-                          revision)
-end
-
-# Build the unrefined root tree and initialize the same-level neighbor tables.
-# Root cells are numbered in mixed-radix order with axis 1 varying fastest, so
-# the direct neighbors can be reconstructed from strides on the root lattice.
+# Build the unrefined root tree. Root cells are numbered in mixed-radix order
+# with axis 1 varying fastest.
 function CartesianGrid(root_counts::Tuple{Vararg{Integer,D}}; periodic=false) where {D}
   D >= 1 || throw(ArgumentError("dimension must be positive"))
   checked_counts = ntuple(axis -> _checked_positive(root_counts[axis], "root_counts[$axis]"), D)
@@ -151,8 +136,6 @@ function CartesianGrid(root_counts::Tuple{Vararg{Integer,D}}; periodic=false) wh
   split_axis = zeros(Int, cell_total)
   active = trues(cell_total)
   active_leaves = collect(1:cell_total)
-  neighbor_lower = ntuple(_ -> fill(NONE, cell_total), D)
-  neighbor_upper = ntuple(_ -> fill(NONE, cell_total), D)
   strides = ntuple(axis -> axis == 1 ? 1 : prod(checked_counts[1:(axis-1)]), D)
 
   for cell in 1:cell_total
@@ -161,29 +144,340 @@ function CartesianGrid(root_counts::Tuple{Vararg{Integer,D}}; periodic=false) wh
     @inbounds for axis in 1:D
       coord = fld(linear, strides[axis]) % checked_counts[axis]
       coords[axis][cell] = coord
-
-      # At the root level, direct neighbors are obtained by stepping one cell on
-      # the tensor-product lattice. Periodic axes wrap to the opposite side,
-      # while nonperiodic axes use `NONE` to mark the outer boundary.
-      if coord == 0
-        neighbor_lower[axis][cell] = checked_periodic[axis] ?
-                                     cell + (checked_counts[axis] - 1) * strides[axis] : NONE
-      else
-        neighbor_lower[axis][cell] = cell - strides[axis]
-      end
-
-      if coord + 1 == checked_counts[axis]
-        neighbor_upper[axis][cell] = checked_periodic[axis] ?
-                                     cell - (checked_counts[axis] - 1) * strides[axis] : NONE
-      else
-        neighbor_upper[axis][cell] = cell + strides[axis]
-      end
     end
   end
 
   return CartesianGrid{D}(checked_counts, levels, coords, parent, first_child, split_axis, active,
-                          active_leaves, neighbor_lower, neighbor_upper, checked_periodic,
-                          zero(UInt))
+                          active_leaves, checked_periodic, zero(UInt))
+end
+
+"""
+    GridSnapshot
+
+Immutable active-frontier view of a [`CartesianGrid`](@ref).
+
+`GridSnapshot` stores the mesh state that changes between adaptation steps:
+the active leaves, dense active-leaf lookup, boundary faces, and active
+interfaces. The referenced `CartesianGrid` owns persistent tree data such as
+levels, logical coordinates, and parent/child links.
+
+Snapshots are valid only for the grid revision from which they were built.
+Normal append-only snapshot adaptation does not change that revision, while
+destructive topology edits such as `refine!`, `derefine!`, and `compact!`
+invalidate old snapshots by incrementing it.
+
+Snapshot active leaves are stored in deterministic Morton order. Cell ids remain
+structural handles owned by the grid; the snapshot order is the traversal order
+used by spaces, integration, adaptivity, and output.
+"""
+struct GridSnapshot{D}
+  grid::CartesianGrid{D}
+  generation::UInt
+  active_leaves::Vector{Int}
+  leaf_to_index::Vector{Int}
+  boundary_leaf::Vector{Int}
+  boundary_axis::Vector{UInt8}
+  boundary_side::Vector{UInt8}
+  interface_minus::Vector{Int}
+  interface_plus::Vector{Int}
+  interface_axis::Vector{UInt8}
+end
+
+"""
+    GridBoundaryFace(leaf, axis, side)
+
+Small value object returned by [`boundary_face_spec`](@ref).
+"""
+struct GridBoundaryFace
+  leaf::Int
+  axis::Int
+  side::Int
+end
+
+"""
+    GridInterface(minus, axis, plus)
+
+Small value object returned by [`interface_spec`](@ref).
+"""
+struct GridInterface
+  minus::Int
+  axis::Int
+  plus::Int
+end
+
+"""
+    snapshot(grid)
+
+Build a [`GridSnapshot`](@ref) for the current active frontier of `grid`.
+"""
+snapshot(grid::CartesianGrid{D}) where {D} = _snapshot(grid, active_leaves(grid))
+
+function _snapshot(grid::CartesianGrid{D}, active::AbstractVector{<:Integer}) where {D}
+  active_leaves = _morton_ordered_snapshot_leaves(grid, active)
+  leaf_to_index = _snapshot_leaf_lookup(grid, active_leaves)
+  boundary_leaf, boundary_axis, boundary_side = _snapshot_boundary_data(grid, active_leaves)
+  interface_minus, interface_plus, interface_axis = _snapshot_interface_data(grid, active_leaves,
+                                                                             leaf_to_index)
+  return GridSnapshot{D}(grid, revision(grid), active_leaves, leaf_to_index, boundary_leaf,
+                         boundary_axis, boundary_side, interface_minus, interface_plus,
+                         interface_axis)
+end
+
+# Snapshot traversal order is spatial rather than storage-based. Leaves are
+# compared by the Morton code of their lower corner on the finest lattice needed
+# by this snapshot; the refinement level and cell id are deterministic
+# tie-breakers for anisotropic or otherwise coincident lower corners.
+function _morton_ordered_snapshot_leaves(grid::CartesianGrid{D},
+                                         active::AbstractVector{<:Integer}) where {D}
+  leaves = Int[_checked_cell(grid, leaf) for leaf in active]
+  isempty(leaves) && throw(ArgumentError("grid snapshot must contain at least one active leaf"))
+  max_levels = _snapshot_max_levels(grid, leaves)
+  bit_count = _snapshot_morton_bit_count(grid, max_levels)
+  keys = Vector{_SnapshotMortonKey{D}}(undef, length(leaves))
+
+  for index in eachindex(leaves)
+    leaf = leaves[index]
+    keys[index] = _snapshot_morton_key(grid, leaf, max_levels)
+  end
+
+  ordering = sortperm(keys; lt=(left, right) -> _snapshot_morton_isless(left, right, bit_count))
+  return leaves[ordering]
+end
+
+# Precomputed ordering key used by the Morton comparator. Storing the scaled
+# lower corner avoids building large integer Morton codes and keeps comparison
+# exact for all refinement levels admitted by the topology checks.
+struct _SnapshotMortonKey{D}
+  lower::NTuple{D,Int128}
+  level::NTuple{D,Int}
+  cell::Int
+end
+
+function _snapshot_max_levels(grid::CartesianGrid{D}, leaves::AbstractVector{Int}) where {D}
+  return ntuple(axis -> maximum(leaf -> _level(grid, leaf, axis), leaves), D)
+end
+
+function _snapshot_morton_bit_count(grid::CartesianGrid{D}, max_levels::NTuple{D,Int}) where {D}
+  return maximum(axis -> _snapshot_axis_bit_count(grid, max_levels, axis), 1:D)
+end
+
+function _snapshot_axis_bit_count(grid::CartesianGrid, max_levels, axis::Int)
+  extent = _checked_axis_extent(_root_cell_count(grid, axis), max_levels[axis], axis)
+  value = extent - 1
+  bits = 0
+
+  while value > 0
+    bits += 1
+    value >>= 1
+  end
+
+  return bits
+end
+
+function _snapshot_morton_key(grid::CartesianGrid{D}, leaf::Int,
+                              max_levels::NTuple{D,Int}) where {D}
+  lower = ntuple(axis -> _scaled_lower_coordinate(grid, leaf, axis, max_levels[axis]), D)
+  return _SnapshotMortonKey{D}(lower, _level_tuple(grid, leaf), leaf)
+end
+
+function _snapshot_morton_isless(left::_SnapshotMortonKey{D}, right::_SnapshotMortonKey{D},
+                                 bit_count::Int) where {D}
+  for bit in (bit_count-1):-1:0
+    for axis in D:-1:1
+      left_bit = !iszero((left.lower[axis] >> bit) & 1)
+      right_bit = !iszero((right.lower[axis] >> bit) & 1)
+      left_bit == right_bit || return !left_bit && right_bit
+    end
+  end
+
+  left.level == right.level || return left.level < right.level
+  return left.cell < right.cell
+end
+
+# Active topology comparisons across independently compacted grids cannot rely
+# on cell ids. Logical signatures provide the same information in the common
+# root lattice and are ordered with the same Morton policy as snapshots.
+function _active_leaf_signatures(grid::CartesianGrid{D},
+                                 active::AbstractVector{<:Integer}) where {D}
+  ordered = _morton_ordered_snapshot_leaves(grid, active)
+  return [(_level_tuple(grid, leaf), _logical_coordinate_tuple(grid, leaf)) for leaf in ordered]
+end
+
+function _active_leaf_signatures(snapshot::GridSnapshot)
+  _require_current_snapshot(snapshot)
+  grid_data = grid(snapshot)
+  return [(_level_tuple(grid_data, leaf), _logical_coordinate_tuple(grid_data, leaf))
+          for leaf in snapshot.active_leaves]
+end
+
+# Build a fresh grid that contains the smallest root-preserving tree needed by
+# a snapshot. Every expanded retained parent keeps its full binary child block
+# so the normal `CartesianGrid` invariants continue to hold; inactive siblings
+# become ordinary grid leaves if they are not part of the snapshot frontier.
+function _compact_grid_snapshot(snapshot::GridSnapshot{D}) where {D}
+  check_snapshot(snapshot)
+  source_grid = grid(snapshot)
+  source_stored = stored_cell_count(source_grid)
+  root_total = root_cell_total(source_grid)
+  old_to_new = zeros(Int, source_stored)
+  expanded = _snapshot_expanded_cell_flags(snapshot)
+  compact_cell_count = root_total + _MIDPOINT_CHILD_COUNT * count(expanded)
+  levels = ntuple(_ -> Int[], D)
+  coords = ntuple(_ -> Int[], D)
+  parent = Int[]
+  first_child = Int[]
+  split_axis = Int[]
+  active = falses(0)
+  sizehint!(parent, compact_cell_count)
+  sizehint!(first_child, compact_cell_count)
+  sizehint!(split_axis, compact_cell_count)
+  sizehint!(active, compact_cell_count)
+
+  for axis in 1:D
+    sizehint!(levels[axis], compact_cell_count)
+    sizehint!(coords[axis], compact_cell_count)
+  end
+
+  for old_root in 1:root_total
+    new_root = _append_compact_cell!(source_grid, levels, coords, parent, first_child, split_axis,
+                                     active, old_root, NONE)
+    new_root == old_root || throw(ArgumentError("compacted grid must preserve root cell ids"))
+    old_to_new[old_root] = new_root
+  end
+
+  for old_root in 1:root_total
+    _compact_snapshot_subtree!(snapshot, expanded, old_to_new, levels, coords, parent, first_child,
+                               split_axis, active, old_root)
+  end
+
+  active_leaves = Int[]
+  sizehint!(active_leaves, length(active))
+
+  for cell in eachindex(active)
+    @inbounds active[cell] && push!(active_leaves, cell)
+  end
+
+  compact_grid = CartesianGrid{D}(source_grid.root_counts, levels, coords, parent, first_child,
+                                  split_axis, active, active_leaves, source_grid.periodic,
+                                  zero(UInt))
+  compact_active = Int[]
+  sizehint!(compact_active, length(snapshot.active_leaves))
+
+  for old_leaf in snapshot.active_leaves
+    mapped_leaf = @inbounds old_to_new[old_leaf]
+    mapped_leaf != NONE || throw(ArgumentError("compaction dropped active leaf $old_leaf"))
+    push!(compact_active, mapped_leaf)
+  end
+
+  compact_snapshot = _snapshot(compact_grid, compact_active)
+  return compact_snapshot, old_to_new
+end
+
+"""
+    compact!(grid, snapshot)
+
+Destructively prune `grid` so it keeps only the tree data needed to represent
+`snapshot`.
+
+This rewrites non-root cell ids, preserves root ids, bumps the grid revision,
+and invalidates every existing snapshot of `grid`, including the input
+snapshot. The returned tuple is
+`(compacted_snapshot, old_to_new_cell)`, where `compacted_snapshot` is valid for
+the compacted `grid` and `old_to_new_cell[old_cell]` is the new cell id or
+[`NONE`](@ref) if the old cell was pruned.
+"""
+function compact!(grid_data::CartesianGrid{D}, active_snapshot::GridSnapshot{D}) where {D}
+  active_snapshot.grid === grid_data || throw(ArgumentError("snapshot must reference grid"))
+  _require_revision_bump(grid_data)
+  compact_snapshot, old_to_new = _compact_grid_snapshot(active_snapshot)
+  compact_grid = grid(compact_snapshot)
+  grid_data.root_counts = compact_grid.root_counts
+  grid_data.levels = compact_grid.levels
+  grid_data.coords = compact_grid.coords
+  grid_data.parent = compact_grid.parent
+  grid_data.first_child = compact_grid.first_child
+  grid_data.split_axis = compact_grid.split_axis
+  grid_data.active = compact_grid.active
+  grid_data.active_leaves = compact_grid.active_leaves
+  grid_data.periodic = compact_grid.periodic
+  grid_data.revision += 1
+  check_topology(grid_data)
+  compacted_snapshot = _snapshot(grid_data, compact_snapshot.active_leaves)
+  return compacted_snapshot, old_to_new
+end
+
+# Mark exactly those cells that are ancestors of the snapshot active leaves.
+# Compaction then follows this bitset instead of recursively asking the snapshot
+# whether unrelated retained storage happens to contain active descendants.
+function _snapshot_expanded_cell_flags(snapshot::GridSnapshot)
+  source_grid = grid(snapshot)
+  expanded = falses(stored_cell_count(source_grid))
+
+  for leaf in snapshot.active_leaves
+    current = _parent(source_grid, leaf)
+
+    while current != NONE
+      @inbounds expanded[current] = true
+      current = _parent(source_grid, current)
+    end
+  end
+
+  return expanded
+end
+
+function _append_compact_cell!(source_grid::CartesianGrid{D}, levels::NTuple{D,Vector{Int}},
+                               coords::NTuple{D,Vector{Int}}, parent::Vector{Int},
+                               first_child::Vector{Int}, split_axis::Vector{Int}, active::BitVector,
+                               source_cell::Int, parent_cell::Int) where {D}
+  new_cell = length(parent) + 1
+  push!(parent, parent_cell)
+  push!(first_child, NONE)
+  push!(split_axis, 0)
+  push!(active, true)
+
+  for axis in 1:D
+    push!(levels[axis], _level(source_grid, source_cell, axis))
+    push!(coords[axis], _logical_coordinate(source_grid, source_cell, axis))
+  end
+
+  return new_cell
+end
+
+function _compact_snapshot_subtree!(snapshot::GridSnapshot{D}, expanded::BitVector,
+                                    old_to_new::Vector{Int}, levels::NTuple{D,Vector{Int}},
+                                    coords::NTuple{D,Vector{Int}}, parent::Vector{Int},
+                                    first_child::Vector{Int}, split_axis::Vector{Int},
+                                    active::BitVector, source_cell::Int) where {D}
+  @inbounds expanded[source_cell] || return nothing
+  source_grid = grid(snapshot)
+  target_cell = @inbounds old_to_new[source_cell]
+  target_cell != NONE || throw(ArgumentError("snapshot compaction reached an unmapped tree cell"))
+  source_first = _first_child(source_grid, source_cell)
+  source_first != NONE ||
+    throw(ArgumentError("expanded snapshot cell $source_cell is missing its child block"))
+  source_split = _structural_split_axis(source_grid, source_cell)
+  source_split != 0 ||
+    throw(ArgumentError("expanded snapshot cell $source_cell has no structural split axis"))
+  target_first = length(parent) + 1
+  @inbounds begin
+    first_child[target_cell] = target_first
+    split_axis[target_cell] = source_split
+    active[target_cell] = false
+  end
+
+  for child_offset in 0:(_MIDPOINT_CHILD_COUNT-1)
+    source_child = source_first + child_offset
+    target_child = _append_compact_cell!(source_grid, levels, coords, parent, first_child,
+                                         split_axis, active, source_child, target_cell)
+    @inbounds old_to_new[source_child] = target_child
+  end
+
+  for child_offset in 0:(_MIDPOINT_CHILD_COUNT-1)
+    _compact_snapshot_subtree!(snapshot, expanded, old_to_new, levels, coords, parent, first_child,
+                               split_axis, active, source_first + child_offset)
+  end
+
+  return nothing
 end
 
 # Basic global queries.
@@ -198,6 +492,9 @@ therefore the length of per-axis tuples such as levels, logical coordinates,
 root counts, and periodicity flags.
 """
 dimension(::CartesianGrid{D}) where {D} = D
+dimension(::GridSnapshot{D}) where {D} = D
+
+grid(snapshot::GridSnapshot) = snapshot.grid
 
 """
     root_cell_counts(grid)
@@ -276,10 +573,42 @@ stored_cell_count(grid::CartesianGrid) = length(grid.parent)
 Return the topology revision counter.
 
 The counter is incremented whenever refinement or derefinement rebuilds the tree
-connectivity. Higher-level caches can use it to detect when topological data
-have become stale.
+connectivity, and also when destructive compaction rewrites stored cell ids.
+Higher-level caches can use it to detect when topological data have become
+stale.
 """
 revision(grid::CartesianGrid) = grid.revision
+
+"""
+    check_snapshot(snapshot)
+
+Validate that `snapshot` is current for its grid and that its active-frontier
+lookup and derived traversal arrays are internally consistent.
+"""
+function check_snapshot(snapshot::GridSnapshot)
+  _require_current_snapshot(snapshot)
+  active = snapshot.active_leaves
+  lookup = snapshot.leaf_to_index
+  stored = stored_cell_count(grid(snapshot))
+  length(lookup) <= stored || throw(ArgumentError("snapshot leaf lookup exceeds grid storage"))
+
+  expected_lookup = zeros(Int, length(lookup))
+  for index in eachindex(active)
+    leaf = active[index]
+    1 <= leaf <= length(lookup) ||
+      throw(ArgumentError("snapshot active leaf is outside the snapshot lookup range"))
+    @inbounds expected_lookup[leaf] == 0 ||
+              throw(ArgumentError("snapshot active leaves must be unique"))
+    @inbounds expected_lookup[leaf] = index
+  end
+
+  lookup == expected_lookup || throw(ArgumentError("snapshot leaf lookup is inconsistent"))
+  active == _morton_ordered_snapshot_leaves(grid(snapshot), active) ||
+    throw(ArgumentError("snapshot active leaves are not in Morton order"))
+  _check_snapshot_boundary_data(snapshot)
+  _check_snapshot_interface_data(snapshot)
+  return nothing
+end
 
 """
     active_leaf_count(grid)
@@ -290,22 +619,29 @@ Active leaves are the cells that currently partition the domain and therefore
 act as the discrete elements seen by spaces, integration, and assembly.
 """
 active_leaf_count(grid::CartesianGrid) = length(grid.active_leaves)
+function active_leaf_count(snapshot::GridSnapshot)
+  length(_require_current_snapshot(snapshot).active_leaves)
+end
 
 """
     active_leaves(grid)
 
-Return the active leaves of the current tree as a newly allocated vector.
+Return the active leaves as a newly allocated vector.
 
-The returned vector is sorted by cell index and is independent of the internal
-storage, so callers may reorder or modify it without mutating the grid.
+For a `CartesianGrid`, the returned vector follows structural cell-id order.
+For a `GridSnapshot`, it follows the snapshot's deterministic Morton traversal
+order. In both cases, the returned vector is independent of the internal
+storage, so callers may reorder or modify it without mutating the source.
 """
 active_leaves(grid::CartesianGrid) = copy(grid.active_leaves)
+active_leaves(snapshot::GridSnapshot) = copy(_require_current_snapshot(snapshot).active_leaves)
 
 @inline _root_cell_count(grid::CartesianGrid, axis::Int) = @inbounds grid.root_counts[axis]
 
 @inline _is_periodic_axis(grid::CartesianGrid, axis::Int) = @inbounds grid.periodic[axis]
 
 @inline _active_leaf(grid::CartesianGrid, index::Int) = @inbounds grid.active_leaves[index]
+@inline _active_leaf(snapshot::GridSnapshot, index::Int) = @inbounds snapshot.active_leaves[index]
 
 @inline _level(grid::CartesianGrid, cell::Int, axis::Int) = @inbounds grid.levels[axis][cell]
 
@@ -326,15 +662,16 @@ end
 @inline _split_axis(grid::CartesianGrid, cell::Int) = @inbounds grid.split_axis[cell]
 
 @inline _is_active_leaf(grid::CartesianGrid, cell::Int) = @inbounds grid.active[cell]
+@inline function _is_active_leaf(snapshot::GridSnapshot, cell::Int)
+  return cell <= length(snapshot.leaf_to_index) && @inbounds(snapshot.leaf_to_index[cell] != 0)
+end
 
 @inline _is_expanded(grid::CartesianGrid, cell::Int) = _split_axis(grid, cell) != 0
+@inline _is_expanded(snapshot::GridSnapshot, cell::Int) = _snapshot_has_active_descendant(snapshot,
+                                                                                          cell)
 
 @inline _is_tree_cell(grid::CartesianGrid, cell::Int) = _is_active_leaf(grid, cell) ||
                                                         _is_expanded(grid, cell)
-
-@inline function _neighbor(grid::CartesianGrid, cell::Int, axis::Int, side::Int)
-  return @inbounds _neighbor_array(grid, side)[axis][cell]
-end
 
 # Cell-local tree queries.
 
@@ -350,6 +687,13 @@ and [`active_leaf_count`](@ref).
   count = active_leaf_count(grid)
   @boundscheck 1 <= index <= count || _throw_index_error(index, count, "active leaf")
   return _active_leaf(grid, Int(index))
+end
+
+@inline function active_leaf(snapshot::GridSnapshot, index::Integer)
+  _require_current_snapshot(snapshot)
+  count = active_leaf_count(snapshot)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "active leaf")
+  return _active_leaf(snapshot, Int(index))
 end
 
 """
@@ -460,7 +804,7 @@ the corresponding full face at that level. If no such same-level tree cell
 exists, the function returns [`NONE`](@ref). For nonmatching interfaces, use
 [`covering_neighbor`](@ref) or [`opposite_active_leaves`](@ref) instead.
 """
-@inline function neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, side::Integer)
+function neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, side::Integer)
   cell_count = stored_cell_count(grid)
   axis_count = dimension(grid)
   @boundscheck 1 <= cell <= cell_count || _throw_index_error(cell, cell_count, "cell")
@@ -484,6 +828,13 @@ integration routines.
   return _is_active_leaf(grid, Int(cell))
 end
 
+@inline function is_active_leaf(snapshot::GridSnapshot, cell::Integer)
+  _require_current_snapshot(snapshot)
+  count = stored_cell_count(grid(snapshot))
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _is_active_leaf(snapshot, Int(cell))
+end
+
 """
     is_expanded(grid, cell)
 
@@ -498,6 +849,13 @@ active leaves.
   return _is_expanded(grid, Int(cell))
 end
 
+@inline function is_expanded(snapshot::GridSnapshot, cell::Integer)
+  _require_current_snapshot(snapshot)
+  count = stored_cell_count(grid(snapshot))
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  return _is_expanded(snapshot, Int(cell))
+end
+
 """
     is_tree_cell(grid, cell)
 
@@ -510,6 +868,14 @@ stored cells that no longer participate in the live tree after derefinement.
   count = stored_cell_count(grid)
   @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
   return _is_tree_cell(grid, Int(cell))
+end
+
+@inline function is_tree_cell(snapshot::GridSnapshot, cell::Integer)
+  _require_current_snapshot(snapshot)
+  count = stored_cell_count(grid(snapshot))
+  @boundscheck 1 <= cell <= count || _throw_index_error(cell, count, "cell")
+  checked_cell = Int(cell)
+  return _is_active_leaf(snapshot, checked_cell) || _is_expanded(snapshot, checked_cell)
 end
 
 """
@@ -532,9 +898,9 @@ end
 Return the coarsest tree cell on the opposite side whose face covers the
 selected face patch of `cell`.
 
-Direct neighbor tables store only same-level tree neighbors. When the opposite
-side is coarser, this function climbs the ancestor chain until it finds a
-same-level neighbor that geometrically covers the queried face. The returned
+Same-level direct neighbors are derived from the logical tree. When the
+opposite side is coarser, this function climbs the ancestor chain until it finds
+a same-level neighbor that geometrically covers the queried face. The returned
 cell may therefore be active or expanded. If no covering cell exists, the
 function returns [`NONE`](@ref).
 """
@@ -542,15 +908,17 @@ function covering_neighbor(grid::CartesianGrid, cell::Integer, axis::Integer, si
   current = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   checked_side = _checked_side(side)
-  return _covering_neighbor(grid, current, checked_axis, checked_side)
+  lookup = _tree_cell_lookup(grid)
+  return _covering_neighbor(grid, lookup, current, checked_axis, checked_side)
 end
 
-function _covering_neighbor(grid::CartesianGrid, current::Int, checked_axis::Int, checked_side::Int)
+function _covering_neighbor(grid::CartesianGrid, lookup, current::Int, checked_axis::Int,
+                            checked_side::Int)
   while true
-    # The direct neighbor tables resolve only same-level tree neighbors. When a
-    # fine face abuts a coarser cell, we ascend until the missing face segment
-    # reaches an ancestor whose opposite side is represented at the same level.
-    candidate = _neighbor(grid, current, checked_axis, checked_side)
+    # Direct neighbors are resolved on the current tree-cell lookup. When a fine
+    # face abuts a coarser cell, we ascend until the missing face segment reaches
+    # an ancestor whose opposite side is represented at the same level.
+    candidate = _neighbor(grid, lookup, current, checked_axis, checked_side)
     candidate != NONE && return candidate
     current_parent = _parent(grid, current)
     current_parent == NONE && return NONE
@@ -575,7 +943,8 @@ function opposite_active_leaves(grid::CartesianGrid, cell::Integer, axis::Intege
   checked_cell = _checked_cell(grid, cell)
   checked_axis = _checked_axis(grid, axis)
   checked_side = _checked_side(side)
-  candidate = _covering_neighbor(grid, checked_cell, checked_axis, checked_side)
+  lookup = _tree_cell_lookup(grid)
+  candidate = _covering_neighbor(grid, lookup, checked_cell, checked_axis, checked_side)
   candidate == NONE && return Int[]
   leaves = Int[]
 
@@ -598,6 +967,45 @@ function opposite_active_leaves(grid::CartesianGrid, cell::Integer, axis::Intege
   return leaves
 end
 
+function opposite_active_leaves(snapshot::GridSnapshot, cell::Integer, axis::Integer, side::Integer)
+  _require_current_snapshot(snapshot)
+  grid_data = grid(snapshot)
+  checked_cell = _checked_cell(grid_data, cell)
+  checked_axis = _checked_axis(grid_data, axis)
+  checked_side = _checked_side(side)
+  tree_lookup = _snapshot_tree_cell_lookup(grid_data, snapshot.active_leaves)
+  return _snapshot_opposite_active_leaves(grid_data, tree_lookup, snapshot.leaf_to_index,
+                                          checked_cell, checked_axis, checked_side)
+end
+
+function boundary_face_count(snapshot::GridSnapshot)
+  return length(_require_current_snapshot(snapshot).boundary_leaf)
+end
+
+function interface_count(snapshot::GridSnapshot)
+  return length(_require_current_snapshot(snapshot).interface_minus)
+end
+
+function boundary_face_spec(snapshot::GridSnapshot, index::Integer)
+  _require_current_snapshot(snapshot)
+  count = boundary_face_count(snapshot)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "boundary face")
+  checked_index = Int(index)
+  return GridBoundaryFace(@inbounds(snapshot.boundary_leaf[checked_index]),
+                          Int(@inbounds(snapshot.boundary_axis[checked_index])),
+                          Int(@inbounds(snapshot.boundary_side[checked_index])))
+end
+
+function interface_spec(snapshot::GridSnapshot, index::Integer)
+  _require_current_snapshot(snapshot)
+  count = interface_count(snapshot)
+  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "interface")
+  checked_index = Int(index)
+  return GridInterface(@inbounds(snapshot.interface_minus[checked_index]),
+                       Int(@inbounds(snapshot.interface_axis[checked_index])),
+                       @inbounds(snapshot.interface_plus[checked_index]))
+end
+
 # Copying and validation.
 
 # Copying a grid duplicates the topology arrays while preserving the logical
@@ -607,10 +1015,7 @@ function Base.copy(grid::CartesianGrid{D}) where {D}
   return CartesianGrid{D}(grid.root_counts, ntuple(axis -> copy(grid.levels[axis]), D),
                           ntuple(axis -> copy(grid.coords[axis]), D), copy(grid.parent),
                           copy(grid.first_child), copy(grid.split_axis), copy(grid.active),
-                          copy(grid.active_leaves),
-                          ntuple(axis -> copy(grid.neighbor_lower[axis]), D),
-                          ntuple(axis -> copy(grid.neighbor_upper[axis]), D), grid.periodic,
-                          grid.revision)
+                          copy(grid.active_leaves), grid.periodic, grid.revision)
 end
 
 """
@@ -620,15 +1025,15 @@ Validate the internal consistency of a `CartesianGrid`.
 
 This routine checks that the topology arrays have matching sizes, that every
 stored cell satisfies the refinement-tree invariants, that the explicit
-`active_leaves` list agrees with the `active` bit vector, and that the stored
-same-level neighbor tables match the logical tree description.
+`active_leaves` list agrees with the `active` bit vector, and that live tree
+cells have unique logical signatures.
 
 It is mainly a debugging, testing, and constructor-validation tool. Public
 constructors and topology copies already call it automatically.
 """
 # Internal consistency check for the complete topological state. Constructors and
 # tests use this to ensure that the refinement arrays, active-leaf list, and
-# direct-neighbor tables all encode the same tree.
+# logical tree structure are internally consistent.
 function check_topology(grid::CartesianGrid)
   stored = stored_cell_count(grid)
   all(count >= 1 for count in grid.root_counts) ||
@@ -641,10 +1046,6 @@ function check_topology(grid::CartesianGrid)
   for axis in 1:dimension(grid)
     length(grid.levels[axis]) == stored || throw(ArgumentError("level array length mismatch"))
     length(grid.coords[axis]) == stored || throw(ArgumentError("coordinate array length mismatch"))
-    length(grid.neighbor_lower[axis]) == stored ||
-      throw(ArgumentError("neighbor array length mismatch"))
-    length(grid.neighbor_upper[axis]) == stored ||
-      throw(ArgumentError("neighbor array length mismatch"))
   end
 
   computed_active = Int[]
@@ -656,7 +1057,7 @@ function check_topology(grid::CartesianGrid)
 
   computed_active == grid.active_leaves || throw(ArgumentError("active-leaf list is inconsistent"))
   _check_live_tree_structure!(grid)
-  _check_direct_neighbor_tables!(grid)
+  _tree_cell_lookup(grid)
   return nothing
 end
 
@@ -664,7 +1065,7 @@ end
 
 # Append storage for a new binary child block. The block is initialized as two
 # active leaves with empty topology links; the caller is responsible for filling
-# in the actual parent, level, coordinate, and neighbor information.
+# in the actual parent, level, and coordinate information.
 function _append_child_block!(grid::CartesianGrid{D}) where {D}
   first = stored_cell_count(grid) + 1
 
@@ -677,8 +1078,6 @@ function _append_child_block!(grid::CartesianGrid{D}) where {D}
     for axis in 1:D
       push!(grid.levels[axis], 0)
       push!(grid.coords[axis], 0)
-      push!(grid.neighbor_lower[axis], NONE)
-      push!(grid.neighbor_upper[axis], NONE)
     end
   end
 
@@ -699,42 +1098,7 @@ function _rebuild_active_leaves!(grid::CartesianGrid)
   return grid
 end
 
-# Rebuild same-level direct-neighbor tables for all live tree cells. The tables
-# do not try to resolve hanging faces directly; instead they store exact
-# same-level neighbors, and higher-level routines recover coverings and active
-# face decompositions from those data.
-function _rebuild_direct_neighbors!(grid::CartesianGrid{D}) where {D}
-  stored = stored_cell_count(grid)
-
-  for cell in 1:stored
-    @inbounds for axis in 1:D
-      grid.neighbor_lower[axis][cell] = NONE
-      grid.neighbor_upper[axis][cell] = NONE
-    end
-  end
-
-  lookup = _tree_cell_lookup(grid)
-
-  for cell in 1:stored
-    _is_tree_cell(grid, cell) || continue
-    cell_level = _level_tuple(grid, cell)
-    cell_coord = _logical_coordinate_tuple(grid, cell)
-
-    @inbounds for axis in 1:D
-      lower, upper = _expected_direct_neighbors(grid, lookup, cell_level, cell_coord, axis)
-      grid.neighbor_lower[axis][cell] = lower
-      grid.neighbor_upper[axis][cell] = upper
-    end
-  end
-
-  return grid
-end
-
 # Geometric comparison helpers on the logical lattice.
-
-function _neighbor_array(grid::CartesianGrid, side::Int)
-  return side == LOWER ? grid.neighbor_lower : grid.neighbor_upper
-end
 
 # Scale interval endpoints to a common finest level so cells with different
 # refinement levels can be compared on one integer lattice without roundoff.
@@ -893,32 +1257,243 @@ function _check_live_tree_structure!(grid::CartesianGrid)
   return nothing
 end
 
-# Recompute what the same-level direct-neighbor tables should contain from the
-# logical tree description alone, then compare that result with the stored
-# tables. This detects inconsistent rebuilds or invalid copied topologies.
-function _check_direct_neighbor_tables!(grid::CartesianGrid{D}) where {D}
-  lookup = _tree_cell_lookup(grid)
+function _require_current_snapshot(snapshot::GridSnapshot)
+  snapshot.generation == revision(grid(snapshot)) ||
+    throw(ArgumentError("grid snapshot has been invalidated by a topology generation change"))
+  return snapshot
+end
 
-  for cell in 1:stored_cell_count(grid)
-    for axis in 1:D
-      expected_lower, expected_upper = _is_tree_cell(grid, cell) ?
-                                       _expected_direct_neighbors(grid, lookup, cell, axis) :
-                                       (NONE, NONE)
+function _snapshot_leaf_lookup(grid::CartesianGrid, active::AbstractVector{<:Integer})
+  lookup = zeros(Int, stored_cell_count(grid))
 
-      grid.neighbor_lower[axis][cell] == expected_lower ||
-        throw(ArgumentError("lower neighbor table is inconsistent"))
-      grid.neighbor_upper[axis][cell] == expected_upper ||
-        throw(ArgumentError("upper neighbor table is inconsistent"))
+  for index in eachindex(active)
+    leaf = _checked_cell(grid, active[index])
+    lookup[leaf] == 0 || throw(ArgumentError("snapshot active leaves must be unique"))
+    lookup[leaf] = index
+  end
+
+  return lookup
+end
+
+function _snapshot_axis_byte(axis::Int)
+  axis <= typemax(UInt8) || throw(ArgumentError("snapshot axis must be UInt8-representable"))
+  return UInt8(axis)
+end
+
+_snapshot_side_byte(side::Int) = UInt8(_checked_side(side))
+
+function _snapshot_boundary_data(grid::CartesianGrid{D},
+                                 active::AbstractVector{<:Integer}) where {D}
+  tree_lookup = _snapshot_tree_cell_lookup(grid, active)
+  boundary_leaf = Int[]
+  boundary_axis = UInt8[]
+  boundary_side = UInt8[]
+  sizehint!(boundary_leaf, length(active) * D)
+  sizehint!(boundary_axis, length(active) * D)
+  sizehint!(boundary_side, length(active) * D)
+
+  for leaf in active, axis in 1:D, side in (LOWER, UPPER)
+    _snapshot_covering_neighbor(grid, tree_lookup, Int(leaf), axis, side) == NONE || continue
+    push!(boundary_leaf, Int(leaf))
+    push!(boundary_axis, _snapshot_axis_byte(axis))
+    push!(boundary_side, _snapshot_side_byte(side))
+  end
+
+  return boundary_leaf, boundary_axis, boundary_side
+end
+
+function _snapshot_interface_data(grid::CartesianGrid{D}, active::AbstractVector{<:Integer},
+                                  leaf_to_index::AbstractVector{<:Integer}) where {D}
+  tree_lookup = _snapshot_tree_cell_lookup(grid, active)
+  interface_minus = Int[]
+  interface_plus = Int[]
+  interface_axis = UInt8[]
+  sizehint!(interface_minus, length(active) * D)
+  sizehint!(interface_plus, length(active) * D)
+  sizehint!(interface_axis, length(active) * D)
+
+  for leaf in active, axis in 1:D
+    for other in
+        _snapshot_opposite_active_leaves(grid, tree_lookup, leaf_to_index, Int(leaf), axis, UPPER)
+      push!(interface_minus, Int(leaf))
+      push!(interface_plus, other)
+      push!(interface_axis, _snapshot_axis_byte(axis))
     end
   end
 
+  return interface_minus, interface_plus, interface_axis
+end
+
+function _snapshot_tree_cell_lookup(grid::CartesianGrid{D},
+                                    active::AbstractVector{<:Integer}) where {D}
+  lookup = Dict{Tuple{NTuple{D,Int},NTuple{D,Int}},Int}()
+
+  for leaf in active
+    current = _checked_cell(grid, leaf)
+
+    while current != NONE
+      signature = (_level_tuple(grid, current), _logical_coordinate_tuple(grid, current))
+      stored = get(lookup, signature, NONE)
+      stored == NONE ||
+        stored == current ||
+        throw(ArgumentError("snapshot tree cells must have unique logical signatures"))
+      lookup[signature] = current
+      current = _parent(grid, current)
+    end
+  end
+
+  return lookup
+end
+
+function _snapshot_direct_neighbor(grid::CartesianGrid{D}, tree_lookup, cell::Int,
+                                   axis::Int) where {D}
+  return _expected_direct_neighbors(grid, tree_lookup, _level_tuple(grid, cell),
+                                    _logical_coordinate_tuple(grid, cell), axis)
+end
+
+function _snapshot_covering_neighbor(grid::CartesianGrid, tree_lookup, current::Int, axis::Int,
+                                     side::Int)
+  while true
+    lower, upper = _snapshot_direct_neighbor(grid, tree_lookup, current, axis)
+    candidate = side == LOWER ? lower : upper
+    candidate != NONE && return candidate
+    current_parent = _parent(grid, current)
+    current_parent == NONE && return NONE
+    _snapshot_touches_parent_boundary(grid, current, axis, side) || return NONE
+    current = current_parent
+  end
+end
+
+function _snapshot_opposite_active_leaves(grid::CartesianGrid{D}, tree_lookup,
+                                          leaf_to_index::AbstractVector{<:Integer}, cell::Int,
+                                          axis::Int, side::Int) where {D}
+  candidate = _snapshot_covering_neighbor(grid, tree_lookup, cell, axis, side)
+  candidate == NONE && return Int[]
+  leaves = Int[]
+  _collect_snapshot_opposite_active_leaves!(leaves, grid, tree_lookup, leaf_to_index, cell, axis,
+                                            side, candidate)
+  isempty(leaves) && return leaves
+  comparison_levels = [maximum(_level(grid, leaf, current_axis)
+                               for leaf in Iterators.flatten(((cell,), leaves)))
+                       for current_axis in 1:D]
+  sort!(leaves;
+        by=leaf -> ntuple(current_axis -> current_axis == axis ? 0 :
+                                          _scaled_lower_coordinate(grid, leaf, current_axis,
+                                                                   comparison_levels[current_axis]),
+                          D))
+  return leaves
+end
+
+function _collect_snapshot_opposite_active_leaves!(leaves::Vector{Int}, grid::CartesianGrid,
+                                                   tree_lookup,
+                                                   leaf_to_index::AbstractVector{<:Integer},
+                                                   source::Int, axis::Int, side::Int,
+                                                   candidate::Int)
+  _tangential_intervals_overlap(grid, source, candidate, axis) || return leaves
+
+  if candidate <= length(leaf_to_index) && @inbounds(leaf_to_index[candidate] != 0)
+    push!(leaves, candidate)
+    return leaves
+  end
+
+  split = _structural_split_axis(grid, candidate)
+  split == 0 && return leaves
+  first = _first_child(grid, candidate)
+
+  if split == axis
+    child = first + (side == LOWER ? 1 : 0)
+    _snapshot_cell_in_tree(grid, tree_lookup, child) ||
+      throw(ArgumentError("snapshot tree is missing an active face child"))
+    _collect_snapshot_opposite_active_leaves!(leaves, grid, tree_lookup, leaf_to_index, source,
+                                              axis, side, child)
+    return leaves
+  end
+
+  for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
+    _snapshot_cell_in_tree(grid, tree_lookup, child) || continue
+    _collect_snapshot_opposite_active_leaves!(leaves, grid, tree_lookup, leaf_to_index, source,
+                                              axis, side, child)
+  end
+
+  return leaves
+end
+
+function _snapshot_cell_in_tree(grid::CartesianGrid, tree_lookup, cell::Int)
+  signature = (_level_tuple(grid, cell), _logical_coordinate_tuple(grid, cell))
+  return get(tree_lookup, signature, NONE) == cell
+end
+
+function _structural_split_axis(grid::CartesianGrid, cell::Int)
+  split = _split_axis(grid, cell)
+  split != 0 && return split
+  first = _first_child(grid, cell)
+  first == NONE && return 0
+  child = first
+  for axis in 1:dimension(grid)
+    if _level(grid, child, axis) == _level(grid, cell, axis) + 1
+      return axis
+    end
+  end
+  return 0
+end
+
+function _snapshot_touches_parent_boundary(grid::CartesianGrid, cell::Int, axis::Int, side::Int)
+  parent_cell = _parent(grid, cell)
+  parent_cell == NONE && return false
+  split = _structural_split_axis(grid, parent_cell)
+  split != axis && return true
+  return (_logical_coordinate(grid, cell, axis) & 1) == _side_bit(side)
+end
+
+function _check_snapshot_boundary_data(snapshot::GridSnapshot)
+  lengths = (length(snapshot.boundary_leaf), length(snapshot.boundary_axis),
+             length(snapshot.boundary_side))
+  all(length == first(lengths) for length in lengths) ||
+    throw(ArgumentError("snapshot boundary arrays must have matching lengths"))
+  expected_leaf, expected_axis, expected_side = _snapshot_boundary_data(grid(snapshot),
+                                                                        snapshot.active_leaves)
+  snapshot.boundary_leaf == expected_leaf ||
+    throw(ArgumentError("snapshot boundary leaves are inconsistent"))
+  snapshot.boundary_axis == expected_axis ||
+    throw(ArgumentError("snapshot boundary axes are inconsistent"))
+  snapshot.boundary_side == expected_side ||
+    throw(ArgumentError("snapshot boundary sides are inconsistent"))
   return nothing
+end
+
+function _check_snapshot_interface_data(snapshot::GridSnapshot)
+  lengths = (length(snapshot.interface_minus), length(snapshot.interface_plus),
+             length(snapshot.interface_axis))
+  all(length == first(lengths) for length in lengths) ||
+    throw(ArgumentError("snapshot interface arrays must have matching lengths"))
+  expected_minus, expected_plus, expected_axis = _snapshot_interface_data(grid(snapshot),
+                                                                          snapshot.active_leaves,
+                                                                          snapshot.leaf_to_index)
+  snapshot.interface_minus == expected_minus ||
+    throw(ArgumentError("snapshot interface minus leaves are inconsistent"))
+  snapshot.interface_plus == expected_plus ||
+    throw(ArgumentError("snapshot interface plus leaves are inconsistent"))
+  snapshot.interface_axis == expected_axis ||
+    throw(ArgumentError("snapshot interface axes are inconsistent"))
+  return nothing
+end
+
+function _snapshot_has_active_descendant(snapshot::GridSnapshot, cell::Int)
+  _is_active_leaf(snapshot, cell) && return false
+  first = _first_child(grid(snapshot), cell)
+  first == NONE && return false
+
+  for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
+    (_is_active_leaf(snapshot, child) || _snapshot_has_active_descendant(snapshot, child)) &&
+      return true
+  end
+
+  return false
 end
 
 # Tree cells are uniquely identified by their per-axis levels and logical
 # coordinates, so a dictionary on `(level, coordinate)` is enough to recover
-# same-level neighbors after arbitrary refinement updates or to validate stored
-# neighbor tables against the logical tree description.
+# same-level neighbors after arbitrary refinement updates.
 function _tree_cell_lookup(grid::CartesianGrid{D}) where {D}
   lookup = Dict{Tuple{NTuple{D,Int},NTuple{D,Int}},Int}()
 
@@ -947,6 +1522,16 @@ end
 function _expected_direct_neighbors(grid::CartesianGrid{D}, lookup, cell::Int, axis::Int) where {D}
   return _expected_direct_neighbors(grid, lookup, _level_tuple(grid, cell),
                                     _logical_coordinate_tuple(grid, cell), axis)
+end
+
+function _neighbor(grid::CartesianGrid, cell::Int, axis::Int, side::Int)
+  return _neighbor(grid, _tree_cell_lookup(grid), cell, axis, side)
+end
+
+function _neighbor(grid::CartesianGrid, lookup, cell::Int, axis::Int, side::Int)
+  _is_tree_cell(grid, cell) || return NONE
+  lower, upper = _expected_direct_neighbors(grid, lookup, cell, axis)
+  return side == LOWER ? lower : upper
 end
 
 function _filtered_upper_face_neighbor_specs(grid::CartesianGrid{D},

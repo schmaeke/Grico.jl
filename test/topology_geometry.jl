@@ -10,7 +10,6 @@ function _topology_access_allocation(grid)
     leaf = Grico.active_leaf(grid, index)
     value += Grico.level(grid, leaf, 1)
     value += Grico.logical_coordinate(grid, leaf, 1)
-    value += Grico.neighbor(grid, leaf, 1, Grico.UPPER)
   end
 
   return value
@@ -22,6 +21,28 @@ function _geometry_access_allocation(physical, geometry, grid, cell, reference)
   value += Grico.jacobian_determinant_from_biunit_cube(geometry, grid, cell)
   Grico.map_from_biunit_cube!(physical, geometry, grid, cell, reference)
   return value + physical[1]
+end
+
+function _snapshot_boundary_specs(snapshot)
+  specs = Set{Tuple{Int,Int,Int}}()
+
+  for index in 1:Grico.boundary_face_count(snapshot)
+    spec = Grico.boundary_face_spec(snapshot, index)
+    push!(specs, (spec.leaf, spec.axis, spec.side))
+  end
+
+  return specs
+end
+
+function _snapshot_interface_specs(snapshot)
+  specs = Set{Tuple{Int,Int,Int}}()
+
+  for index in 1:Grico.interface_count(snapshot)
+    spec = Grico.interface_spec(snapshot, index)
+    push!(specs, (spec.minus, spec.axis, spec.plus))
+  end
+
+  return specs
 end
 
 @testset "Cartesian Grid" begin
@@ -146,28 +167,136 @@ end
   @test Grico.opposite_active_leaves(three_dimensional, 1, 1, Grico.UPPER) == [5, 6, 7, 8]
 end
 
+@testset "Grid Snapshots" begin
+  grid = Grico.CartesianGrid((2, 1))
+  grid_snapshot = Grico.snapshot(grid)
+  @test grid_snapshot isa Grico.GridSnapshot{2}
+  @test Grico.grid(grid_snapshot) === grid
+  @test Grico.dimension(grid_snapshot) == 2
+  @test grid_snapshot.generation == Grico.revision(grid)
+  @test Grico.active_leaf_count(grid_snapshot) == 2
+  @test Grico.active_leaves(grid_snapshot) == [1, 2]
+  @test Grico.active_leaf(grid_snapshot, 2) == 2
+  @test Grico.is_active_leaf(grid_snapshot, 1)
+  @test !Grico.is_expanded(grid_snapshot, 1)
+  @test Grico.check_snapshot(grid_snapshot) === nothing
+
+  expected_boundary = Set([(1, 1, Grico.LOWER), (1, 2, Grico.LOWER), (1, 2, Grico.UPPER),
+                           (2, 1, Grico.UPPER), (2, 2, Grico.LOWER), (2, 2, Grico.UPPER)])
+  @test Grico.boundary_face_count(grid_snapshot) == length(expected_boundary)
+  @test _snapshot_boundary_specs(grid_snapshot) == expected_boundary
+  @test Grico.interface_count(grid_snapshot) == 1
+  @test _snapshot_interface_specs(grid_snapshot) == Set([(1, 1, 2)])
+
+  periodic = Grico.CartesianGrid((2, 1); periodic=(true, false))
+  periodic_snapshot = Grico.snapshot(periodic)
+  @test Grico.check_snapshot(periodic_snapshot) === nothing
+  @test _snapshot_boundary_specs(periodic_snapshot) ==
+        Set([(1, 2, Grico.LOWER), (1, 2, Grico.UPPER), (2, 2, Grico.LOWER), (2, 2, Grico.UPPER)])
+  @test _snapshot_interface_specs(periodic_snapshot) == Set([(1, 1, 2), (2, 1, 1)])
+
+  self_periodic = Grico.CartesianGrid((1,); periodic=true)
+  self_periodic_snapshot = Grico.snapshot(self_periodic)
+  @test Grico.boundary_face_count(self_periodic_snapshot) == 0
+  @test _snapshot_interface_specs(self_periodic_snapshot) == Set([(1, 1, 1)])
+
+  morton_grid = Grico.CartesianGrid((2,))
+  Grico.refine!(morton_grid, 2, 1)
+  Grico.refine!(morton_grid, 1, 1)
+  morton_snapshot = Grico.snapshot(morton_grid)
+  @test Grico.active_leaves(morton_grid) == [3, 4, 5, 6]
+  @test Grico.active_leaves(morton_snapshot) == [5, 6, 3, 4]
+  @test [Grico.logical_coordinate(morton_grid, leaf, 1)
+         for leaf in Grico.active_leaves(morton_snapshot)] == [0, 1, 2, 3]
+  @test Grico.check_snapshot(morton_snapshot) === nothing
+
+  refined = Grico.CartesianGrid((1,))
+  stale_snapshot = Grico.snapshot(refined)
+  first = Grico.refine!(refined, 1, 1)
+  @test first == 2
+  @test_throws ArgumentError Grico.check_snapshot(stale_snapshot)
+  @test_throws ArgumentError Grico.active_leaf_count(stale_snapshot)
+  @test_throws ArgumentError Grico.boundary_face_count(stale_snapshot)
+
+  refined_snapshot = Grico.snapshot(refined)
+  @test Grico.active_leaves(refined_snapshot) == [2, 3]
+  @test Grico.is_expanded(refined_snapshot, 1)
+  @test !Grico.is_active_leaf(refined_snapshot, 1)
+  @test Grico.check_snapshot(refined_snapshot) === nothing
+
+  append_only = Grico.CartesianGrid((1, 1))
+  source_snapshot = Grico.snapshot(append_only)
+  source_generation = Grico.revision(append_only)
+  target_snapshot, children = Grico._refine_snapshot_leaf!(source_snapshot, 1, (true, false))
+  @test children == [2, 3]
+  @test Grico.revision(append_only) == source_generation
+  @test Grico.stored_cell_count(append_only) == 3
+  @test Grico.active_leaves(source_snapshot) == [1]
+  @test Grico.check_snapshot(source_snapshot) === nothing
+  @test Grico.active_leaves(target_snapshot) == [2, 3]
+  @test Grico.is_expanded(target_snapshot, 1)
+
+  coarsened_snapshot, coarsened_children = Grico._derefine_snapshot_cell(target_snapshot, 1, 1)
+  @test coarsened_children == (2, 3)
+  @test Grico.revision(append_only) == source_generation
+  @test Grico.active_leaves(coarsened_snapshot) == [1]
+  @test Grico.check_snapshot(target_snapshot) === nothing
+  @test Grico.check_snapshot(coarsened_snapshot) === nothing
+
+  tuple_refined_snapshot, tuple_children = Grico._refine_snapshot_leaf!(coarsened_snapshot, 1,
+                                                                        (true, true))
+  @test length(tuple_children) == 4
+  @test Grico.active_leaves(tuple_refined_snapshot) == [4, 6, 5, 7]
+  @test Set(Grico.active_leaves(tuple_refined_snapshot)) == Set(tuple_children)
+  @test all(leaf -> Grico.level(append_only, leaf) == (1, 1), tuple_children)
+  @test Grico.check_snapshot(coarsened_snapshot) === nothing
+  @test Grico.check_snapshot(tuple_refined_snapshot) === nothing
+
+  append_domain = Grico.Domain(append_only, Grico.Geometry((0.0, 0.0), (1.0, 1.0)))
+  compact_source_domain, compact_source_snapshot, source_old_to_new = Grico.compact(append_domain,
+                                                                                    source_snapshot)
+  compact_source_grid = Grico.grid(compact_source_domain)
+  @test Grico.stored_cell_count(compact_source_grid) == 1
+  @test Grico.active_leaves(compact_source_snapshot) == [1]
+  @test source_old_to_new[1] == 1
+  @test all(iszero, source_old_to_new[2:end])
+  @test Grico.check_snapshot(source_snapshot) === nothing
+  @test Grico.check_snapshot(compact_source_snapshot) === nothing
+
+  compact_target_domain, compact_target_snapshot, target_old_to_new = Grico.compact(append_domain,
+                                                                                    target_snapshot)
+  compact_target_grid = Grico.grid(compact_target_domain)
+  @test Grico.stored_cell_count(compact_target_grid) == 3
+  @test Grico.active_leaves(compact_target_snapshot) == [2, 3]
+  @test target_old_to_new[1:3] == [1, 2, 3]
+  @test all(iszero, target_old_to_new[4:end])
+  @test Grico.check_topology(compact_target_grid) === nothing
+  @test Grico.check_snapshot(target_snapshot) === nothing
+  @test Grico.check_snapshot(compact_target_snapshot) === nothing
+
+  destructive = Grico.CartesianGrid((1,))
+  destructive_source = Grico.snapshot(destructive)
+  destructive_refined, _ = Grico._refine_snapshot_leaf!(destructive_source, 1, (true,))
+  destructive_coarsened, _ = Grico._derefine_snapshot_cell(destructive_refined, 1, 1)
+  @test Grico.stored_cell_count(destructive) == 3
+  compacted_snapshot, destructive_old_to_new = Grico.compact!(destructive, destructive_coarsened)
+  @test Grico.stored_cell_count(destructive) == 1
+  @test Grico.active_leaves(destructive) == [1]
+  @test Grico.active_leaves(compacted_snapshot) == [1]
+  @test destructive_old_to_new == [1, 0, 0]
+  @test Grico.check_snapshot(compacted_snapshot) === nothing
+  @test_throws ArgumentError Grico.check_snapshot(destructive_source)
+  @test_throws ArgumentError Grico.check_snapshot(destructive_refined)
+  @test_throws ArgumentError Grico.check_snapshot(destructive_coarsened)
+  @test_throws ArgumentError Grico.compact!(Grico.CartesianGrid((1,)), compacted_snapshot)
+end
+
 @testset "Topology Validation" begin
   @test_throws ArgumentError Grico.CartesianGrid((0,))
   @test_throws ArgumentError Grico.CartesianGrid((typemax(Int), 2))
   @test Grico.root_cell_counts(Grico.CartesianGrid((1, big(2)))) == (1, 2)
 
   grid = Grico.CartesianGrid((1,))
-  levels = ntuple(axis -> copy(grid.levels[axis]), 1)
-  coords = ntuple(axis -> copy(grid.coords[axis]), 1)
-  neighbor_lower = ntuple(axis -> copy(grid.neighbor_lower[axis]), 1)
-  neighbor_upper = ntuple(axis -> copy(grid.neighbor_upper[axis]), 1)
-  neighbor_upper[1][1] = 1
-  @test_throws ArgumentError Grico.CartesianGrid{1}(grid.root_counts, levels, coords,
-                                                    copy(grid.parent), copy(grid.first_child),
-                                                    copy(grid.split_axis), copy(grid.active),
-                                                    copy(grid.active_leaves), neighbor_lower,
-                                                    neighbor_upper, grid.revision)
-
-  broken_grid = copy(grid)
-  broken_grid.neighbor_upper[1][1] = 1
-  geometry = Grico.Geometry((0.0,), (1.0,))
-  @test_throws ArgumentError Grico.Domain{1,Float64}(broken_grid, geometry)
-
   @test_throws ArgumentError Grico.neighbor(grid, 1, 2, Grico.LOWER)
   @test_throws ArgumentError Grico.neighbor(grid, 1, 1, 0)
   @test_throws ArgumentError Grico.neighbor(grid, 1, 1, big(typemax(Int)) + 1)
@@ -197,11 +326,8 @@ end
                                                     copy(frontier.parent),
                                                     copy(frontier.first_child),
                                                     copy(frontier.split_axis), frontier_active,
-                                                    [1, first],
-                                                    ntuple(axis -> copy(frontier.neighbor_lower[axis]),
-                                                           1),
-                                                    ntuple(axis -> copy(frontier.neighbor_upper[axis]),
-                                                           1), frontier.periodic, frontier.revision)
+                                                    [1, first], frontier.periodic,
+                                                    frontier.revision)
 
   childless = Grico.CartesianGrid((1,))
   childless_active = copy(childless.active)
@@ -215,16 +341,11 @@ end
                                                     ntuple(axis -> copy(childless.coords[axis]), 1),
                                                     copy(childless.parent), childless_first_child,
                                                     childless_split_axis, childless_active, Int[],
-                                                    ntuple(axis -> copy(childless.neighbor_lower[axis]),
-                                                           1),
-                                                    ntuple(axis -> copy(childless.neighbor_upper[axis]),
-                                                           1), childless.periodic,
-                                                    childless.revision)
+                                                    childless.periodic, childless.revision)
 
   duplicate = Grico.CartesianGrid((2,))
   duplicate_coords = (copy(duplicate.coords[1]),)
   duplicate_coords[1][2] = 0
-  duplicate_neighbors = (fill(Grico.NONE, 2),)
   @test_throws ArgumentError Grico.CartesianGrid{1}(duplicate.root_counts,
                                                     ntuple(axis -> copy(duplicate.levels[axis]), 1),
                                                     duplicate_coords, copy(duplicate.parent),
@@ -232,7 +353,6 @@ end
                                                     copy(duplicate.split_axis),
                                                     copy(duplicate.active),
                                                     copy(duplicate.active_leaves),
-                                                    duplicate_neighbors, duplicate_neighbors,
                                                     duplicate.periodic, duplicate.revision)
 
   retained = Grico.CartesianGrid((1,))
@@ -244,11 +364,8 @@ end
                                                     copy(retained.parent), retained_first_child,
                                                     copy(retained.split_axis),
                                                     copy(retained.active),
-                                                    copy(retained.active_leaves),
-                                                    ntuple(axis -> copy(retained.neighbor_lower[axis]),
-                                                           1),
-                                                    ntuple(axis -> copy(retained.neighbor_upper[axis]),
-                                                           1), retained.periodic, retained.revision)
+                                                    copy(retained.active_leaves), retained.periodic,
+                                                    retained.revision)
 
   retained_parent = Grico.CartesianGrid((1,))
   retained_first = Grico.refine!(retained_parent, 1, 1)
@@ -264,10 +381,7 @@ end
                                                     copy(retained_parent.split_axis),
                                                     copy(retained_parent.active),
                                                     copy(retained_parent.active_leaves),
-                                                    ntuple(axis -> copy(retained_parent.neighbor_lower[axis]),
-                                                           1),
-                                                    ntuple(axis -> copy(retained_parent.neighbor_upper[axis]),
-                                                           1), retained_parent.periodic,
+                                                    retained_parent.periodic,
                                                     retained_parent.revision)
 
   corrupted = Grico.CartesianGrid((1,))

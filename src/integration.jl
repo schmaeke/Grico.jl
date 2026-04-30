@@ -1200,7 +1200,8 @@ end
 function _compile_cells(layout::FieldLayout{D,T},
                         overrides::AbstractDict{Int,<:AbstractQuadrature{D}}) where {D,
                                                                                      T<:AbstractFloat}
-  leaves = layout.slots[1].space.active_leaves
+  space = layout.slots[1].space
+  leaves = snapshot(space).active_leaves
   isempty(leaves) && return CellValues[]
   return _compile_item_collection(leaves) do leaf
     _compile_cell(layout, leaf, get(overrides, leaf, nothing))
@@ -1245,16 +1246,14 @@ end
 # therefore appear in the interface array rather than here.
 function _compile_boundary_faces(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
   space = layout.slots[1].space
-  specs = Tuple{Int,Int,Int}[]
-
-  for leaf in space.active_leaves, axis in 1:D, side in (LOWER, UPPER)
-    is_domain_boundary(grid(space), leaf, axis, side) || continue
-    push!(specs, (leaf, axis, side))
-  end
-
-  isempty(specs) && return FaceValues[]
-  return _compile_item_collection(specs) do spec
-    _compile_boundary_face(layout, spec...)
+  space_snapshot = snapshot(space)
+  count = boundary_face_count(space_snapshot)
+  count == 0 && return FaceValues[]
+  return _compile_item_collection(1:count) do face_index
+    leaf = @inbounds space_snapshot.boundary_leaf[face_index]
+    axis = Int(@inbounds space_snapshot.boundary_axis[face_index])
+    side = Int(@inbounds space_snapshot.boundary_side[face_index])
+    _compile_boundary_face(layout, leaf, axis, side)
   end
 end
 
@@ -1313,10 +1312,14 @@ end
 # traces.
 function _compile_interfaces(layout::FieldLayout{D,T}) where {D,T<:AbstractFloat}
   space = layout.slots[1].space
-  specs = _filtered_upper_face_neighbor_specs(grid(space), space.active_leaves, space.leaf_to_index)
-  isempty(specs) && return InterfaceValues[]
-  return _compile_item_collection(specs) do spec
-    _compile_interface(layout, spec...)
+  space_snapshot = snapshot(space)
+  count = interface_count(space_snapshot)
+  count == 0 && return InterfaceValues[]
+  return _compile_item_collection(1:count) do interface_index
+    minus_leaf = @inbounds space_snapshot.interface_minus[interface_index]
+    axis = Int(@inbounds space_snapshot.interface_axis[interface_index])
+    plus_leaf = @inbounds space_snapshot.interface_plus[interface_index]
+    _compile_interface(layout, minus_leaf, axis, plus_leaf)
   end
 end
 
@@ -1478,7 +1481,8 @@ function _cell_quadrature_overrides(layout::FieldLayout{D,T},
     end
 
     checked_leaf = _checked_cell(grid_data, leaf)
-    _checked_active_leaf_index(grid_data, space.leaf_to_index, checked_leaf, "cell quadrature")
+    _checked_active_leaf_index(grid_data, snapshot(space).leaf_to_index, checked_leaf,
+                               "cell quadrature")
     checked_leaf in explicit &&
       throw(ArgumentError("duplicate cell quadrature attachment for leaf $checked_leaf"))
     dimension(quadrature) == D ||
@@ -1496,7 +1500,8 @@ function _checked_surface_quadrature(space::HpSpace{D}, surface, dimension_count
     throw(ArgumentError("surface quadrature attachments must be SurfaceQuadrature instances"))
   dimension(surface.quadrature) == dimension_count ||
     throw(ArgumentError("surface quadrature dimension must match the problem dimension"))
-  _checked_active_leaf_index(grid(space), space.leaf_to_index, surface.leaf, "surface quadrature")
+  _checked_active_leaf_index(grid(space), snapshot(space).leaf_to_index, surface.leaf,
+                             "surface quadrature")
   _check_reference_quadrature(surface.quadrature)
   return surface
 end

@@ -93,6 +93,15 @@ using Grico
   @test Set(skeleton_cells["axis"]) == Set([1, 2])
   @test Set(skeleton_cells["leaf"]) == Set(active_leaves(grid(refined_domain)))
 
+  ordered_domain = Domain((0.0,), (2.0,), (2,))
+  refine!(grid(ordered_domain), 2, 1)
+  refine!(grid(ordered_domain), 1, 1)
+  ordered_space = HpSpace(ordered_domain, SpaceOptions(degree=UniformDegree(0), continuity=:dg))
+  ordered_field = ScalarField(ordered_space; name=:ordered)
+  ordered_state = State(FieldLayout((ordered_field,)), ones(scalar_dof_count(ordered_space)))
+  @test active_leaves(ordered_space) != active_leaves(grid(ordered_domain))
+  @test sample_postprocess(ordered_domain; state=ordered_state) isa SampledPostprocess
+
   @test_throws ArgumentError write_vtk("unloaded", domain)
   @test_throws ArgumentError write_pvd("unloaded.pvd", String[])
   @test_throws ArgumentError plot_field(sampled, :u)

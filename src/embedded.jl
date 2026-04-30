@@ -240,8 +240,8 @@ resolution tracks the local integration order of the space.
 function implicit_surface_quadrature(space::HpSpace{D,T}, leaf::Integer, classifier;
                                      subdivision_depth=2,
                                      surface_point_count=nothing) where {D,T<:AbstractFloat}
-  checked_leaf, leaf_index = _checked_active_leaf_index(grid(space), space.leaf_to_index, leaf,
-                                                        "embedded surface")
+  checked_leaf, leaf_index = _checked_active_leaf_index(grid(space), snapshot(space).leaf_to_index,
+                                                        leaf, "embedded surface")
   subdivision_depth isa Integer ||
     throw(ArgumentError("subdivision_depth must be a non-negative Int-representable integer"))
   point_count_value = if surface_point_count === nothing

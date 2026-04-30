@@ -239,9 +239,9 @@ Compile a dimension-independent high-order finite-element space on a Cartesian
 background or physical domain.
 
 `HpSpace` is the public compiled space object of the library. It stores the
-active leaves, the chosen basis family, the materialized degree and quadrature
-policies, the normalized per-axis continuity policy, and for each active leaf a
-sparse expansion of local tensor-product modes into global scalar degrees of
+grid snapshot, the chosen basis family, the materialized degree and quadrature
+policies, the normalized per-axis continuity policy, and for each snapshot leaf
+a sparse expansion of local tensor-product modes into global scalar degrees of
 freedom. The actual continuity algebra that produces these expansions is
 implemented in `continuity.jl`; this type exposes the compiled result in a form
 used by fields, integration, assembly, and adaptivity.
@@ -267,12 +267,11 @@ one compiled representation.
 struct HpSpace{D,T<:AbstractFloat,DO<:AbstractDomain{D,T},B<:AbstractBasisFamily,
                DG<:AbstractDegreePolicy,Q<:AbstractQuadraturePolicy,C<:_AbstractContinuityPolicy}
   domain::DO
+  grid_snapshot::GridSnapshot{D}
   basis::B
   degree_policy::DG
   quadrature_policy::Q
   continuity_policy::C
-  active_leaves::Vector{Int}
-  leaf_to_index::Vector{Int}
   compiled_leaves::Vector{_CompiledLeaf{D,T}}
   scalar_dof_count::Int
   global_quadrature_shape::NTuple{D,Int}
@@ -288,17 +287,27 @@ function HpSpace(domain::AbstractDomain{D,T},
                  options::SpaceOptions=SpaceOptions()) where {D,T<:AbstractFloat}
   compiled_domain = copy(domain)
   active = _domain_active_leaves(compiled_domain)
+  compiled_snapshot = _snapshot(grid(compiled_domain), active)
+  return _compile_snapshot_space(compiled_domain, compiled_snapshot, options)
+end
+
+function _compile_snapshot_space(compiled_domain::AbstractDomain{D,T},
+                                 compiled_snapshot::GridSnapshot{D},
+                                 options::SpaceOptions) where {D,T<:AbstractFloat}
+  _require_current_snapshot(compiled_snapshot)
+  grid(compiled_snapshot) === grid(compiled_domain) ||
+    throw(ArgumentError("space snapshot must reference the space domain grid"))
+  active = compiled_snapshot.active_leaves
   continuity_policy = _normalized_continuity_policy(options.continuity, Val(D))
   degree_policy = _space_degrees(compiled_domain, options.degree, active, continuity_policy)
-  active, leaf_to_index, compiled, scalar_dofs, global_quadrature_shape = _compile_space_data(compiled_domain,
-                                                                                              active,
-                                                                                              degree_policy.leaf_to_index,
-                                                                                              options.basis,
-                                                                                              degree_policy.data,
-                                                                                              continuity_policy,
-                                                                                              options.quadrature)
-  return HpSpace(compiled_domain, options.basis, degree_policy, options.quadrature,
-                 continuity_policy, active, leaf_to_index, compiled, scalar_dofs,
+  compiled, scalar_dofs, global_quadrature_shape = _compile_space_data(compiled_domain,
+                                                                       compiled_snapshot,
+                                                                       options.basis,
+                                                                       degree_policy.data,
+                                                                       continuity_policy,
+                                                                       options.quadrature)
+  return HpSpace(compiled_domain, compiled_snapshot, options.basis, degree_policy,
+                 options.quadrature, continuity_policy, compiled, scalar_dofs,
                  global_quadrature_shape)
 end
 
@@ -310,6 +319,14 @@ end
 dimension(space::HpSpace) = dimension(space.domain)
 domain(space::HpSpace) = space.domain
 grid(space::HpSpace) = grid(space.domain)
+
+"""
+    snapshot(space)
+
+Return the `GridSnapshot` that fixes the active mesh frontier used to compile
+`space`.
+"""
+snapshot(space::HpSpace) = space.grid_snapshot
 geometry(space::HpSpace) = geometry(space.domain)
 origin(space::HpSpace) = origin(space.domain)
 extent(space::HpSpace) = extent(space.domain)
@@ -378,7 +395,7 @@ plain background `Domain` this is the active frontier of the Cartesian grid. On
 a [`PhysicalDomain`](@ref) it is the physically active subset selected by the
 region after trimming fully fictitious background leaves.
 """
-active_leaf_count(space::HpSpace) = length(space.active_leaves)
+active_leaf_count(space::HpSpace) = active_leaf_count(snapshot(space))
 
 """
     active_leaves(space)
@@ -389,7 +406,7 @@ The returned ordering matches the compilation order of the stored local leaf
 data. In particular, the `i`-th entry corresponds to the `i`-th compiled leaf
 inside the space.
 """
-active_leaves(space::HpSpace) = copy(space.active_leaves)
+active_leaves(space::HpSpace) = active_leaves(snapshot(space))
 
 """
     active_leaf(space, index)
@@ -399,11 +416,7 @@ Return the `index`-th active leaf of `space`.
 This provides indexed access to the compilation order used by
 [`active_leaves`](@ref) and [`active_leaf_count`](@ref).
 """
-@inline function active_leaf(space::HpSpace, index::Integer)
-  count = active_leaf_count(space)
-  @boundscheck 1 <= index <= count || _throw_index_error(index, count, "active leaf")
-  return @inbounds space.active_leaves[Int(index)]
-end
+@inline active_leaf(space::HpSpace, index::Integer) = active_leaf(snapshot(space), index)
 
 """
     scalar_dof_count(space)
@@ -561,20 +574,18 @@ The same checks apply to continuous, discontinuous, and mixed spaces: only the
 structure of the stored local mode expansions differs.
 """
 function check_space(space::HpSpace{D}) where {D}
-  length(space.active_leaves) == length(space.compiled_leaves) ||
+  space_snapshot = snapshot(space)
+  check_snapshot(space_snapshot)
+  length(space_snapshot.active_leaves) == length(space.compiled_leaves) ||
     throw(ArgumentError("compiled leaf data must match the active-leaf list"))
-  stored_cell_count(grid(space)) == length(space.leaf_to_index) ||
-    throw(ArgumentError("leaf lookup length mismatch"))
-  space.active_leaves == _domain_active_leaves(space.domain) ||
-    throw(ArgumentError("space active leaves must match the domain active leaves"))
-  space.leaf_to_index == _active_leaf_lookup(grid(space), space.active_leaves) ||
-    throw(ArgumentError("leaf lookup does not match the active-leaf list"))
+  all(leaf -> _is_domain_active_leaf(space.domain, leaf), space_snapshot.active_leaves) ||
+    throw(ArgumentError("space active leaves must be active in the space domain"))
   space.scalar_dof_count >= 0 || throw(ArgumentError("scalar dof count must be non-negative"))
 
   used = falses(space.scalar_dof_count)
   expected_global_quadrature_shape = ntuple(_ -> 1, D)
 
-  for leaf_index in eachindex(space.active_leaves)
+  for leaf_index in eachindex(space_snapshot.active_leaves)
     quadrature_shape = _check_compiled_leaf!(space, leaf_index, used)
     expected_global_quadrature_shape = _merge_quadrature_shapes(expected_global_quadrature_shape,
                                                                 quadrature_shape)
@@ -627,7 +638,7 @@ function StoredDegrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy,
   return StoredDegrees(domain, active, degrees)
 end
 
-# Preserve the legacy "all active leaves" shorthand.
+# Convenience shorthand for materializing a policy on all domain-active leaves.
 function StoredDegrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy) where {D}
   return StoredDegrees(domain, policy, _domain_active_leaves(domain))
 end
@@ -665,7 +676,7 @@ function _space_degrees(domain::AbstractDomain{D}, policy::AbstractDegreePolicy,
 
   for index in eachindex(active)
     degrees[index] = _checked_space_degree_tuple(_leaf_degrees(policy, domain, active[index]),
-                                                 continuity_policy, "leaf_degrees[$index]")
+                                                 continuity_policy)
   end
 
   return StoredDegrees{D}(leaf_to_index, degrees)
@@ -692,25 +703,22 @@ end
 # produced together so the public constructor stays focused on wiring the final
 # immutable `HpSpace`. Algebraically, this is where a set of leaf-local modal
 # bases becomes one sparse global space description.
-function _compile_space_data(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                             leaf_to_index::Vector{Int}, basis::B,
+function _compile_space_data(domain::AbstractDomain{D,T}, grid_snapshot::GridSnapshot{D}, basis::B,
                              leaf_degrees::Vector{NTuple{D,Int}},
                              continuity_policy::_AxisContinuity{D},
                              quadrature_policy) where {D,T<:AbstractFloat,B<:AbstractBasisFamily}
-  state = _enumerate_space_modes(domain, active, leaf_to_index, basis, leaf_degrees,
-                                 continuity_policy)
+  state = _enumerate_space_modes(domain, grid_snapshot, basis, leaf_degrees, continuity_policy)
   _compile_face_coupling!(state, continuity_policy)
   compiled, global_quadrature_shape = _finalize_compiled_leaves(state, continuity_policy,
                                                                 quadrature_policy)
 
-  return active, leaf_to_index, compiled, state.next_global_dof - 1, global_quadrature_shape
+  return compiled, state.next_global_dof - 1, global_quadrature_shape
 end
 
 # Validation and small lookup helpers.
 
-# Active-leaf lookup tables are used both by stored degree policies and by the
-# compiled `HpSpace` itself. They map raw leaf ids to the active-leaf ordering
-# used by the stored vectors.
+# Active-leaf lookup tables are used by stored degree policies. Runtime spaces
+# now get their active lookup from the owning `GridSnapshot`.
 function _active_leaf_lookup(grid_data::CartesianGrid, active::AbstractVector{<:Integer})
   leaf_to_index = zeros(Int, stored_cell_count(grid_data))
 
@@ -747,6 +755,11 @@ function _checked_space_degree_tuple(degrees::NTuple{D,<:Integer},
                                               "$name[$axis]"), D)
 end
 
+function _checked_space_degree_tuple(degrees::NTuple{D,<:Integer},
+                                     continuity_policy::_AxisContinuity{D}) where {D}
+  return ntuple(axis -> _checked_space_degree(degrees[axis], continuity_policy, axis, "degree"), D)
+end
+
 # Public mode queries accept tuples of nonnegative integer mode indices. Wrong
 # tuple lengths or non-integer entries are semantic API errors; indices outside
 # the local degree box are left to the normal active-mode lookup, which reports
@@ -765,10 +778,11 @@ end
 
 # Validate one compiled leaf and mark all referenced global scalar dofs as used.
 function _check_compiled_leaf!(space::HpSpace, leaf_index::Int, used::BitVector)
-  leaf = space.active_leaves[leaf_index]
+  space_snapshot = snapshot(space)
+  leaf = space_snapshot.active_leaves[leaf_index]
   compiled = space.compiled_leaves[leaf_index]
   compiled.leaf == leaf || throw(ArgumentError("compiled leaf mismatch"))
-  space.leaf_to_index[leaf] == leaf_index || throw(ArgumentError("leaf lookup mismatch"))
+  space_snapshot.leaf_to_index[leaf] == leaf_index || throw(ArgumentError("leaf lookup mismatch"))
   compiled.degrees == space.degree_policy.data[leaf_index] ||
     throw(ArgumentError("compiled leaf degrees do not match stored degree data"))
   compiled.support_shape == ntuple(axis -> compiled.degrees[axis] + 1, dimension(space)) ||
@@ -866,7 +880,8 @@ end
 
 # Resolve one active leaf to its compiled leaf data.
 function _compiled_leaf(space::HpSpace, leaf::Integer)
-  _, leaf_index = _checked_active_leaf_index(grid(space), space.leaf_to_index, leaf, "space")
+  _, leaf_index = _checked_active_leaf_index(grid(space), snapshot(space).leaf_to_index, leaf,
+                                             "space")
   return @inbounds space.compiled_leaves[leaf_index]
 end
 

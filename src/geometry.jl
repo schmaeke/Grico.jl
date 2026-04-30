@@ -221,6 +221,25 @@ function Base.copy(domain::Domain{D,T}) where {D,T<:AbstractFloat}
   Domain(copy(domain.grid), domain.geometry)
 end
 
+"""
+    compact(domain, snapshot)
+
+Build a new domain whose grid keeps only the tree cells needed to represent
+`snapshot`.
+
+This is non-mutating: `domain`, its grid, and all snapshots of that grid remain
+valid. The returned tuple is `(compacted_domain, compacted_snapshot,
+old_to_new_cell)`, where `old_to_new_cell[old_cell]` is the corresponding cell
+id in the compacted grid or [`NONE`](@ref) if the old cell was pruned.
+"""
+function compact(domain::Domain{D,T}, active_snapshot::GridSnapshot{D}) where {D,T<:AbstractFloat}
+  grid(active_snapshot) === grid(domain) ||
+    throw(ArgumentError("snapshot must reference the domain grid"))
+  compact_snapshot, old_to_new = _compact_grid_snapshot(active_snapshot)
+  compact_domain = Domain(grid(compact_snapshot), geometry(domain))
+  return compact_domain, compact_snapshot, old_to_new
+end
+
 # Cell- and face-level metric queries.
 
 """

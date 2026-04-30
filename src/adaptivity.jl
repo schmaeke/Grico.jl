@@ -6,11 +6,11 @@
 # 4. translate those details into concrete `h`, `p`, or mixed `hp` changes.
 #
 # The guiding design choice is to keep "planning a new space" separate from
-# "building that space". An `AdaptivityPlan` therefore stores only a mutable
-# target domain and target per-leaf degree data, while the actual target
-# `HpSpace` is built later by [`transition`](@ref). This keeps interactive plan
-# editing cheap and postpones the more expensive continuity compilation to the
-# point where the target space is really needed.
+# "building that space". An `AdaptivityPlan` therefore stores a target snapshot
+# and target per-leaf degree data, while the actual target `HpSpace` is built
+# later by [`transition`](@ref). This keeps interactive plan editing cheap and
+# postpones the more expensive continuity compilation to the point where the
+# target space is really needed.
 #
 # Conceptually, the file contains four connected chapters.
 #
@@ -205,35 +205,22 @@ end
 # Collect the active leaves in the subtree rooted at `cell`. This is used both
 # for reporting source-to-target changes and for comparing source leaves with the
 # active descendants that replace them in a plan.
-function _collect_active_descendants!(leaves::Vector{Int}, grid_data::CartesianGrid, cell::Int)
-  is_tree_cell(grid_data, cell) || return leaves
+function _collect_active_descendants!(leaves::Vector{Int}, grid_snapshot::GridSnapshot, cell::Int)
+  is_tree_cell(grid_snapshot, cell) || return leaves
 
-  if is_active_leaf(grid_data, cell)
+  if is_active_leaf(grid_snapshot, cell)
     push!(leaves, cell)
     return leaves
   end
 
-  first = first_child(grid_data, cell)
+  first = first_child(grid(grid_snapshot), cell)
   first == NONE && return leaves
 
   for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
-    _collect_active_descendants!(leaves, grid_data, child)
+    _collect_active_descendants!(leaves, grid_snapshot, child)
   end
 
   return leaves
-end
-
-# Dense leaf-to-index lookup makes `cell_degrees(plan, leaf)` independent of the
-# current active-leaf ordering and avoids repeated dictionary allocations during
-# plan editing.
-function _target_leaf_lookup(grid_data::CartesianGrid, active::AbstractVector{<:Integer})
-  lookup = zeros(Int, stored_cell_count(grid_data))
-
-  for index in eachindex(active)
-    lookup[active[index]] = index
-  end
-
-  return lookup
 end
 
 # Adaptivity plans may only change refinement and degree data, not the physical
@@ -241,9 +228,9 @@ end
 # source and target domains describe the same physical box and periodic
 # topology, so state transfer can be defined by overlap on a common geometric
 # domain. For `PhysicalDomain`s the region test is intentionally object
-# identity: copied domains share one region object and therefore one
-# classification/quadrature cache, while independently constructed regions are
-# treated as distinct physical descriptions.
+# identity: spaces on the same physical description share one region object and
+# therefore one classification/quadrature cache, while independently constructed
+# regions are treated as distinct physical descriptions.
 function _same_adaptivity_geometry(source_domain::AbstractDomain, target_domain::AbstractDomain)
   root_cell_counts(grid(source_domain)) == root_cell_counts(grid(target_domain)) || return false
   origin(source_domain) == origin(target_domain) || return false
@@ -281,12 +268,13 @@ end
 Mutable target-space description for adaptive `h`/`p` refinement and
 derefinement.
 
-An `AdaptivityPlan` stores the tentative target domain and the target degree
-tuple on each active target leaf, but it does not immediately build the target
-`HpSpace`. This separation is important: repeated plan edits such as
-`request_h_refinement!` and `request_p_refinement!` only update grid topology
-and per-leaf degree metadata, while the expensive continuity compilation is
-deferred to [`transition`](@ref).
+An `AdaptivityPlan` stores the target domain, an immutable target
+`GridSnapshot`, and the target degree tuple on each snapshot leaf, but it does
+not immediately build the target `HpSpace`. This separation is important:
+repeated plan edits such as `request_h_refinement!` and `request_p_refinement!`
+append missing tree data, produce a new target snapshot, and update per-leaf
+degree metadata, while the expensive continuity compilation is deferred to
+[`transition`](@ref).
 
 The source space is immutable within the plan and serves as the reference
 configuration for summaries, indicator interpretation, and state transfer. The
@@ -299,24 +287,30 @@ be inherited later, and no transfer operators. Its purpose is to make target
 editing cheap.
 """
 mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:AbstractDomain{D,T},
-                              V<:Vector{NTuple{D,Int}},I<:Vector{Int},L<:AdaptivityLimits{D}}
+                              GS<:GridSnapshot{D},V<:Vector{NTuple{D,Int}},I<:Vector{Int},
+                              L<:AdaptivityLimits{D}}
   source_space::S
   target_domain::N
+  target_snapshot::GS
   target_degrees::V
   target_leaf_to_index::I
   limits::L
 
-  function AdaptivityPlan{D,T,S,N,V,I,L}(source_space::S, target_domain::N, target_degrees::V,
-                                         target_leaf_to_index::I,
-                                         limits::L) where {D,T<:AbstractFloat,S<:HpSpace{D,T},
-                                                           N<:AbstractDomain{D,T},
-                                                           V<:Vector{NTuple{D,Int}},I<:Vector{Int},
-                                                           L<:AdaptivityLimits{D}}
+  function AdaptivityPlan{D,T,S,N,GS,V,I,L}(source_space::S, target_domain::N, target_snapshot::GS,
+                                            target_degrees::V, target_leaf_to_index::I,
+                                            limits::L) where {D,T<:AbstractFloat,S<:HpSpace{D,T},
+                                                              N<:AbstractDomain{D,T},
+                                                              GS<:GridSnapshot{D},
+                                                              V<:Vector{NTuple{D,Int}},
+                                                              I<:Vector{Int},L<:AdaptivityLimits{D}}
     _same_adaptivity_geometry(domain(source_space), target_domain) ||
       throw(ArgumentError("target domain must share the source geometry and root cell counts"))
-    stored_cell_count(grid(target_domain)) == length(target_leaf_to_index) ||
-      throw(ArgumentError("target leaf lookup length must match the stored target-cell count"))
-    active = _domain_active_leaves(target_domain)
+    grid(target_snapshot) === grid(target_domain) ||
+      throw(ArgumentError("target snapshot must reference the target domain grid"))
+    _require_current_snapshot(target_snapshot)
+    target_leaf_to_index === target_snapshot.leaf_to_index ||
+      throw(ArgumentError("target leaf lookup must be owned by the target snapshot"))
+    active = target_snapshot.active_leaves
     length(target_degrees) == length(active) ||
       throw(ArgumentError("target degree data must match the active-leaf count"))
 
@@ -327,43 +321,47 @@ mutable struct AdaptivityPlan{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:AbstractDoma
       _check_target_leaf(grid(target_domain), leaf, target_degrees[index], limits)
     end
 
-    return new{D,T,S,N,V,I,L}(source_space, target_domain, target_degrees, target_leaf_to_index,
-                              limits)
+    return new{D,T,S,N,GS,V,I,L}(source_space, target_domain, target_snapshot, target_degrees,
+                                 target_leaf_to_index, limits)
   end
 end
 
 function AdaptivityPlan(source_space::HpSpace{D,T}, target_domain::AbstractDomain{D,T},
+                        target_snapshot::GridSnapshot{D},
                         target_degrees::AbstractVector{<:NTuple{D,<:Integer}};
                         limits::AdaptivityLimits{D}=AdaptivityLimits(source_space)) where {D,
                                                                                            T<:AbstractFloat}
   checked_limits = _checked_limits(limits, source_space)
-  active = _domain_active_leaves(target_domain)
+  active = target_snapshot.active_leaves
   length(target_degrees) == length(active) ||
     throw(ArgumentError("target degree data must match the active-leaf count"))
   checked = Vector{NTuple{D,Int}}(undef, length(target_degrees))
 
   for index in eachindex(target_degrees)
     checked[index] = _checked_space_degree_tuple(target_degrees[index],
-                                                 source_space.continuity_policy,
-                                                 "target_degrees[$index]")
+                                                 source_space.continuity_policy)
   end
 
-  lookup = _target_leaf_lookup(grid(target_domain), active)
+  lookup = target_snapshot.leaf_to_index
   for (index, leaf) in enumerate(active)
     _check_target_leaf(grid(target_domain), leaf, checked[index], checked_limits)
   end
 
-  return AdaptivityPlan{D,T,typeof(source_space),typeof(target_domain),typeof(checked),
-                        typeof(lookup),typeof(checked_limits)}(source_space, target_domain, checked,
-                                                               lookup, checked_limits)
+  return AdaptivityPlan{D,T,typeof(source_space),typeof(target_domain),typeof(target_snapshot),
+                        typeof(checked),typeof(lookup),typeof(checked_limits)}(source_space,
+                                                                               target_domain,
+                                                                               target_snapshot,
+                                                                               checked, lookup,
+                                                                               checked_limits)
 end
 
 function AdaptivityPlan(space::HpSpace{D,T};
                         limits::AdaptivityLimits{D}=AdaptivityLimits(space)) where {D,
                                                                                     T<:AbstractFloat}
-  target = copy(domain(space))
-  degrees = _inherited_target_degrees(space, target)
-  return AdaptivityPlan(space, target, degrees; limits=limits)
+  target = domain(space)
+  target_snapshot = snapshot(space)
+  degrees = _inherited_target_degrees(space, target_snapshot)
+  return AdaptivityPlan(space, target, target_snapshot, degrees; limits=limits)
 end
 
 dimension(plan::AdaptivityPlan) = dimension(plan.source_space)
@@ -378,17 +376,20 @@ source_space(plan::AdaptivityPlan) = plan.source_space
 """
     target_domain(plan)
     domain(plan)
+    target_snapshot(plan)
 
-Return the current target domain stored in `plan`.
+Return the target domain or active-frontier snapshot stored in `plan`.
 
-This domain carries the tentative `h`-adapted topology. The target polynomial
-degrees are stored separately in `plan.target_degrees`.
+The domain owns the shared append-only grid and physical geometry. The snapshot
+carries the tentative active `h`-adapted topology. The target polynomial degrees
+are stored separately in `plan.target_degrees`.
 """
 target_domain(plan::AdaptivityPlan) = plan.target_domain
 domain(plan::AdaptivityPlan) = plan.target_domain
+target_snapshot(plan::AdaptivityPlan) = plan.target_snapshot
 grid(plan::AdaptivityPlan) = grid(plan.target_domain)
 active_leaf_count(plan::AdaptivityPlan) = length(plan.target_degrees)
-active_leaves(plan::AdaptivityPlan) = _domain_active_leaves(plan.target_domain)
+active_leaves(plan::AdaptivityPlan) = active_leaves(plan.target_snapshot)
 
 # Check that `leaf` names one active target leaf in `plan`.
 function _checked_target_leaf(plan::AdaptivityPlan, leaf::Integer)
@@ -408,10 +409,10 @@ end
 
 # A plan is empty if it reproduces the source active leaves and degrees exactly.
 # This query intentionally compares against source-space leaf numbering rather
-# than against object identity of the stored domain copy.
+# than target object identity.
 function Base.isempty(plan::AdaptivityPlan)
   source = source_space(plan)
-  source_active = source.active_leaves
+  source_active = snapshot(source).active_leaves
   target_active = active_leaves(plan)
   source_active == target_active || return false
 
@@ -480,11 +481,14 @@ function _degree_map(plan::AdaptivityPlan{D}) where {D}
   return mapping
 end
 
-# Rebuild the target degree vector after topology changes. Refinement and
-# derefinement mutate the target grid in place, so the active-leaf ordering and
-# lookup table must be regenerated from the surviving mapping.
-function _reset_plan_degrees!(plan::AdaptivityPlan{D}, mapping::Dict{Int,NTuple{D,Int}}) where {D}
-  active = active_leaves(plan)
+# Rebuild the target degree vector after snapshot topology changes. The topology
+# layer owns active-frontier construction; adaptivity only filters it through
+# domain activity and aligns the degree vector with the resulting snapshot.
+function _reset_plan_degrees!(plan::AdaptivityPlan{D}, mapping::Dict{Int,NTuple{D,Int}},
+                              target_snapshot::GridSnapshot{D}) where {D}
+  plan.target_snapshot = _filter_target_snapshot!(target_domain(plan), target_snapshot, mapping)
+  plan.target_leaf_to_index = plan.target_snapshot.leaf_to_index
+  active = plan.target_snapshot.active_leaves
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
 
   for index in eachindex(active)
@@ -494,8 +498,33 @@ function _reset_plan_degrees!(plan::AdaptivityPlan{D}, mapping::Dict{Int,NTuple{
   end
 
   plan.target_degrees = degrees
-  plan.target_leaf_to_index = _target_leaf_lookup(grid(target_domain(plan)), active)
   return plan
+end
+
+function _filter_target_snapshot!(target_domain::AbstractDomain{D},
+                                  target_snapshot::GridSnapshot{D},
+                                  mapping::Dict{Int,NTuple{D,Int}}) where {D}
+  grid(target_snapshot) === grid(target_domain) ||
+    throw(ArgumentError("target snapshot must reference the target domain grid"))
+  active = Int[]
+
+  for leaf in target_snapshot.active_leaves
+    if _is_domain_active_leaf(target_domain, leaf)
+      haskey(mapping, leaf) || throw(ArgumentError("missing planned degrees for target leaf $leaf"))
+      push!(active, leaf)
+    else
+      delete!(mapping, leaf)
+    end
+  end
+
+  for leaf in collect(keys(mapping))
+    in_snapshot = leaf <= length(target_snapshot.leaf_to_index) &&
+                  @inbounds(target_snapshot.leaf_to_index[leaf] != 0)
+    in_target = in_snapshot && _is_domain_active_leaf(target_domain, leaf)
+    in_target || delete!(mapping, leaf)
+  end
+
+  return _snapshot(grid(target_domain), active)
 end
 
 # Snapshot source degrees before batched topology edits. The dictionary form is
@@ -505,7 +534,7 @@ function _source_degree_map(space::HpSpace{D}) where {D}
   mapping = Dict{Int,NTuple{D,Int}}()
   sizehint!(mapping, active_leaf_count(space))
 
-  for leaf in space.active_leaves
+  for leaf in snapshot(space).active_leaves
     mapping[leaf] = cell_degrees(space, leaf)
   end
 
@@ -521,7 +550,7 @@ function _apply_p_degree_changes!(mapping::Dict{Int,NTuple{D,Int}}, space::HpSpa
   length(p_degree_changes) == active_leaf_count(space) ||
     throw(ArgumentError("p degree changes must match the active-leaf count"))
 
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     changes = p_degree_changes[leaf_index]
     any(!=(0), changes) || continue
     haskey(mapping, leaf) ||
@@ -533,44 +562,112 @@ function _apply_p_degree_changes!(mapping::Dict{Int,NTuple{D,Int}}, space::HpSpa
   return mapping
 end
 
-# Split one target leaf along the requested axes and duplicate its degree tuple
-# onto all created children. Because refinement is dyadic and axis-by-axis, a
-# multi-axis refinement is implemented as repeated one-axis splits.
-function _split_mapped_leaf!(grid_data::CartesianGrid{D}, mapping::Dict{Int,NTuple{D,Int}},
-                             leaf::Int, axes::NTuple{D,Bool}, degrees::NTuple{D,Int}) where {D}
-  leaves = Int[leaf]
-
-  for axis in 1:D
-    axes[axis] || continue
-    next_leaves = Int[]
-    sizehint!(next_leaves, 2 * length(leaves))
-
-    for current_leaf in leaves
-      first = _split_leaf!(grid_data, current_leaf, axis)
-      mapping[first] = degrees
-      mapping[first+1] = degrees
-      push!(next_leaves, first, first + 1)
-    end
-
-    leaves = next_leaves
-  end
-
-  return leaves
-end
-
-function _apply_h_refinement!(grid_data::CartesianGrid{D}, mapping::Dict{Int,NTuple{D,Int}},
-                              leaf::Int, axes::NTuple{D,Bool}) where {D}
-  any(axes) || return Int[leaf]
+function _apply_h_refinement_mapping!(mapping::Dict{Int,NTuple{D,Int}}, leaf::Int,
+                                      leaves::AbstractVector{<:Integer}) where {D}
   haskey(mapping, leaf) ||
     throw(ArgumentError("leaf $leaf is not available for planned h refinement"))
   degrees = mapping[leaf]
   delete!(mapping, leaf)
-  return _split_mapped_leaf!(grid_data, mapping, leaf, axes, degrees)
+
+  for child in leaves
+    mapping[Int(child)] = degrees
+  end
+
+  return mapping
+end
+
+function _batched_h_derefinement_active!(mapping::Dict{Int,NTuple{D,Int}},
+                                         source_snapshot::GridSnapshot{D}, candidates) where {D}
+  child_to_parent = Dict{Int,Int}()
+  emitted_parents = Set{Int}()
+  grid_data = grid(source_snapshot)
+
+  for candidate in candidates
+    checked_cell = _checked_cell(grid_data, candidate.cell)
+    checked_axis = _checked_axis(grid_data, candidate.axis)
+    is_expanded(source_snapshot, checked_cell) ||
+      throw(ArgumentError("candidate cell $checked_cell is not expanded"))
+    _structural_split_axis(grid_data, checked_cell) == checked_axis ||
+      throw(ArgumentError("candidate cell $checked_cell is not split along axis $checked_axis"))
+    first = first_child(grid_data, checked_cell)
+    first == NONE && throw(ArgumentError("candidate cell $checked_cell has no children"))
+    expected_children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
+    candidate.children == expected_children ||
+      throw(ArgumentError("candidate children do not match the children of cell $checked_cell"))
+
+    for child in expected_children
+      is_active_leaf(source_snapshot, child) ||
+        throw(ArgumentError("candidate cell $checked_cell cannot be derefined because child $child is not an active snapshot leaf"))
+      haskey(child_to_parent, child) &&
+        throw(ArgumentError("child $child appears in multiple h-coarsening candidates"))
+      child_to_parent[child] = checked_cell
+    end
+
+    _apply_h_derefinement_mapping!(mapping, candidate)
+  end
+
+  active = Int[]
+  sizehint!(active,
+            length(source_snapshot.active_leaves) - length(child_to_parent) + length(candidates))
+
+  for leaf in source_snapshot.active_leaves
+    parent = get(child_to_parent, leaf, NONE)
+
+    if parent == NONE
+      push!(active, leaf)
+    elseif !(parent in emitted_parents)
+      push!(active, parent)
+      push!(emitted_parents, parent)
+    end
+  end
+
+  return active
+end
+
+function _batched_h_refinement_active!(mapping::Dict{Int,NTuple{D,Int}}, active::Vector{Int},
+                                       space::HpSpace{D}, h_refinement_axes,
+                                       limits::AdaptivityLimits{D}) where {D}
+  grid_data = grid(space)
+  replacements = Dict{Int,Vector{Int}}()
+  replacement_extra = 0
+
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
+    axes = h_refinement_axes[leaf_index]
+    any(axes) || continue
+    haskey(mapping, leaf) ||
+      throw(ArgumentError("leaf $leaf is not available for planned h refinement"))
+
+    for axis in 1:D
+      axes[axis] || continue
+      _can_h_refine(grid_data, leaf, axis, limits) ||
+        throw(ArgumentError("leaf $leaf reached max_h_level[$axis]"))
+    end
+
+    leaves = _split_snapshot_leaf!(grid_data, leaf, axes)
+    replacements[leaf] = leaves
+    replacement_extra += length(leaves) - 1
+    _apply_h_refinement_mapping!(mapping, leaf, leaves)
+  end
+
+  isempty(replacements) && return active
+
+  refined_active = Int[]
+  sizehint!(refined_active, length(active) + replacement_extra)
+
+  for leaf in active
+    if haskey(replacements, leaf)
+      append!(refined_active, replacements[leaf])
+    else
+      push!(refined_active, leaf)
+    end
+  end
+
+  return refined_active
 end
 
 # Construct a plan from batched `p` changes, `h` refinements, and explicit
 # `h`-coarsening candidates. The order matters:
-# 1. apply derefinements on the copied target grid,
+# 1. apply derefinements on the target snapshot frontier,
 # 2. edit per-leaf polynomial degrees on the surviving source leaves,
 # 3. refine marked leaves and inherit those updated degrees to the children.
 #
@@ -586,25 +683,16 @@ function _batched_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_refin
   length(h_refinement_axes) == active_leaf_count(space) ||
     throw(ArgumentError("h refinement axes must match the active-leaf count"))
 
-  target_domain = copy(domain(space))
-  target_grid = grid(target_domain)
-  _require_revision_bump(target_grid)
+  target_domain = domain(space)
+  source_snapshot = snapshot(space)
   mapping = _source_degree_map(space)
-
-  for candidate in h_coarsening_candidates
-    _apply_h_derefinement!(target_grid, mapping, candidate)
-  end
+  active = _batched_h_derefinement_active!(mapping, source_snapshot, h_coarsening_candidates)
 
   _apply_p_degree_changes!(mapping, space, p_degree_changes)
-
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
-    axes = h_refinement_axes[leaf_index]
-    any(axes) || continue
-    _apply_h_refinement!(target_grid, mapping, leaf, axes)
-  end
-
-  _finish_refinement_update!(target_grid)
-  active = _domain_active_leaves(target_domain)
+  active = _batched_h_refinement_active!(mapping, active, space, h_refinement_axes, limits)
+  target_snapshot = _snapshot(grid(target_domain), active)
+  target_snapshot = _filter_target_snapshot!(target_domain, target_snapshot, mapping)
+  active = target_snapshot.active_leaves
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
 
   for index in eachindex(active)
@@ -613,7 +701,7 @@ function _batched_adaptivity_plan(space::HpSpace{D,T}, p_degree_changes, h_refin
     degrees[index] = mapping[leaf]
   end
 
-  return AdaptivityPlan(space, target_domain, degrees; limits=limits)
+  return AdaptivityPlan(space, target_domain, target_snapshot, degrees; limits=limits)
 end
 
 # These predicates encode admissibility against the active limits only. Keeping
@@ -696,17 +784,18 @@ end
 function _checked_h_coarsening_candidate(space::HpSpace{D},
                                          candidate::HCoarseningCandidate{D}) where {D}
   checked_cell = _checked_cell(grid(space), candidate.cell)
-  is_expanded(grid(space), checked_cell) ||
+  space_snapshot = snapshot(space)
+  is_expanded(space_snapshot, checked_cell) ||
     throw(ArgumentError("candidate cell $checked_cell is not expanded"))
   checked_axis = _checked_axis(grid(space), candidate.axis)
-  split_axis(grid(space), checked_cell) == checked_axis ||
+  _structural_split_axis(grid(space), checked_cell) == checked_axis ||
     throw(ArgumentError("candidate cell $checked_cell is not split along axis $checked_axis"))
   first = first_child(grid(space), checked_cell)
   first == NONE && throw(ArgumentError("candidate cell $checked_cell has no children"))
   expected_children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
   candidate.children == expected_children ||
     throw(ArgumentError("candidate children do not match the children of cell $checked_cell"))
-  all(child -> is_active_leaf(grid(space), child) && space.leaf_to_index[child] != 0,
+  all(child -> is_active_leaf(space_snapshot, child) && space_snapshot.leaf_to_index[child] != 0,
       expected_children) ||
     throw(ArgumentError("candidate cell $checked_cell cannot be derefined because not all children are active space leaves"))
   expected_degrees = _candidate_target_degrees(space, expected_children)
@@ -729,16 +818,12 @@ function _checked_h_coarsening_candidates(space::HpSpace{D}, candidates) where {
   return checked
 end
 
-# Apply the topological inverse of one dyadic split to the transient degree map.
-# The caller is responsible for candidate validation and for rebuilding active
-# leaf lookup data after all batched edits have been applied.
-function _apply_h_derefinement!(grid_data::CartesianGrid{D}, mapping::Dict{Int,NTuple{D,Int}},
-                                candidate::HCoarseningCandidate{D}) where {D}
+function _apply_h_derefinement_mapping!(mapping::Dict{Int,NTuple{D,Int}},
+                                        candidate::HCoarseningCandidate{D}) where {D}
   for child in candidate.children
     delete!(mapping, child)
   end
 
-  _collapse_leaf!(grid_data, candidate.cell)
   mapping[candidate.cell] = candidate.target_degrees
   return mapping
 end
@@ -755,16 +840,17 @@ can be applied without first collapsing deeper descendants.
 function h_coarsening_candidates(space::HpSpace{D}; limits=AdaptivityLimits(space)) where {D}
   checked_limits = _checked_limits(limits, space)
   candidates = HCoarseningCandidate{D}[]
+  space_snapshot = snapshot(space)
 
   for cell in 1:stored_cell_count(grid(space))
-    is_expanded(grid(space), cell) || continue
-    axis = split_axis(grid(space), cell)
+    is_expanded(space_snapshot, cell) || continue
+    axis = _structural_split_axis(grid(space), cell)
     level(grid(space), cell, axis) >= checked_limits.min_h_level[axis] || continue
     first = first_child(grid(space), cell)
     first == NONE && continue
     children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
-    all(child -> is_active_leaf(grid(space), child) && space.leaf_to_index[child] != 0, children) ||
-      continue
+    all(child -> is_active_leaf(space_snapshot, child) && space_snapshot.leaf_to_index[child] != 0,
+        children) || continue
     push!(candidates,
           HCoarseningCandidate(cell, axis, children, _candidate_target_degrees(space, children)))
   end
@@ -786,14 +872,11 @@ function _refine_target_leaf!(plan::AdaptivityPlan{D}, leaf::Integer,
   end
 
   any(axes) || return Int[checked_leaf]
-  degrees = cell_degrees(plan, checked_leaf)
   mapping = _degree_map(plan)
-  delete!(mapping, checked_leaf)
-  _require_revision_bump(grid(plan))
-  leaves = _split_mapped_leaf!(grid(plan), mapping, checked_leaf, axes, degrees)
-  _finish_refinement_update!(grid(plan))
+  refined_snapshot, leaves = _refine_snapshot_leaf!(target_snapshot(plan), checked_leaf, axes)
+  _apply_h_refinement_mapping!(mapping, checked_leaf, leaves)
 
-  _reset_plan_degrees!(plan, mapping)
+  _reset_plan_degrees!(plan, mapping, refined_snapshot)
   return leaves
 end
 
@@ -834,25 +917,20 @@ child and is the natural inverse of degree inheritance under refinement.
 function request_h_derefinement!(plan::AdaptivityPlan, cell::Integer, axis::Integer)
   checked_cell = _checked_cell(grid(plan), cell)
   checked_axis = _checked_axis(grid(plan), axis)
-  is_expanded(grid(plan), checked_cell) ||
-    throw(ArgumentError("cell $checked_cell is not expanded"))
-  split_axis(grid(plan), checked_cell) == checked_axis ||
-    throw(ArgumentError("cell $checked_cell is not split along axis $checked_axis"))
   level(grid(plan), checked_cell, checked_axis) >= plan.limits.min_h_level[checked_axis] ||
     throw(ArgumentError("cell $checked_cell cannot be derefined below min_h_level[$checked_axis]"))
-  first = first_child(grid(plan), checked_cell)
-  child_degrees = ntuple(offset -> cell_degrees(plan, first + offset - 1), _MIDPOINT_CHILD_COUNT)
+  derefined_snapshot, children = _derefine_snapshot_cell(target_snapshot(plan), checked_cell,
+                                                         checked_axis)
+  child_degrees = ntuple(offset -> cell_degrees(plan, children[offset]), _MIDPOINT_CHILD_COUNT)
   merged = ntuple(current_axis -> maximum(degrees[current_axis] for degrees in child_degrees),
                   dimension(plan))
   mapping = _degree_map(plan)
 
-  for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
+  for child in children
     delete!(mapping, child)
   end
-
-  derefine!(grid(plan), checked_cell)
   mapping[checked_cell] = merged
-  _reset_plan_degrees!(plan, mapping)
+  _reset_plan_degrees!(plan, mapping, derefined_snapshot)
   return plan
 end
 
@@ -943,7 +1021,7 @@ target_space(transition::SpaceTransition) = transition.target_space
 # every target leaf.
 function _source_leaf_range(transition::SpaceTransition, target_leaf::Integer)
   checked_leaf = _checked_cell(grid(target_space(transition)), target_leaf)
-  is_active_leaf(grid(target_space(transition)), checked_leaf) ||
+  is_active_leaf(snapshot(target_space(transition)), checked_leaf) ||
     throw(ArgumentError("leaf $checked_leaf is not an active target leaf"))
   first, count = _source_leaf_range_unchecked(transition, checked_leaf)
   count != 0 || throw(ArgumentError("leaf $checked_leaf has no compiled source leaves"))
@@ -973,12 +1051,13 @@ end
 # cells whose physical boxes overlap the target leaf. Because both grids are
 # dyadic on the same root box, box overlap on logical coordinates is sufficient
 # to identify potentially contributing source leaves.
-function _collect_source_leaves!(leaves::Vector{Int}, source_grid::CartesianGrid{D},
+function _collect_source_leaves!(leaves::Vector{Int}, source_snapshot::GridSnapshot{D},
                                  target_grid::CartesianGrid{D}, source_cell::Int,
                                  target_leaf::Int) where {D}
+  source_grid = grid(source_snapshot)
   _cells_overlap(source_grid, source_cell, target_grid, target_leaf) || return leaves
 
-  if is_active_leaf(source_grid, source_cell)
+  if is_active_leaf(source_snapshot, source_cell)
     push!(leaves, source_cell)
     return leaves
   end
@@ -987,7 +1066,8 @@ function _collect_source_leaves!(leaves::Vector{Int}, source_grid::CartesianGrid
   first == NONE && return leaves
 
   for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
-    _collect_source_leaves!(leaves, source_grid, target_grid, child, target_leaf)
+    is_tree_cell(source_snapshot, child) || continue
+    _collect_source_leaves!(leaves, source_snapshot, target_grid, child, target_leaf)
   end
 
   return leaves
@@ -996,7 +1076,7 @@ end
 # A target leaf overlaps only source leaves inside the source subtree rooted at
 # the corresponding root cell of the target leaf. Starting the search there
 # avoids scanning unrelated roots in multi-root grids.
-function _transition_source_leaves!(leaves::Vector{Int}, source_grid::CartesianGrid,
+function _transition_source_leaves!(leaves::Vector{Int}, source_snapshot::GridSnapshot,
                                     target_grid::CartesianGrid, target_leaf::Int)
   empty!(leaves)
   root = target_leaf
@@ -1007,14 +1087,14 @@ function _transition_source_leaves!(leaves::Vector{Int}, source_grid::CartesianG
     root = parent_cell
   end
 
-  _collect_source_leaves!(leaves, source_grid, target_grid, root, target_leaf)
+  _collect_source_leaves!(leaves, source_snapshot, target_grid, root, target_leaf)
   isempty(leaves) && throw(ArgumentError("leaf $target_leaf has no source leaves"))
   return leaves
 end
 
 # A derived plan may use a different source space, but it must live on the same
-# physical geometry and scalar type as the driver plan. Otherwise the copied
-# target topology could not be interpreted as the same adapted domain.
+# physical geometry and scalar type as the driver plan. Otherwise the target
+# snapshot could not be interpreted as the same adapted domain.
 function _checked_derived_plan_space(driver_plan::AdaptivityPlan, space::HpSpace)
   dimension(space) == dimension(driver_plan) ||
     throw(ArgumentError("derived space must have dimension $(dimension(driver_plan))"))
@@ -1028,15 +1108,19 @@ end
 # Lift one target topology onto a companion space by inheriting the maximal
 # degree over every overlapping source leaf. This reproduces refinement
 # inheritance and coarsening-by-maximum without assuming leaf-number identity.
-function _inherited_target_degrees(space::HpSpace{D}, target_domain::AbstractDomain{D},
-                                   active::AbstractVector{<:Integer}=_domain_active_leaves(target_domain)) where {D}
-  source_grid = grid(space)
-  target_grid = grid(target_domain)
+function _inherited_target_degrees(space::HpSpace{D}, target_snapshot::GridSnapshot{D},
+                                   active::AbstractVector{<:Integer}=target_snapshot.active_leaves) where {D}
+  source_snapshot = snapshot(space)
+  if grid(target_snapshot) === grid(source_snapshot) && active == source_snapshot.active_leaves
+    return copy(space.degree_policy.data)
+  end
+
+  target_grid = grid(target_snapshot)
   degrees = Vector{NTuple{D,Int}}(undef, length(active))
   source_leaves = Int[]
 
   for index in eachindex(active)
-    _transition_source_leaves!(source_leaves, source_grid, target_grid, active[index])
+    _transition_source_leaves!(source_leaves, source_snapshot, target_grid, active[index])
     degrees[index] = ntuple(axis -> maximum(cell_degrees(space, leaf)[axis]
                                             for leaf in source_leaves), D)
   end
@@ -1088,10 +1172,11 @@ compact way to express relationships such as pressure = velocity - 1.
 function derived_adaptivity_plan(driver_plan::AdaptivityPlan{D}, space::HpSpace{D};
                                  degree_offset=nothing, limits=AdaptivityLimits(space)) where {D}
   checked_space = _checked_derived_plan_space(driver_plan, space)
-  target = copy(target_domain(driver_plan))
-  degrees = isnothing(degree_offset) ? _inherited_target_degrees(checked_space, target) :
+  target = target_domain(driver_plan)
+  target_topology = target_snapshot(driver_plan)
+  degrees = isnothing(degree_offset) ? _inherited_target_degrees(checked_space, target_topology) :
             _offset_target_degrees(driver_plan, _degree_offset_tuple(degree_offset, D))
-  return AdaptivityPlan(checked_space, target, degrees; limits=limits)
+  return AdaptivityPlan(checked_space, target, target_topology, degrees; limits=limits)
 end
 
 function derived_adaptivity_plan(driver_plan::AdaptivityPlan, field::AbstractField;
@@ -1100,38 +1185,70 @@ function derived_adaptivity_plan(driver_plan::AdaptivityPlan, field::AbstractFie
                                  limits=limits)
 end
 
+function _transition_target_data(plan::AdaptivityPlan, use_compact::Bool)
+  use_compact || return target_domain(plan), target_snapshot(plan), plan.target_degrees
+  compact_domain, compact_snapshot, old_to_new = compact(target_domain(plan), target_snapshot(plan))
+  compact_degrees = _remap_compacted_target_degrees(target_snapshot(plan), plan.target_degrees,
+                                                    compact_snapshot, old_to_new)
+  return compact_domain, compact_snapshot, compact_degrees
+end
+
+function _remap_compacted_target_degrees(source_snapshot::GridSnapshot{D},
+                                         source_degrees::AbstractVector{NTuple{D,Int}},
+                                         compact_snapshot::GridSnapshot{D},
+                                         old_to_new::AbstractVector{<:Integer}) where {D}
+  length(source_degrees) == length(source_snapshot.active_leaves) ||
+    throw(ArgumentError("target degree data must match the active-leaf count"))
+  remapped = Vector{NTuple{D,Int}}(undef, length(compact_snapshot.active_leaves))
+
+  for (source_index, old_leaf) in enumerate(source_snapshot.active_leaves)
+    new_leaf = @inbounds old_to_new[old_leaf]
+    new_leaf != NONE || throw(ArgumentError("compaction dropped active leaf $old_leaf"))
+    new_index = @inbounds compact_snapshot.leaf_to_index[new_leaf]
+    new_index != 0 ||
+      throw(ArgumentError("compacted snapshot is missing active leaf mapped from $old_leaf"))
+    remapped[new_index] = source_degrees[source_index]
+  end
+
+  return remapped
+end
+
 """
-    transition(plan)
+    transition(plan; compact=false)
 
 Build the `SpaceTransition` from the source space of `plan` to its target
 space.
 
-This compiles the current target domain and target degree data of `plan` into a
-new `HpSpace`, then records for every active target leaf which active source
+This compiles the current target snapshot and target degree data of `plan` into
+a new `HpSpace`, then records for every active target leaf which active source
 leaves overlap it. The resulting `SpaceTransition` is the object required for
 state transfer and for recreating field layouts on the target space.
+
+If `compact=true`, the target space is compiled on a non-mutating compacted copy
+of the target grid. The source space and the plan snapshot remain valid while
+the transition uses the compacted target for all new-space data.
 
 Because the source and target domains share the same physical box and root-grid
 layout, the transition can describe source-to-target overlap purely by leaf
 relations on dyadic grids.
 """
-function transition(plan::AdaptivityPlan{D,T}) where {D,T<:AbstractFloat}
+function transition(plan::AdaptivityPlan{D,T}; compact::Bool=false) where {D,T<:AbstractFloat}
   old_space = source_space(plan)
-  new_domain = copy(target_domain(plan))
-  degree_policy = StoredDegrees(new_domain, plan.target_degrees)
+  new_domain, new_snapshot, target_degrees = _transition_target_data(plan, compact)
+  degree_policy = StoredDegrees(new_domain, new_snapshot.active_leaves, target_degrees)
   options = SpaceOptions(basis=basis_family(old_space), degree=degree_policy,
                          quadrature=old_space.quadrature_policy,
                          continuity=continuity_policy(old_space))
-  new_space = HpSpace(new_domain, options)
-  source_grid = grid(old_space)
+  new_space = _compile_snapshot_space(new_domain, new_snapshot, options)
+  source_snapshot = snapshot(old_space)
   target_grid = grid(new_space)
   source_offsets = zeros(Int, stored_cell_count(target_grid))
   source_counts = zeros(Int, stored_cell_count(target_grid))
   source_data = Int[]
   source_leaves = Int[]
 
-  for leaf in new_space.active_leaves
-    leaves = _transition_source_leaves!(source_leaves, source_grid, target_grid, leaf)
+  for leaf in snapshot(new_space).active_leaves
+    leaves = _transition_source_leaves!(source_leaves, source_snapshot, target_grid, leaf)
     source_offsets[leaf] = length(source_data) + 1
     source_counts[leaf] = length(leaves)
     append!(source_data, leaves)
@@ -1590,6 +1707,7 @@ function _checked_transition_plans(plans::Tuple, state::State)
 
   plan_by_space = IdDict{Any,AdaptivityPlan}()
   reference_target = nothing
+  reference_topology = nothing
 
   for plan in plans
     plan isa AdaptivityPlan || throw(ArgumentError("plans must be AdaptivityPlan values"))
@@ -1602,12 +1720,13 @@ function _checked_transition_plans(plans::Tuple, state::State)
 
     if isnothing(reference_target)
       reference_target = target_domain(plan)
+      reference_topology = _active_leaf_signatures(target_snapshot(plan))
       continue
     end
 
     _same_adaptivity_geometry(reference_target, target_domain(plan)) ||
       throw(ArgumentError("adaptivity plan targets must share one physical domain and periodic topology"))
-    _domain_active_leaves(reference_target) == _domain_active_leaves(target_domain(plan)) ||
+    reference_topology == _active_leaf_signatures(target_snapshot(plan)) ||
       throw(ArgumentError("adaptivity plan targets must share the same active-leaf topology"))
   end
 
@@ -1825,8 +1944,8 @@ function _interface_jump_quadratures(::Type{T}, space::HpSpace{D}, specs) where 
   for spec_index in eachindex(specs)
     spec = specs[spec_index]
     minus_leaf, axis, plus_leaf = spec
-    minus_compiled = @inbounds space.compiled_leaves[space.leaf_to_index[minus_leaf]]
-    plus_compiled = @inbounds space.compiled_leaves[space.leaf_to_index[plus_leaf]]
+    minus_compiled = @inbounds space.compiled_leaves[snapshot(space).leaf_to_index[minus_leaf]]
+    plus_compiled = @inbounds space.compiled_leaves[snapshot(space).leaf_to_index[plus_leaf]]
     shape = _interface_jump_shape(minus_compiled, plus_compiled, axis)
     key = (axis, _face_tangential_shape(shape, axis))
 
@@ -1941,7 +2060,9 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
   space = field_space(field)
   D = dimension(space)
   active_leaf_total = active_leaf_count(space)
-  specs = _filtered_upper_face_neighbor_specs(grid(space), space.active_leaves, space.leaf_to_index)
+  space_snapshot = snapshot(space)
+  specs = [(space_snapshot.interface_minus[index], Int(space_snapshot.interface_axis[index]),
+            space_snapshot.interface_plus[index]) for index in 1:interface_count(space_snapshot)]
   isempty(specs) && return [ntuple(_ -> zero(T), D) for _ in 1:active_leaf_total]
   domain_data = domain(space)
   component_coefficients = _component_coefficient_views(state, field)
@@ -1951,8 +2072,8 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
   for spec_index in eachindex(specs)
     spec = specs[spec_index]
     minus_leaf, axis, plus_leaf = spec
-    minus_leaf_index = @inbounds space.leaf_to_index[minus_leaf]
-    plus_leaf_index = @inbounds space.leaf_to_index[plus_leaf]
+    minus_leaf_index = @inbounds snapshot(space).leaf_to_index[minus_leaf]
+    plus_leaf_index = @inbounds snapshot(space).leaf_to_index[plus_leaf]
     minus_compiled = @inbounds space.compiled_leaves[minus_leaf_index]
     plus_compiled = @inbounds space.compiled_leaves[plus_leaf_index]
     quadrature = quadratures[spec_index]
@@ -2027,7 +2148,7 @@ function _modal_axis_detail_data(state::State{T}, field::AbstractField) where {T
   decay = Vector{NTuple{D,T}}(undef, active_leaf_count(space))
   scratch = _ModalAxisDetailScratch(zeros(T, D), zeros(T, D), T[])
 
-  for leaf_index in eachindex(space.active_leaves)
+  for leaf_index in eachindex(snapshot(space).active_leaves)
     compiled = space.compiled_leaves[leaf_index]
     resize!(scratch.mode_energy, length(compiled.local_modes))
     fill!(scratch.top, zero(T))
@@ -2066,7 +2187,7 @@ end
 
 function _active_leaf_index(space::HpSpace, leaf::Integer)
   checked_leaf = _checked_cell(grid(space), leaf)
-  index = @inbounds space.leaf_to_index[checked_leaf]
+  index = @inbounds snapshot(space).leaf_to_index[checked_leaf]
   index != 0 || throw(ArgumentError("leaf $checked_leaf is not an active space leaf"))
   return index
 end
@@ -2079,7 +2200,8 @@ end
 function _child_point_in_parent(space::HpSpace{D,T}, parent::Int, child::Int,
                                 ξ_child::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
   grid_data = grid(space)
-  split = split_axis(grid_data, parent)
+  split = _structural_split_axis(grid_data, parent)
+  split != 0 || throw(ArgumentError("parent cell $parent does not own a structural child block"))
   parent_coordinate = logical_coordinate(grid_data, parent, split)
   lower_child = logical_coordinate(grid_data, child, split) == 2 * parent_coordinate
 
@@ -2361,7 +2483,7 @@ function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T
   component_values = Vector{T}(undef, components)
   quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
 
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     compiled = space.compiled_leaves[leaf_index]
     if haskey(quadrature_cache, compiled.quadrature_shape)
       quadrature = quadrature_cache[compiled.quadrature_shape]
@@ -2410,7 +2532,7 @@ function _normalized_interface_jump_indicators(state::State{T}, field::AbstractF
   denominators = _cell_l2_denominators(cell_energies)
   result = Vector{NTuple{dimension(space),T}}(undef, active_leaf_count(space))
 
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     result[leaf_index] = ntuple(axis -> raw[leaf_index][axis] *
                                         cell_size(domain(space), leaf, axis) /
                                         denominators[leaf_index], dimension(space))
@@ -2544,7 +2666,7 @@ function _multiresolution_refinement_axes(space::HpSpace{D}, data::_Multiresolut
   h_refined = _empty_axis_flags(space)
   p_refined = _empty_axis_flags(space)
 
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     h_current = h_refined[leaf_index]
     p_current = p_refined[leaf_index]
 
@@ -2586,6 +2708,7 @@ function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
                                           limits::AdaptivityLimits{D}) where {D}
   expanded = copy(h_refined)
   grid_data = grid(space)
+  space_snapshot = snapshot(space)
 
   for (leaf_index, axes) in enumerate(h_refined)
     any(axes) || continue
@@ -2594,8 +2717,8 @@ function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
 
     for face_axis in 1:D
       for side in (LOWER, UPPER)
-        for neighbor_leaf in opposite_active_leaves(grid_data, leaf, face_axis, side)
-          neighbor_index = @inbounds space.leaf_to_index[neighbor_leaf]
+        for neighbor_leaf in opposite_active_leaves(space_snapshot, leaf, face_axis, side)
+          neighbor_index = @inbounds space_snapshot.leaf_to_index[neighbor_leaf]
           neighbor_index == 0 && continue
           neighbor_levels = level(grid_data, neighbor_leaf)
           current = expanded[neighbor_index]
@@ -2640,7 +2763,7 @@ function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
     throw(ArgumentError("significant leaf flags must match the active-leaf count"))
   blocked = [any(h_refined[index]) || any(p_refined[index]) || significant[index]
              for index in eachindex(h_refined)]
-  grid_data = grid(space)
+  space_snapshot = snapshot(space)
 
   for (leaf_index, is_blocked) in enumerate(copy(blocked))
     is_blocked || continue
@@ -2648,8 +2771,8 @@ function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
 
     for axis in 1:D
       for side in (LOWER, UPPER)
-        for neighbor_leaf in opposite_active_leaves(grid_data, leaf, axis, side)
-          neighbor_index = @inbounds space.leaf_to_index[neighbor_leaf]
+        for neighbor_leaf in opposite_active_leaves(space_snapshot, leaf, axis, side)
+          neighbor_index = @inbounds space_snapshot.leaf_to_index[neighbor_leaf]
           neighbor_index == 0 && continue
           blocked[neighbor_index] = true
         end
@@ -2694,7 +2817,7 @@ function _multiresolution_p_coarsening_axes(space::HpSpace{D}, data::_Multiresol
                                             blocked) where {D}
   p_coarsened = _empty_axis_flags(space)
 
-  for (leaf_index, leaf) in enumerate(space.active_leaves)
+  for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     blocked[leaf_index] && continue
     current = p_coarsened[leaf_index]
 
@@ -2812,7 +2935,7 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
   source_levels = level(source_grid, leaf)
   source_degrees = cell_degrees(source_space(plan), leaf)
   descendants = Int[]
-  _collect_active_descendants!(descendants, grid(plan), leaf)
+  _collect_active_descendants!(descendants, target_snapshot(plan), leaf)
   h_axes = fill(false, D)
   p_degree_changes = fill(typemin(Int), D)
   p_refined = false
@@ -2856,7 +2979,7 @@ leaf is more refined than the source leaf along each axis.
 """
 function h_adaptation_axes(plan::AdaptivityPlan{D}, leaf::Integer) where {D}
   checked_leaf = _checked_cell(grid(source_space(plan)), leaf)
-  is_active_leaf(grid(source_space(plan)), checked_leaf) ||
+  is_active_leaf(snapshot(source_space(plan)), checked_leaf) ||
     throw(ArgumentError("leaf $checked_leaf is not an active source leaf"))
   return _source_refinement_axes(plan, checked_leaf)
 end
@@ -2873,7 +2996,7 @@ descendant changes the degree on that axis.
 """
 function p_degree_change(plan::AdaptivityPlan{D}, leaf::Integer) where {D}
   checked_leaf = _checked_cell(grid(source_space(plan)), leaf)
-  is_active_leaf(grid(source_space(plan)), checked_leaf) ||
+  is_active_leaf(snapshot(source_space(plan)), checked_leaf) ||
     throw(ArgumentError("leaf $checked_leaf is not an active source leaf"))
   return _source_leaf_change(plan, checked_leaf).p_degree_changes
 end
@@ -2889,13 +3012,14 @@ space rather than summarizing raw target-space counts.
 """
 function adaptivity_summary(plan::AdaptivityPlan)
   source = source_space(plan)
+  source_snapshot = snapshot(source)
   target_grid = grid(plan)
   marked_leaf_count = 0
   h_refinement_leaf_count = 0
   p_refinement_leaf_count = 0
   p_derefinement_leaf_count = 0
 
-  for leaf in source.active_leaves
+  for leaf in source_snapshot.active_leaves
     change = _source_leaf_change(plan, leaf)
     is_h = any(change.h_axes)
     marked_leaf_count += (is_h || change.p_refined || change.p_derefined)
@@ -2907,7 +3031,7 @@ function adaptivity_summary(plan::AdaptivityPlan)
   h_derefinement_cell_count = 0
 
   for cell in 1:stored_cell_count(grid(source))
-    is_expanded(grid(source), cell) || continue
+    is_expanded(source_snapshot, cell) || continue
     cell <= stored_cell_count(target_grid) || continue
     cell <= length(plan.target_leaf_to_index) &&
       @inbounds(plan.target_leaf_to_index[cell] != 0) &&

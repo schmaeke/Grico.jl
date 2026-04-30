@@ -61,7 +61,7 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
     attachment.second isa AbstractQuadrature ||
       throw(ArgumentError("cell quadrature value must be an AbstractQuadrature"))
     checked_leaf = _checked_cell(grid_data, attachment.first)
-    _checked_active_leaf_index(grid_data, space.leaf_to_index, checked_leaf,
+    _checked_active_leaf_index(grid_data, snapshot(space).leaf_to_index, checked_leaf,
                                "verification cell quadrature")
     !(checked_leaf in explicit_overrides) ||
       throw(ArgumentError("duplicate verification cell quadrature attachment for leaf $checked_leaf"))

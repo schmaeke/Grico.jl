@@ -83,7 +83,9 @@ end
   state = State(FieldLayout((u,)), collect(1.0:scalar_dof_count(space)))
   automatic_plan = adaptivity_plan(state, u; tolerance=0.0,
                                    limits=AdaptivityLimits(space; min_p=1, max_p=1, max_h_level=1))
-  @test active_leaves(target_space(transition(automatic_plan))) == [4, 5, 6]
+  automatic_active = active_leaves(target_space(transition(automatic_plan)))
+  @test length(automatic_active) == 3
+  @test all(leaf -> level(grid(space), leaf) == (1,), automatic_active)
 end
 
 @testset "Periodic Transition" begin
@@ -148,13 +150,25 @@ end
   coarsen_transition = transition(coarsen_plan)
   recovered_u = adapted_field(coarsen_transition, fine_u; name=:u)
   recovered_state = transfer_state(coarsen_transition, fine_state, fine_u, recovered_u)
+  compact_coarsen_transition = transition(coarsen_plan; compact=true)
+  compact_recovered_u = adapted_field(compact_coarsen_transition, fine_u; name=:u)
+  compact_recovered_state = transfer_state(compact_coarsen_transition, fine_state, fine_u,
+                                           compact_recovered_u)
 
   @test active_leaf_count(target_space(coarsen_transition)) == 1
   @test source_leaves(coarsen_transition, 1) == [2, 3]
+  @test Grico.stored_cell_count(grid(target_space(coarsen_transition))) == 3
+  @test active_leaf_count(target_space(compact_coarsen_transition)) == 1
+  @test Grico.stored_cell_count(grid(target_space(compact_coarsen_transition))) == 1
+  @test active_leaves(target_space(compact_coarsen_transition)) == [1]
+  @test source_leaves(compact_coarsen_transition, 1) == [2, 3]
+  @test Grico.check_space(target_space(compact_coarsen_transition)) === nothing
 
   for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
     @test _field_value_at_point(coarse_u, coarse_state, x) ≈
           _field_value_at_point(recovered_u, recovered_state, x) atol = ADAPTIVITY_TOL
+    @test _field_value_at_point(coarse_u, coarse_state, x) ≈
+          _field_value_at_point(compact_recovered_u, compact_recovered_state, x) atol = ADAPTIVITY_TOL
   end
 end
 
@@ -316,6 +330,8 @@ end
 
   @test_throws ArgumentError transfer_state((velocity_plan,), state)
   @test_throws ArgumentError transfer_state((velocity_plan, pressure_plan, pressure_plan), state)
+  mismatched_pressure_plan = AdaptivityPlan(pressure_space)
+  @test_throws ArgumentError transfer_state((velocity_plan, mismatched_pressure_plan), state)
   @test_throws ArgumentError adapted_field(velocity_transition, pressure)
   @test_throws ArgumentError adapted_fields(velocity_transition, (velocity, "bad"))
   @test_throws ArgumentError transfer_state(velocity_transition, state, ("bad",), (new_velocity,))
@@ -740,12 +756,13 @@ end
   @test_throws ArgumentError AdaptivityLimits(1; min_h_level=(0, 0))
   @test_throws ArgumentError AdaptivityLimits(1; min_h_level=1, max_h_level=0)
   @test_throws ArgumentError AdaptivityLimits(1; min_p=2, max_p=1)
-  @test_throws ArgumentError AdaptivityPlan(space, domain, NTuple{1,Int}[])
-  @test_throws ArgumentError AdaptivityPlan(space, domain, [(0,)])
+  domain_snapshot = snapshot(grid(domain))
+  @test_throws ArgumentError AdaptivityPlan(space, domain, domain_snapshot, NTuple{1,Int}[])
+  @test_throws ArgumentError AdaptivityPlan(space, domain, domain_snapshot, [(0,)])
   @test_throws ArgumentError Grico.HCoarseningCandidate(big(typemax(Int)) + 1, 1, (1, 2), (1,))
   dg_space = HpSpace(domain,
                      SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
-  @test AdaptivityPlan(dg_space, domain, [(0,)]) isa AdaptivityPlan
+  @test AdaptivityPlan(dg_space, domain, domain_snapshot, [(0,)]) isa AdaptivityPlan
   @test_throws ArgumentError AdaptivityLimits(space; min_p=0)
   @test_throws ArgumentError adaptivity_plan(state, u; tolerance=NaN)
   @test_throws ArgumentError adaptivity_plan(state, u; tolerance=-1.0)

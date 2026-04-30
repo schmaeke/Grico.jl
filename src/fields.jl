@@ -311,9 +311,10 @@ struct _FieldLayoutReference{L,O,E,P,R,M}
 end
 
 @inline function _field_layout_reference(space::HpSpace)
-  return _FieldLayoutReference(dimension(space), eltype(origin(space)), space.active_leaves,
-                               origin(space), extent(space), periodic_axes(space),
-                               _physical_region(domain(space)), _cell_measure(domain(space)))
+  return _FieldLayoutReference(dimension(space), eltype(origin(space)),
+                               snapshot(space).active_leaves, origin(space), extent(space),
+                               periodic_axes(space), _physical_region(domain(space)),
+                               _cell_measure(domain(space)))
 end
 
 # Check that one field space is compatible with the common layout reference.
@@ -322,7 +323,7 @@ function _check_field_layout_space(space::HpSpace, reference::_FieldLayoutRefere
     throw(ArgumentError("all fields must use the same dimension"))
   eltype(origin(space)) == reference.scalar_type ||
     throw(ArgumentError("all fields must use the same scalar type"))
-  space.active_leaves == reference.active_leaves ||
+  snapshot(space).active_leaves == reference.active_leaves ||
     throw(ArgumentError("all fields must share the same active-leaf topology"))
   origin(space) == reference.origin && extent(space) == reference.extent ||
     throw(ArgumentError("all fields must share the same physical domain"))

@@ -145,6 +145,11 @@ end
   Grico.refine!(Grico.grid(snapshot_domain), 1, 1)
   @test Grico.active_leaves(snapshot_space) == [1]
   @test Grico.active_leaves(Grico.grid(snapshot_space)) == [1]
+  @test Grico.snapshot(snapshot_space) isa Grico.GridSnapshot{1}
+  @test Grico.grid(Grico.snapshot(snapshot_space)) === Grico.grid(snapshot_space)
+  @test Grico.check_snapshot(Grico.snapshot(snapshot_space)) === nothing
+  @test Grico.boundary_face_count(Grico.snapshot(snapshot_space)) == 2
+  @test Grico.interface_count(Grico.snapshot(snapshot_space)) == 0
   @test Grico.check_space(snapshot_space) === nothing
 end
 
@@ -156,6 +161,9 @@ end
   default_space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(1)))
 
   @test Grico.active_leaves(default_space) == [1, 2]
+  @test Grico.active_leaves(Grico.snapshot(default_space)) == [1, 2]
+  @test Grico.check_snapshot(Grico.snapshot(default_space)) === nothing
+  @test Grico.interface_count(Grico.snapshot(default_space)) == 1
 
   sliver_background = Grico.Domain((0.0,), (1.0,), (2,))
   sliver_region = Grico.ImplicitRegion(x -> x[1] <= 0.05 || x[1] >= 0.75; subdivision_depth=0)

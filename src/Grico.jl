@@ -109,12 +109,13 @@ export AbstractQuadrature, GaussLegendreRule, PointQuadrature, TensorQuadrature,
 # space. Topology comes first, geometry builds on top of it, and refinement
 # mutates that topological tree.
 include("topology.jl")
-export CartesianGrid, LOWER, NONE, UPPER, active_leaf_count, active_leaves, is_periodic_axis, level,
-       periodic_axes, root_cell_count, root_cell_counts, root_cell_total
+export CartesianGrid, GridSnapshot, LOWER, NONE, UPPER, active_leaf_count, active_leaves, compact!,
+       is_periodic_axis, level, periodic_axes, root_cell_count, root_cell_counts, root_cell_total,
+       snapshot
 
 include("geometry.jl")
-export Domain, cell_center, cell_lower, cell_size, cell_upper, cell_volume, extent, face_measure,
-       grid, map_from_biunit_cube, map_to_biunit_cube, origin
+export Domain, cell_center, cell_lower, cell_size, cell_upper, cell_volume, compact, extent,
+       face_measure, grid, map_from_biunit_cube, map_to_biunit_cube, origin
 
 include("refinement.jl")
 export derefine!, refine!

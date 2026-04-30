@@ -16,13 +16,13 @@ function adaptive_benchmark_defaults(; cycles=8, root_cells=(20, 20), degree=1,
                                      quadrature_extra_points=2, max_h_level=12, tolerance=1.0e-5,
                                      smoothness_threshold=0.25,
                                      output_directory=joinpath(@__DIR__, "output"),
-                                     write_plots=false, warmup=true)
+                                     write_plots=false, warmup=true, compact_transition=false)
   return Dict{String,Any}("cycles" => cycles, "root_cells" => root_cells, "degree" => degree,
                           "quadrature_extra_points" => quadrature_extra_points,
                           "max_h_level" => max_h_level, "tolerance" => tolerance,
                           "smoothness_threshold" => smoothness_threshold,
                           "output_directory" => output_directory, "write_plots" => write_plots,
-                          "warmup" => warmup)
+                          "warmup" => warmup, "compact_transition" => compact_transition)
 end
 
 struct BenchmarkReferenceProvider{F}
@@ -100,6 +100,7 @@ function _print_help(script_name::AbstractString, defaults, extra_help::Abstract
   println("""
     --output DIR               output directory (default: $(defaults["output_directory"]))
     --plots                    write PDF runtime plots with Plots.jl
+    --compact-transition       compile adapted target spaces on compacted grids
     --no-warmup                include first-use compilation latency in the measurements
     --help                     show this message
   """)
@@ -183,6 +184,8 @@ function parse_adaptive_benchmark_options(args; script_name::AbstractString, def
       exit(0)
     elseif arg == "--plots"
       options["write_plots"] = true
+    elseif arg == "--compact-transition"
+      options["compact_transition"] = true
     elseif arg == "--no-warmup"
       options["warmup"] = false
     elseif arg == "--unrestricted-h"
@@ -429,7 +432,7 @@ function run_adaptive_cycles(options; build_initial_field, build_problem, output
 
     if !isempty(adaptivity)
       transition_data = _timed!(component_rows, cycle, "transition") do
-        transition(adaptivity)
+        transition(adaptivity; compact=options["compact_transition"])
       end
       target_field = _timed!(component_rows, cycle, "adapted_field") do
         adapted_field(transition_data, field)
@@ -488,9 +491,9 @@ function run_adaptive_benchmark(args; script_name::AbstractString, benchmark_tit
   end
 
   println(benchmark_title)
-  @printf("  cycles=%d root_cells=%s degree=%d max_h_level=%s tolerance=%.3e\n", options["cycles"],
-          options["root_cells"], options["degree"], _limit_text(options["max_h_level"]),
-          options["tolerance"])
+  @printf("  cycles=%d root_cells=%s degree=%d max_h_level=%s tolerance=%.3e compact_transition=%s\n",
+          options["cycles"], options["root_cells"], options["degree"],
+          _limit_text(options["max_h_level"]), options["tolerance"], options["compact_transition"])
   run_adaptive_cycles(options; build_initial_field, build_problem, output_prefix,
                       plot_title=benchmark_title, solution_reference, write_files=true)
   return nothing

@@ -127,6 +127,7 @@ end
 #   provisional boundary variable in terms of global scalar dofs.
 mutable struct _SpaceBuildState{D,T<:AbstractFloat,B}
   grid::CartesianGrid{D}
+  grid_snapshot::GridSnapshot{D}
   basis::B
   active_leaves::Vector{Int}
   leaf_to_index::Vector{Int}
@@ -149,10 +150,14 @@ end
 # common finest logical lattice, and repeated degree patterns are cached so the
 # later compilation phases can work with integer interval arithmetic and shared
 # local mode tables.
-function _build_space_state(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                            leaf_to_index::Vector{Int}, basis::B,
+function _build_space_state(domain::AbstractDomain{D,T}, grid_snapshot::GridSnapshot{D}, basis::B,
                             leaf_degrees::Vector{NTuple{D,Int}}) where {D,T<:AbstractFloat,B}
   grid_data = grid(domain)
+  grid(grid_snapshot) === grid_data ||
+    throw(ArgumentError("space snapshot must reference the space domain grid"))
+  _require_current_snapshot(grid_snapshot)
+  active = grid_snapshot.active_leaves
+  leaf_to_index = grid_snapshot.leaf_to_index
   length(leaf_degrees) == length(active) ||
     throw(ArgumentError("leaf degree data must match the active-leaf count"))
   finest_levels = ntuple(axis -> maximum(level(grid_data, leaf, axis) for leaf in active; init=0),
@@ -180,8 +185,8 @@ function _build_space_state(domain::AbstractDomain{D,T}, active::AbstractVector{
 
   boundary_lookup = [Dict{NTuple{D,Int},Int}() for _ in eachindex(active)]
   face_boundary_modes = [Vector{_BoundaryVariable{D}}() for _ in 1:(length(active)*D*2)]
-  return _SpaceBuildState(grid_data, basis, active, leaf_to_index, leaf_degrees, leaf_patterns,
-                          leaf_lower, leaf_upper, finest_levels, boundary_lookup,
+  return _SpaceBuildState(grid_data, grid_snapshot, basis, active, leaf_to_index, leaf_degrees,
+                          leaf_patterns, leaf_lower, leaf_upper, finest_levels, boundary_lookup,
                           face_boundary_modes, Vector{Vector{Pair{Int,T}}}(), 0, 1)
 end
 
@@ -192,11 +197,10 @@ end
 # face algebra at all. Fully DG spaces deliberately skip that work, while any
 # policy with at least one CG axis introduces provisional variables only for the
 # local modes that actually participate in CG trace coupling.
-function _enumerate_space_modes(domain::AbstractDomain{D,T}, active::AbstractVector{<:Integer},
-                                leaf_to_index::Vector{Int}, basis::B,
-                                leaf_degrees::Vector{NTuple{D,Int}},
+function _enumerate_space_modes(domain::AbstractDomain{D,T}, grid_snapshot::GridSnapshot{D},
+                                basis::B, leaf_degrees::Vector{NTuple{D,Int}},
                                 continuity_policy::_AxisContinuity{D}) where {D,T<:AbstractFloat,B}
-  state = _build_space_state(domain, active, leaf_to_index, basis, leaf_degrees)
+  state = _build_space_state(domain, grid_snapshot, basis, leaf_degrees)
   _enumerate_trace_modes!(state, continuity_policy)
   return state
 end
@@ -438,8 +442,10 @@ function _internal_face_pairs(state::_SpaceBuildState{D},
   pairs = Tuple{Int,Int,Int}[]
   sizehint!(pairs, length(state.active_leaves) * D)
 
-  for (leaf, axis, other) in
-      _filtered_upper_face_neighbor_specs(state.grid, state.active_leaves, state.leaf_to_index)
+  for spec_index in 1:interface_count(state.grid_snapshot)
+    leaf = @inbounds state.grid_snapshot.interface_minus[spec_index]
+    other = @inbounds state.grid_snapshot.interface_plus[spec_index]
+    axis = Int(@inbounds state.grid_snapshot.interface_axis[spec_index])
     _is_cg_axis(continuity_policy, axis) || continue
     push!(pairs,
           (@inbounds(state.leaf_to_index[leaf]), @inbounds(state.leaf_to_index[other]), axis))

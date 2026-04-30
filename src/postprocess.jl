@@ -262,14 +262,14 @@ _postprocess_reference_domain(domain_data::AbstractDomain) = domain_data
 
 _postprocess_reference_active_leaves(space::HpSpace) = active_leaves(space)
 function _postprocess_reference_active_leaves(domain_data::AbstractDomain)
-  _domain_active_leaves(domain_data)
+  _morton_ordered_snapshot_leaves(grid(domain_data), _domain_active_leaves(domain_data))
 end
 
 function _postprocess_matching_domain(space::HpSpace, reference)
   reference_domain = _postprocess_reference_domain(reference)
   space_domain = domain(space)
   root_cell_counts(grid(space_domain)) == root_cell_counts(grid(reference_domain)) || return false
-  space.active_leaves == _postprocess_reference_active_leaves(reference) || return false
+  snapshot(space).active_leaves == _postprocess_reference_active_leaves(reference) || return false
   origin(space_domain) == origin(reference_domain) || return false
   extent(space_domain) == extent(reference_domain) || return false
   periodic_axes(space_domain) == periodic_axes(reference_domain) || return false
