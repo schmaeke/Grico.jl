@@ -2710,6 +2710,7 @@ function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
   expanded = copy(h_refined)
   grid_data = grid(space)
   space_snapshot = snapshot(space)
+  neighbor_lookup = _SnapshotNeighborLookup(space_snapshot)
 
   for (leaf_index, axes) in enumerate(h_refined)
     any(axes) || continue
@@ -2718,7 +2719,7 @@ function _expanded_multiresolution_h_zone(space::HpSpace{D}, h_refined,
 
     for face_axis in 1:D
       for side in (LOWER, UPPER)
-        for neighbor_leaf in opposite_active_leaves(space_snapshot, leaf, face_axis, side)
+        for neighbor_leaf in _opposite_active_leaves(neighbor_lookup, leaf, face_axis, side)
           neighbor_index = @inbounds space_snapshot.leaf_to_index[neighbor_leaf]
           neighbor_index == 0 && continue
           neighbor_levels = level(grid_data, neighbor_leaf)
@@ -2765,6 +2766,7 @@ function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
   blocked = [any(h_refined[index]) || any(p_refined[index]) || significant[index]
              for index in eachindex(h_refined)]
   space_snapshot = snapshot(space)
+  neighbor_lookup = _SnapshotNeighborLookup(space_snapshot)
 
   for (leaf_index, is_blocked) in enumerate(copy(blocked))
     is_blocked || continue
@@ -2772,7 +2774,7 @@ function _multiresolution_h_block_flags(space::HpSpace{D}, h_refined, p_refined,
 
     for axis in 1:D
       for side in (LOWER, UPPER)
-        for neighbor_leaf in opposite_active_leaves(space_snapshot, leaf, axis, side)
+        for neighbor_leaf in _opposite_active_leaves(neighbor_lookup, leaf, axis, side)
           neighbor_index = @inbounds space_snapshot.leaf_to_index[neighbor_leaf]
           neighbor_index == 0 && continue
           blocked[neighbor_index] = true

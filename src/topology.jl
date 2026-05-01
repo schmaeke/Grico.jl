@@ -968,14 +968,7 @@ function opposite_active_leaves(grid::CartesianGrid, cell::Integer, axis::Intege
 end
 
 function opposite_active_leaves(snapshot::GridSnapshot, cell::Integer, axis::Integer, side::Integer)
-  _require_current_snapshot(snapshot)
-  grid_data = grid(snapshot)
-  checked_cell = _checked_cell(grid_data, cell)
-  checked_axis = _checked_axis(grid_data, axis)
-  checked_side = _checked_side(side)
-  tree_lookup = _snapshot_tree_cell_lookup(grid_data, snapshot.active_leaves)
-  return _snapshot_opposite_active_leaves(grid_data, tree_lookup, snapshot.leaf_to_index,
-                                          checked_cell, checked_axis, checked_side)
+  return _opposite_active_leaves(_SnapshotNeighborLookup(snapshot), cell, axis, side)
 end
 
 function boundary_face_count(snapshot::GridSnapshot)
@@ -1343,6 +1336,28 @@ function _snapshot_tree_cell_lookup(grid::CartesianGrid{D},
   end
 
   return lookup
+end
+
+struct _SnapshotNeighborLookup{D,L}
+  snapshot::GridSnapshot{D}
+  tree_lookup::L
+end
+
+function _SnapshotNeighborLookup(snapshot::GridSnapshot{D}) where {D}
+  current = _require_current_snapshot(snapshot)
+  tree_lookup = _snapshot_tree_cell_lookup(grid(current), current.active_leaves)
+  return _SnapshotNeighborLookup{D,typeof(tree_lookup)}(current, tree_lookup)
+end
+
+function _opposite_active_leaves(lookup::_SnapshotNeighborLookup, cell::Integer,
+                                 axis::Integer, side::Integer)
+  snapshot = lookup.snapshot
+  grid_data = grid(snapshot)
+  checked_cell = _checked_cell(grid_data, cell)
+  checked_axis = _checked_axis(grid_data, axis)
+  checked_side = _checked_side(side)
+  return _snapshot_opposite_active_leaves(grid_data, lookup.tree_lookup, snapshot.leaf_to_index,
+                                          checked_cell, checked_axis, checked_side)
 end
 
 function _snapshot_direct_neighbor(grid::CartesianGrid{D}, tree_lookup, cell::Int,
