@@ -1,4 +1,5 @@
 using Test
+using LinearAlgebra
 using Grico
 
 const TOL = 1.0e-12
@@ -86,6 +87,36 @@ end
 _quadrature_tolerance(::Type{Float32}) = 5.0e-5
 
 _quadrature_tolerance(::Type{Float64}) = 1.0e-12
+
+@testset "Dense Local Kernels" begin
+  matrix_data = [0.0 2.0 1.0; 1.0 -2.0 -3.0; 2.0 3.0 1.0]
+  rhs = [1.0, -2.0, 0.5]
+  factor = copy(matrix_data)
+  pivots = zeros(Int, 3)
+  solution = copy(rhs)
+  Grico._dense_lu_factor!(factor, pivots)
+  Grico._dense_lu_solve!(factor, pivots, solution)
+  @test solution ≈ matrix_data \ rhs atol = TOL
+
+  rhs_matrix = [1.0 0.0; -2.0 3.0; 0.5 -1.0]
+  factor = copy(matrix_data)
+  matrix_solution = copy(rhs_matrix)
+  Grico._dense_lu_factor!(factor, pivots)
+  Grico._dense_lu_solve!(factor, pivots, matrix_solution)
+  @test matrix_solution ≈ matrix_data \ rhs_matrix atol = TOL
+
+  @test_throws SingularException Grico._dense_lu_factor!([1.0 2.0; 2.0 4.0], zeros(Int, 2))
+
+  spd_matrix = [4.0 1.0 2.0; 1.0 3.0 0.5; 2.0 0.5 5.0]
+  spd_rhs = [1.0, 2.0, -1.0]
+  cholesky_factor = copy(spd_matrix)
+  cholesky_solution = copy(spd_rhs)
+  Grico._dense_cholesky_factor!(cholesky_factor)
+  Grico._dense_cholesky_solve!(cholesky_factor, cholesky_solution)
+  @test cholesky_solution ≈ spd_matrix \ spd_rhs atol = TOL
+
+  @test_throws PosDefException Grico._dense_cholesky_factor!([1.0 2.0; 2.0 1.0])
+end
 
 @testset "Polynomial Core" begin
   @test Grico.legendre_values(0.5, 2) ≈ [1.0, 0.5, -0.125] atol = TOL

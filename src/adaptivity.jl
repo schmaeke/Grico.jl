@@ -1516,7 +1516,8 @@ end
 @inline function _cellwise_transfer_linear_solve(::Type{T}, local_matrix, local_rhs,
                                                  linear_solve) where {T<:AbstractFloat}
   solution = if linear_solve === default_linear_solve
-    local_matrix \ local_rhs
+    _dense_cholesky_factor!(local_matrix)
+    _dense_cholesky_solve!(local_matrix, local_rhs)
   else
     linear_solve(local_matrix, local_rhs)
   end

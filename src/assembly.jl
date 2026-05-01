@@ -202,6 +202,7 @@ mutable struct _AssemblyScratch{T<:AbstractFloat}
   solve_matrix::Matrix{T}
   rhs::Vector{T}
   work_rhs::Vector{T}
+  pivots::Vector{Int}
   shift_rows::Vector{Int}
   shift_values::Vector{T}
   reconstruction_rows::Vector{Int}
@@ -238,7 +239,7 @@ function _AssemblyScratch(::Type{T}, local_dof_count::Int) where {T<:AbstractFlo
                           Matrix{T}(undef, local_dof_count, local_dof_count),
                           Matrix{T}(undef, local_dof_count, local_dof_count),
                           Vector{T}(undef, local_dof_count), Vector{T}(undef, local_dof_count),
-                          Int[], T[], Int[], Int[], T[])
+                          Vector{Int}(undef, local_dof_count), Int[], T[], Int[], Int[], T[])
 end
 
 function _sparse_matrix_pattern(nrows::Int, ncols::Int, rows::Vector{Int}, cols::Vector{Int};
@@ -2019,9 +2020,9 @@ function _static_condense_affine!(scratch::_AssemblyScratch{T}, item::CellValues
     end
   end
 
-  factorization = lu!(factor_matrix)
-  ldiv!(factorization, work_rhs)
-  ldiv!(factorization, solve_matrix)
+  _dense_lu_factor!(factor_matrix, scratch.pivots)
+  _dense_lu_solve!(factor_matrix, scratch.pivots, work_rhs)
+  _dense_lu_solve!(factor_matrix, scratch.pivots, solve_matrix)
 
   for kept_row_index in 1:kept_count
     local_row = plan.kept_local_dofs[kept_row_index]
