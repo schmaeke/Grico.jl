@@ -7,8 +7,7 @@ struct _StabilityQuadraticReaction{F,T}
   target::T
 end
 
-function Grico.cell_residual!(local_residual, operator::_StabilityQuadraticReaction, values,
-                              state)
+function Grico.cell_residual!(local_residual, operator::_StabilityQuadraticReaction, values, state)
   field = operator.field
 
   for point_index in 1:point_count(values)
@@ -76,30 +75,26 @@ end
   @testset "Embedded Surface Active Frontiers" begin
     inactive_domain = Domain((0.0,), (1.0,), (1,))
     refine!(grid(inactive_domain), 1, 1)
-    _throws_argument_message(() -> implicit_surface_quadrature(inactive_domain, 1,
-                                                               x -> x[1] - 0.5),
+    _throws_argument_message(() -> implicit_surface_quadrature(inactive_domain, 1, x -> x[1] - 0.5),
                              "active leaves")
 
     physical_background = Domain((0.0,), (1.0,), (1,))
     refine!(grid(physical_background), 1, 1)
     physical_domain = PhysicalDomain(physical_background,
                                      ImplicitRegion(x -> -1.0; subdivision_depth=0))
-    _throws_argument_message(() -> implicit_surface_quadrature(physical_domain, 1,
-                                                               x -> x[1] - 0.5),
+    _throws_argument_message(() -> implicit_surface_quadrature(physical_domain, 1, x -> x[1] - 0.5),
                              "active leaves")
 
     virtual_domain = Domain((0.0,), (1.0,), (1,))
     virtual_snapshot, children = Grico._refine_snapshot_leaf!(Grico.snapshot(grid(virtual_domain)),
                                                               1, (true,))
     _throws_argument_message(() -> implicit_surface_quadrature(virtual_domain, first(children),
-                                                               x -> x[1] - 0.25),
-                             "active leaves")
+                                                               x -> x[1] - 0.25), "active leaves")
 
     virtual_space = Grico._compile_snapshot_space(virtual_domain, virtual_snapshot,
                                                   SpaceOptions(degree=UniformDegree(1)))
     @test Grico.check_space(virtual_space) === nothing
-    @test implicit_surface_quadrature(virtual_space, first(children), x -> x[1] - 0.25) !==
-          nothing
+    @test implicit_surface_quadrature(virtual_space, first(children), x -> x[1] - 0.25) !== nothing
   end
 
   @testset "Extension Fallbacks" begin

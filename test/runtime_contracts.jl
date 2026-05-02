@@ -21,8 +21,7 @@ function Grico.cell_rhs!(local_rhs, operator::_RuntimeMassOperator, values)
   return nothing
 end
 
-function Grico.cell_apply!(local_result, operator::_RuntimeMassOperator, values,
-                           local_coefficients)
+function Grico.cell_apply!(local_result, operator::_RuntimeMassOperator, values, local_coefficients)
   field = operator.field
 
   for point_index in 1:point_count(values)
@@ -61,8 +60,8 @@ function Grico.cell_residual!(local_residual, operator::_RuntimeQuadraticOperato
   return nothing
 end
 
-function Grico.cell_tangent_apply!(local_result, operator::_RuntimeQuadraticOperator, values,
-                                   state, local_increment)
+function Grico.cell_tangent_apply!(local_result, operator::_RuntimeQuadraticOperator, values, state,
+                                   local_increment)
   field = operator.field
 
   for point_index in 1:point_count(values)
@@ -87,16 +86,14 @@ end
 
 @testset "Runtime Contracts" begin
   @testset "Shared Memory Runtime Boundary" begin
-    @test Grico._runtime_worker_count(Grico._SHARED_MEMORY_CPU_BACKEND) ==
-          Base.Threads.nthreads()
+    @test Grico._runtime_worker_count(Grico._SHARED_MEMORY_CPU_BACKEND) == Base.Threads.nthreads()
     @test Grico._runtime_uses_polyester(Grico._SharedMemoryCPUBackend) isa Bool
   end
 
   @testset "Affine Matrix-Free Workspace" begin
     domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 2))
     space = HpSpace(domain,
-                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2),
-                                 continuity=:dg))
+                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2), continuity=:dg))
     u = ScalarField(space; name=:u)
     problem = AffineProblem(u)
     add_cell!(problem, _RuntimeMassOperator(u))
@@ -123,8 +120,7 @@ end
   @testset "Residual Matrix-Free Workspace" begin
     domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 2))
     space = HpSpace(domain,
-                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1),
-                                 continuity=:dg))
+                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1), continuity=:dg))
     u = ScalarField(space; name=:u)
     problem = ResidualProblem(u)
     add_cell!(problem, _RuntimeQuadraticOperator(u, 1.0))
@@ -148,8 +144,7 @@ end
   @testset "Transfer Allocation Smoke" begin
     domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 2))
     space = HpSpace(domain,
-                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1),
-                                 continuity=:dg))
+                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1), continuity=:dg))
     u = ScalarField(space; name=:u)
     state = State(FieldLayout((u,)), ones(field_dof_count(u)))
     plan = AdaptivityPlan(space)

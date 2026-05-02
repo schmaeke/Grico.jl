@@ -634,25 +634,22 @@ function _transfer_variational_state(transition::SpaceTransition, state::State, 
   end
 end
 
-function _transfer_state_with_strategy(::_CellwiseDGTransferStrategy,
-                                       transition::SpaceTransition, state::State,
-                                       old_fields::Tuple, new_fields::Tuple;
+function _transfer_state_with_strategy(::_CellwiseDGTransferStrategy, transition::SpaceTransition,
+                                       state::State, old_fields::Tuple, new_fields::Tuple;
                                        linear_solve=default_linear_solve)
   plan = _compile_cellwise_dg_transfer_plan(transition, old_fields, new_fields)
   return _transfer_cellwise_dg_state(plan, state; linear_solve=linear_solve)
 end
 
 function _transfer_state_with_strategy(::_LocalProjectionTransferStrategy,
-                                       transition::SpaceTransition, state::State,
-                                       old_fields::Tuple, new_fields::Tuple;
-                                       linear_solve=default_linear_solve)
+                                       transition::SpaceTransition, state::State, old_fields::Tuple,
+                                       new_fields::Tuple; linear_solve=default_linear_solve)
   plan = _compile_local_projection_transfer_plan(transition, old_fields, new_fields)
   return _transfer_local_projection_state(plan, state)
 end
 
-function _transfer_state_with_strategy(::_VariationalTransferStrategy,
-                                       transition::SpaceTransition, state::State,
-                                       old_fields::Tuple, new_fields::Tuple;
+function _transfer_state_with_strategy(::_VariationalTransferStrategy, transition::SpaceTransition,
+                                       state::State, old_fields::Tuple, new_fields::Tuple;
                                        linear_solve=default_linear_solve)
   return _transfer_variational_state(transition, state, old_fields, new_fields; linear_solve)
 end

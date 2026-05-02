@@ -57,8 +57,8 @@ end
 # only decides whether to write a single solution grid or a multiblock file with
 # an additional active-leaf mesh skeleton.
 function _write_vtk(path::AbstractString, reference; state::Union{Nothing,Grico.State}=nothing,
-                    fields=nothing, point_data=(), cell_data=(), field_data=(),
-                    subdivisions=1, sample_degree=1, mesh::Bool=false, vtk_kwargs...)
+                    fields=nothing, point_data=(), cell_data=(), field_data=(), subdivisions=1,
+                    sample_degree=1, mesh::Bool=false, vtk_kwargs...)
   data = Grico.sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                   cell_data=cell_data, field_data=field_data,
                                   subdivisions=subdivisions, sample_degree=sample_degree)
@@ -72,8 +72,7 @@ function _write_vtk(path::AbstractString, reference; state::Union{Nothing,Grico.
   return only(_write_vtk_solution_grid(path, data, grid_kwargs))
 end
 
-function _require_vtk_dimension(mesh::Union{Grico.SampledMesh{D},
-                                            Grico.SampledMeshSkeleton{D}}) where {D}
+function _require_vtk_dimension(mesh::Union{Grico.SampledMesh{D},Grico.SampledMeshSkeleton{D}}) where {D}
   Grico.postprocess_supported(D) ||
     throw(ArgumentError("VTK export requires sampled data with dimension between 1 and 3"))
   return nothing

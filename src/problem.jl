@@ -236,9 +236,7 @@ function Base.setproperty!(problem::_AbstractProblem, name::Symbol, value)
   return setfield!(problem, name, value)
 end
 
-function Base.propertynames(::_AbstractProblem, private::Bool=false)
-  return private ? (:_data,) : ()
-end
+Base.propertynames(::_AbstractProblem, private::Bool=false) = private ? (:_data,) : ()
 
 # Public problem wrapper types.
 
@@ -269,9 +267,7 @@ plans.
 struct AffineProblem <: _AbstractProblem
   _data::_ProblemData
 
-  function AffineProblem(fields::AbstractField...)
-    return new(_empty_problem_data(fields...))
-  end
+  AffineProblem(fields::AbstractField...) = new(_empty_problem_data(fields...))
 end
 
 """
@@ -293,9 +289,7 @@ operator callbacks.
 struct ResidualProblem <: _AbstractProblem
   _data::_ProblemData
 
-  function ResidualProblem(fields::AbstractField...)
-    return new(_empty_problem_data(fields...))
-  end
+  ResidualProblem(fields::AbstractField...) = new(_empty_problem_data(fields...))
 end
 
 """

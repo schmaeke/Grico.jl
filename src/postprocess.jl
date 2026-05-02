@@ -161,8 +161,7 @@ function _sample_postprocess(reference; state::Union{Nothing,State}=nothing, fie
 end
 
 function _checked_postprocess_positive_integer(value, name::AbstractString)
-  value isa Integer ||
-    throw(ArgumentError("$name must be a positive Int-representable integer"))
+  value isa Integer || throw(ArgumentError("$name must be a positive Int-representable integer"))
   return _checked_positive(value, name)
 end
 

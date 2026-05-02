@@ -129,8 +129,8 @@ export CartesianGrid, LOWER, NONE, UPPER, active_leaf_count, active_leaves
 public GridSnapshot, active_leaf, boundary_face_count, boundary_face_spec, check_snapshot,
        check_topology, compact!, covering_neighbor, first_child, interface_count, interface_spec,
        is_active_leaf, is_domain_boundary, is_expanded, is_periodic_axis, is_tree_cell, level,
-       logical_coordinate, neighbor, opposite_active_leaves, parent, periodic_axes,
-       root_cell_count, root_cell_counts, root_cell_total, snapshot, split_axis, stored_cell_count
+       logical_coordinate, neighbor, opposite_active_leaves, parent, periodic_axes, root_cell_count,
+       root_cell_counts, root_cell_total, snapshot, split_axis, stored_cell_count
 
 include("geometry.jl")
 export Domain, cell_center, cell_lower, cell_size, cell_upper, cell_volume, extent, grid, origin

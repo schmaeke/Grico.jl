@@ -513,22 +513,17 @@ end
   @test Grico.scalar_dof_count(ring_space) == 2
   @test Grico.check_space(ring_space) === nothing
 
-  mixed_periodic_domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (2, 1);
-                                       periodic=(true, false))
+  mixed_periodic_domain = Grico.Domain((0.0, 0.0), (1.0, 1.0), (2, 1); periodic=(true, false))
   mixed_periodic_space = Grico.HpSpace(mixed_periodic_domain,
                                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
                                                           degree=Grico.AxisDegrees((1, 0)),
                                                           continuity=(:cg, :dg)))
   @test Grico.check_space(mixed_periodic_space) === nothing
   mixed_periodic_coefficients = collect(1.0:Grico.scalar_dof_count(mixed_periodic_space))
-  @test _space_value(mixed_periodic_space, 1, (-1.0, 0.0),
-                     mixed_periodic_coefficients) ≈
-        _space_value(mixed_periodic_space, 2, (1.0, 0.0),
-                     mixed_periodic_coefficients) atol = SPACE_TOL
-  @test _space_value(mixed_periodic_space, 1, (1.0, 0.0),
-                     mixed_periodic_coefficients) ≈
-        _space_value(mixed_periodic_space, 2, (-1.0, 0.0),
-                     mixed_periodic_coefficients) atol = SPACE_TOL
+  @test _space_value(mixed_periodic_space, 1, (-1.0, 0.0), mixed_periodic_coefficients) ≈
+        _space_value(mixed_periodic_space, 2, (1.0, 0.0), mixed_periodic_coefficients) atol = SPACE_TOL
+  @test _space_value(mixed_periodic_space, 1, (1.0, 0.0), mixed_periodic_coefficients) ≈
+        _space_value(mixed_periodic_space, 2, (-1.0, 0.0), mixed_periodic_coefficients) atol = SPACE_TOL
 
   single_domain = Grico.Domain((0.0,), (1.0,), (1,); periodic=true)
   single_space = Grico.HpSpace(single_domain,

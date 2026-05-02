@@ -46,8 +46,7 @@ end
     @test fields(problem) == (u,)
     @test field_count(problem) == 1
     @test propertynames(problem) == ()
-    _throws_problem_argument_message(() -> getproperty(problem, :cell_operators),
-                                     "problem storage")
+    _throws_problem_argument_message(() -> getproperty(problem, :cell_operators), "problem storage")
     _throws_problem_argument_message(() -> setproperty!(problem, :fields, AbstractField[]),
                                      "problem storage")
   end
@@ -76,8 +75,8 @@ end
     @test_throws ArgumentError add_boundary!(periodic_problem, BoundaryFace(1, LOWER),
                                              _ProblemApiBoundaryMarker())
     @test_throws ArgumentError add_constraint!(periodic_problem,
-                                               Dirichlet(periodic_field,
-                                                         BoundaryFace(1, LOWER), 0.0))
+                                               Dirichlet(periodic_field, BoundaryFace(1, LOWER),
+                                                         0.0))
 
     dg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(0), continuity=:dg))
     dg_field = ScalarField(dg_space; name=:dg)

@@ -1118,4 +1118,3 @@ function _adaptivity_plan_from_selections(space::HpSpace{D}, h_refinement_axes, 
   return _batched_adaptivity_plan(space, p_degree_changes, h_refinement_axes,
                                   h_coarsening_candidates; limits=limits)
 end
-

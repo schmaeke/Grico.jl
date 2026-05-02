@@ -147,8 +147,7 @@ end
 
   dg_domain = Domain((0.0,), (1.0,), (1,))
   dg_space = HpSpace(dg_domain,
-                     SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
-                                  continuity=:dg))
+                     SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
   dg_plan = AdaptivityPlan(dg_space)
   request_h_refinement!(dg_plan, 1, 1)
   dg_transition = transition(dg_plan)
@@ -167,9 +166,8 @@ end
   manual_plan = AdaptivityPlan(space)
   request_h_refinement!(manual_plan, 1, 1)
   heuristic_plan = adaptivity_plan(state, u; tolerance=0.0,
-                                   limits=AdaptivityLimits(space; min_h_level=0,
-                                                           max_h_level=0, min_p=2,
-                                                           max_p=3))
+                                   limits=AdaptivityLimits(space; min_h_level=0, max_h_level=0,
+                                                           min_p=2, max_p=3))
 
   @test h_adaptation_axes(manual_plan, 1) == (true,)
   @test p_degree_change(manual_plan, 1) == (0,)

@@ -988,7 +988,6 @@ function request_p_derefinement!(plan::AdaptivityPlan{D}, leaf::Integer,
   return _apply_p_derefinement!(plan, leaf, _checked_degree_steps(decrements, "decrements"))
 end
 
-
 # Source-space reporting helpers.
 
 # One internal change summary per source leaf keeps the public query helpers and

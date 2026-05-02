@@ -561,8 +561,7 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return apply!(result, plan, coefficients, OperatorWorkspace(plan))
 end
 
-function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
-                coefficients::AbstractVector{T},
+function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, coefficients::AbstractVector{T},
                 workspace::OperatorWorkspace{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   _check_operator_workspace(plan, workspace)

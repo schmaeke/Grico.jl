@@ -44,19 +44,16 @@ end
   @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> 1.0) === nothing
   @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> x[1]) === nothing
 
-  sliver = Grico.finite_cell_quadrature(domain, 1, (1,), x -> x[1] - 1.0e-6;
-                                        subdivision_depth=0)
+  sliver = Grico.finite_cell_quadrature(domain, 1, (1,), x -> x[1] - 1.0e-6; subdivision_depth=0)
   @test sliver !== nothing
   @test point_count(sliver) >= 1
   @test sum(weight(sliver, index) for index in 1:point_count(sliver)) > 0.0
 
   domain3 = Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1, 1, 1))
-  half = Grico.finite_cell_quadrature(domain3, 1, (2, 2, 2), x -> x[1] - 0.5;
-                                      subdivision_depth=1)
+  half = Grico.finite_cell_quadrature(domain3, 1, (2, 2, 2), x -> x[1] - 0.5; subdivision_depth=1)
   @test half !== nothing
   @test Grico.dimension(half) == 3
-  @test sum(weight(half, index) for index in 1:point_count(half)) ≈ 4.0 atol =
-        EMBEDDED_GEOMETRY_TOL
+  @test sum(weight(half, index) for index in 1:point_count(half)) ≈ 4.0 atol = EMBEDDED_GEOMETRY_TOL
 
   _argument_message_contains(() -> ImplicitRegion(x -> -1.0; subdivision_depth=1.5),
                              "subdivision_depth")
@@ -70,8 +67,7 @@ end
   one_dimensional = Domain((0.0,), (1.0,), (1,))
   three_dimensional = Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1, 1, 1))
 
-  _argument_message_contains(() -> Grico.surface_quadratures(EmbeddedSurface(line),
-                                                             one_dimensional),
+  _argument_message_contains(() -> Grico.surface_quadratures(EmbeddedSurface(line), one_dimensional),
                              "dimension 1")
   _argument_message_contains(() -> Grico.implicit_surface_quadrature(three_dimensional, 1,
                                                                      x -> x[1] - 0.5),
