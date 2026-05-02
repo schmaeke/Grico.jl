@@ -4,11 +4,17 @@ import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 struct SineInterfacePoissonDiffusion{F}
   field::F
+  use_tensor::Bool
 end
+
+SineInterfacePoissonDiffusion(field) = SineInterfacePoissonDiffusion(field, true)
 
 struct SineInterfacePoissonSource{F}
   field::F
+  use_tensor::Bool
 end
+
+SineInterfacePoissonSource(field) = SineInterfacePoissonSource(field, true)
 
 function sine_interface_poisson_field(options; continuity)
   domain = Domain((0.0, 0.0), (1.0, 1.0), options["root_cells"])
@@ -20,9 +26,33 @@ function sine_interface_poisson_field(options; continuity)
 end
 
 function add_sine_interface_poisson_cells!(problem, field)
-  add_cell!(problem, SineInterfacePoissonDiffusion(field))
-  add_cell!(problem, SineInterfacePoissonSource(field))
+  add_sine_interface_poisson_cells!(problem, field, true)
+end
+
+function add_sine_interface_poisson_cells!(problem, field, use_tensor::Bool)
+  add_cell!(problem, SineInterfacePoissonDiffusion(field, use_tensor))
+  add_cell!(problem, SineInterfacePoissonSource(field, use_tensor))
   return problem
+end
+
+function _copy_scalar_tensor_input!(result, values, field, local_coefficients)
+  range = field_dof_range(values, field)
+
+  @inbounds for mode_index in eachindex(result)
+    result[mode_index] = local_coefficients[first(range)+mode_index-1]
+  end
+
+  return result
+end
+
+function _add_scalar_tensor_output!(local_result, values, field, contribution)
+  range = field_dof_range(values, field)
+
+  @inbounds for mode_index in eachindex(contribution)
+    local_result[first(range)+mode_index-1] += contribution[mode_index]
+  end
+
+  return local_result
 end
 
 # Apply the scalar Poisson stiffness block ∫Ω ∇u · ∇v dΩ.
@@ -47,6 +77,42 @@ function cell_apply!(local_result, operator::SineInterfacePoissonDiffusion, valu
     end
   end
 
+  return nothing
+end
+
+function cell_apply!(local_result, operator::SineInterfacePoissonDiffusion, values::CellValues,
+                     local_coefficients, scratch::KernelScratch)
+  tensor = tensor_values(values, operator.field)
+  if !operator.use_tensor || tensor === nothing || !is_full_tensor(tensor)
+    return cell_apply!(local_result, operator, values, local_coefficients)
+  end
+
+  return _cell_apply_tensor_diffusion!(local_result, operator, values, local_coefficients, tensor,
+                                       scratch)
+end
+
+function _cell_apply_tensor_diffusion!(local_result, operator::SineInterfacePoissonDiffusion,
+                                       values::CellValues, local_coefficients,
+                                       tensor::TensorProductValues{D,T},
+                                       scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  gradients = scratch_matrix(scratch, 1, length(tensor_degrees(tensor)), tensor_point_count(tensor))
+  input = scratch_vector(scratch, length(tensor_degrees(tensor)) + 2, tensor_mode_count(tensor))
+  _copy_scalar_tensor_input!(input, values, operator.field, local_coefficients)
+  tensor_gradient!(gradients, tensor, input, scratch)
+
+  @inbounds for point_index in 1:tensor_point_count(tensor)
+    weighted = weight(values, point_index)
+
+    for axis in 1:size(gradients, 1)
+      gradients[axis, point_index] *= weighted
+    end
+  end
+
+  contribution = scratch_vector(scratch, length(tensor_degrees(tensor)) + 3,
+                                tensor_mode_count(tensor))
+  fill!(contribution, zero(eltype(contribution)))
+  tensor_project_gradient!(contribution, tensor, gradients, scratch)
+  _add_scalar_tensor_output!(local_result, values, operator.field, contribution)
   return nothing
 end
 
@@ -90,6 +156,35 @@ function cell_rhs!(local_rhs, operator::SineInterfacePoissonSource, values::Cell
     end
   end
 
+  return nothing
+end
+
+function cell_rhs!(local_rhs, operator::SineInterfacePoissonSource, values::CellValues,
+                   scratch::KernelScratch)
+  tensor = tensor_values(values, operator.field)
+  if !operator.use_tensor || tensor === nothing || !is_full_tensor(tensor)
+    return cell_rhs!(local_rhs, operator, values)
+  end
+
+  return _cell_rhs_tensor_source!(local_rhs, operator, values, tensor, scratch)
+end
+
+function _cell_rhs_tensor_source!(local_rhs, operator::SineInterfacePoissonSource,
+                                  values::CellValues, tensor::TensorProductValues{D,T},
+                                  scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  weighted_values = scratch_vector(scratch, length(tensor_degrees(tensor)) + 2,
+                                   tensor_point_count(tensor))
+
+  @inbounds for point_index in 1:tensor_point_count(tensor)
+    weighted_values[point_index] = sine_interface_source(point(values, point_index)) *
+                                   weight(values, point_index)
+  end
+
+  contribution = scratch_vector(scratch, length(tensor_degrees(tensor)) + 3,
+                                tensor_mode_count(tensor))
+  fill!(contribution, zero(eltype(contribution)))
+  tensor_project!(contribution, tensor, weighted_values, scratch)
+  _add_scalar_tensor_output!(local_rhs, values, operator.field, contribution)
   return nothing
 end
 

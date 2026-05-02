@@ -46,6 +46,27 @@
 # function values can be reconstructed directly from a global `State`. The
 # component count is a type parameter because component-free vector evaluation
 # returns tuples whose length should be known to inference.
+"""
+    TensorProductValues
+
+One-dimensional tensor-product basis data for one field on one local
+integration item.
+
+`TensorProductValues` is available through [`tensor_values`](@ref) when the
+quadrature item has tensor-product point structure. It stores per-axis basis
+value tables and physical derivative-factor tables; full multidimensional shape
+tables remain available through [`shape_values`](@ref) and
+[`shape_gradients`](@ref).
+"""
+struct TensorProductValues{D,T<:AbstractFloat}
+  degrees::NTuple{D,Int}
+  quadrature_shape::NTuple{D,Int}
+  local_modes::Vector{NTuple{D,Int}}
+  values::NTuple{D,Matrix{T}}
+  gradients::NTuple{D,Matrix{T}}
+  full_tensor::Bool
+end
+
 struct _FieldValues{D,T<:AbstractFloat,C}
   field_id::UInt64
   scalar_dof_count::Int
@@ -53,6 +74,7 @@ struct _FieldValues{D,T<:AbstractFloat,C}
   block::UnitRange{Int}
   values::Matrix{T}
   gradients::Array{T,3}
+  tensor::Union{Nothing,TensorProductValues{D,T}}
   term_offsets::Vector{Int}
   term_indices::Vector{Int}
   term_coefficients::Vector{T}
@@ -753,6 +775,475 @@ function shape_gradients(values::_FieldEvaluationValues, field::AbstractField)
   _field_values(values, field).gradients
 end
 
+"""
+    tensor_values(values, field)
+
+Return one-dimensional tensor-product basis data for `field` on `values`, or
+`nothing` when the integration item does not have tensor-product quadrature
+structure.
+
+The returned [`TensorProductValues`](@ref) is intended for sum-factorized local
+kernels. The existing [`shape_values`](@ref) and [`shape_gradients`](@ref)
+tables remain the direct full-table API for prototyping and non-tensor
+quadrature items.
+"""
+@inline function tensor_values(values::_FieldEvaluationValues, field::AbstractField)
+  _field_values(values, field).tensor
+end
+
+"""
+    tensor_degrees(data)
+
+Return the per-axis polynomial degrees of a [`TensorProductValues`](@ref)
+object.
+
+The result describes the enclosing tensor-product mode box. A reduced basis may
+not contain every mode in that box; use [`is_full_tensor`](@ref) to check
+whether the standard full tensor-product ordering is present.
+"""
+tensor_degrees(data::TensorProductValues) = data.degrees
+
+"""
+    tensor_quadrature_shape(data)
+
+Return the number of tensor-product quadrature points on each reference axis.
+
+The product of these counts is [`tensor_point_count`](@ref), and linear
+quadrature-point storage uses Grico's standard mixed-radix order with axis 1 as
+the fastest-varying index.
+"""
+tensor_quadrature_shape(data::TensorProductValues) = data.quadrature_shape
+
+"""
+    tensor_mode_shape(data)
+
+Return the size of the enclosing tensor-product mode box.
+
+For polynomial degree tuple `p`, this is `p .+ 1`. The returned shape is the
+coefficient layout expected by the sum-factorization helper kernels when
+[`is_full_tensor`](@ref) is true.
+"""
+function tensor_mode_shape(data::TensorProductValues{D}) where {D}
+  ntuple(axis -> data.degrees[axis] + 1, D)
+end
+
+"""
+    tensor_point_count(data)
+
+Return the total number of quadrature points represented by `data`.
+"""
+tensor_point_count(data::TensorProductValues) = prod(data.quadrature_shape)
+
+"""
+    tensor_mode_count(data)
+
+Return the number of local scalar modes represented by `data`.
+
+For full tensor-product bases this equals `prod(tensor_mode_shape(data))`; for
+reduced basis families it may be smaller.
+"""
+tensor_mode_count(data::TensorProductValues) = length(data.local_modes)
+
+"""
+    tensor_local_modes(data)
+
+Return the local tensor-mode multi-indices represented by `data`.
+
+Each entry is an axis tuple using zero-based polynomial mode numbers. The
+returned vector is owned by the compiled integration item and should be treated
+as read-only by user kernels.
+"""
+tensor_local_modes(data::TensorProductValues) = data.local_modes
+
+"""
+    tensor_axis_values(data, axis)
+
+Return the one-dimensional basis-value table for `axis`.
+
+The returned matrix entry `(i, q)` stores the value of the one-dimensional mode
+`i - 1` at axis quadrature point `q`. The matrix belongs to the compiled
+integration item and should be treated as read-only.
+"""
+@inline function tensor_axis_values(data::TensorProductValues, axis::Integer)
+  checked_axis = _require_index(axis, length(data.degrees), "tensor axis")
+  return data.values[checked_axis]
+end
+
+"""
+    tensor_axis_gradients(data, axis)
+
+Return the one-dimensional physical derivative-factor table for `axis`.
+
+The returned matrix entry `(i, q)` stores the derivative of one-dimensional
+mode `i - 1` at axis quadrature point `q`, scaled by the affine physical
+inverse Jacobian in that direction. The matrix belongs to the compiled
+integration item and should be treated as read-only.
+"""
+@inline function tensor_axis_gradients(data::TensorProductValues, axis::Integer)
+  checked_axis = _require_index(axis, length(data.degrees), "tensor axis")
+  return data.gradients[checked_axis]
+end
+
+"""
+    is_full_tensor(data)
+
+Return whether `data` stores a complete tensor-product mode box in Grico's
+standard mixed-radix mode order.
+
+The sum-factorization helper kernels require this property. Users working with
+reduced basis families can still use the one-dimensional tables directly.
+"""
+is_full_tensor(data::TensorProductValues) = data.full_tensor
+
+function _is_full_tensor_modes(local_modes, degrees::NTuple{D,Int}) where {D}
+  length(local_modes) == prod(ntuple(axis -> degrees[axis] + 1, D)) || return false
+
+  for (mode_index, mode) in enumerate(basis_modes(FullTensorBasis(), degrees))
+    @inbounds local_modes[mode_index] == mode || return false
+  end
+
+  return true
+end
+
+function _require_full_tensor(data::TensorProductValues)
+  is_full_tensor(data) ||
+    throw(ArgumentError("sum-factorization helpers require a full tensor-product local mode set"))
+  return nothing
+end
+
+function _tensor_reindexed_linear_index(source_shape::NTuple{D,Int}, target_shape::NTuple{D,Int},
+                                        target_linear::Int, axis::Int,
+                                        source_axis_index::Int) where {D}
+  linear = (source_axis_index - 1) * _tensor_shape_stride(source_shape, axis)
+
+  for current_axis in 1:D
+    current_axis == axis && continue
+    target_axis_index = _tensor_shape_axis_index(target_shape, target_linear, current_axis)
+    linear += (target_axis_index - 1) * _tensor_shape_stride(source_shape, current_axis)
+  end
+
+  return linear + 1
+end
+
+function _tensor_contract_axis!(output::AbstractVector{T}, input::AbstractVector{T},
+                                input_shape::NTuple{D,Int}, output_shape::NTuple{D,Int},
+                                table::AbstractMatrix{T}, axis::Int) where {D,T<:AbstractFloat}
+  output_count = prod(output_shape)
+  @boundscheck _require_length(output, output_count, "tensor contraction output")
+
+  @inbounds for output_index in 1:output_count
+    output_linear = output_index - 1
+    output_axis_index = _tensor_shape_axis_index(output_shape, output_linear, axis)
+    value = zero(T)
+
+    for input_axis_index in 1:input_shape[axis]
+      input_index = _tensor_reindexed_linear_index(input_shape, output_shape, output_linear, axis,
+                                                   input_axis_index)
+      value = muladd(table[input_axis_index, output_axis_index], input[input_index], value)
+    end
+
+    output[output_index] = value
+  end
+
+  return output
+end
+
+function _tensor_contract_axis!(output::AbstractVector{T}, input::AbstractVector{T},
+                                input_shape::NTuple{2,Int}, output_shape::NTuple{2,Int},
+                                table::AbstractMatrix{T}, axis::Int) where {T<:AbstractFloat}
+  @boundscheck _require_length(output, prod(output_shape), "tensor contraction output")
+
+  if axis == 1
+    n1, n2 = input_shape
+    q1 = output_shape[1]
+
+    @inbounds for j in 1:n2
+      input_offset = (j - 1) * n1
+      output_offset = (j - 1) * q1
+
+      for q in 1:q1
+        value = zero(T)
+
+        for i in 1:n1
+          value = muladd(table[i, q], input[input_offset+i], value)
+        end
+
+        output[output_offset+q] = value
+      end
+    end
+  elseif axis == 2
+    n1, n2 = input_shape
+    q2 = output_shape[2]
+
+    @inbounds for q in 1:q2
+      output_offset = (q - 1) * n1
+
+      for i in 1:n1
+        value = zero(T)
+
+        for j in 1:n2
+          value = muladd(table[j, q], input[i+(j-1)*n1], value)
+        end
+
+        output[output_offset+i] = value
+      end
+    end
+  else
+    throw(ArgumentError("tensor axis out of range"))
+  end
+
+  return output
+end
+
+function _tensor_contract_axis_transpose!(output::AbstractVector{T}, input::AbstractVector{T},
+                                          input_shape::NTuple{D,Int}, output_shape::NTuple{D,Int},
+                                          table::AbstractMatrix{T},
+                                          axis::Int) where {D,T<:AbstractFloat}
+  output_count = prod(output_shape)
+  @boundscheck _require_length(output, output_count, "tensor transpose contraction output")
+
+  @inbounds for output_index in 1:output_count
+    output_linear = output_index - 1
+    output_axis_index = _tensor_shape_axis_index(output_shape, output_linear, axis)
+    value = zero(T)
+
+    for input_axis_index in 1:input_shape[axis]
+      input_index = _tensor_reindexed_linear_index(input_shape, output_shape, output_linear, axis,
+                                                   input_axis_index)
+      value = muladd(table[output_axis_index, input_axis_index], input[input_index], value)
+    end
+
+    output[output_index] = value
+  end
+
+  return output
+end
+
+function _tensor_contract_axis_transpose!(output::AbstractVector{T}, input::AbstractVector{T},
+                                          input_shape::NTuple{2,Int}, output_shape::NTuple{2,Int},
+                                          table::AbstractMatrix{T},
+                                          axis::Int) where {T<:AbstractFloat}
+  @boundscheck _require_length(output, prod(output_shape), "tensor transpose contraction output")
+
+  if axis == 1
+    q1 = input_shape[1]
+    n1, n2 = output_shape
+
+    @inbounds for j in 1:n2
+      input_offset = (j - 1) * q1
+      output_offset = (j - 1) * n1
+
+      for i in 1:n1
+        value = zero(T)
+
+        for q in 1:q1
+          value = muladd(table[i, q], input[input_offset+q], value)
+        end
+
+        output[output_offset+i] = value
+      end
+    end
+  elseif axis == 2
+    n1 = input_shape[1]
+    q2 = input_shape[2]
+    n2 = output_shape[2]
+
+    @inbounds for j in 1:n2
+      output_offset = (j - 1) * n1
+
+      for i in 1:n1
+        value = zero(T)
+
+        for q in 1:q2
+          value = muladd(table[j, q], input[i+(q-1)*n1], value)
+        end
+
+        output[output_offset+i] = value
+      end
+    end
+  else
+    throw(ArgumentError("tensor axis out of range"))
+  end
+
+  return output
+end
+
+function _tensor_interpolate_with_axis!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                        coefficients::AbstractVector{T}, derivative_axis::Int,
+                                        scratch::KernelScratch{T},
+                                        first_scratch_slot::Int) where {D,T<:AbstractFloat}
+  current = coefficients
+  current_shape = tensor_mode_shape(data)
+
+  for axis in 1:D
+    next_shape = _tensor_replace_axis(current_shape, axis, data.quadrature_shape[axis])
+    next = scratch_vector(scratch, first_scratch_slot + axis - 1, prod(next_shape))
+    table = axis == derivative_axis ? data.gradients[axis] : data.values[axis]
+    _tensor_contract_axis!(next, current, current_shape, next_shape, table, axis)
+    current = next
+    current_shape = next_shape
+  end
+
+  copyto!(result, current)
+  return result
+end
+
+"""
+    tensor_interpolate!(result, data, coefficients, scratch[, first_scratch_slot])
+
+Evaluate a scalar full tensor-product local coefficient vector at all
+quadrature points using sum factorization. `result` is overwritten.
+
+The helper uses `D` vector scratch slots beginning at `first_scratch_slot`,
+which defaults to `1`. The input and output buffers must not alias those work
+slots.
+"""
+function tensor_interpolate!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                             coefficients::AbstractVector{T},
+                             scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_interpolate!(result, data, coefficients, scratch, 1)
+end
+
+function tensor_interpolate!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                             coefficients::AbstractVector{T}, scratch::KernelScratch{T},
+                             first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_full_tensor(data)
+  _require_length(coefficients, tensor_mode_count(data), "tensor coefficient vector")
+  _require_length(result, tensor_point_count(data), "tensor interpolation result")
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  return _tensor_interpolate_with_axis!(result, data, coefficients, 0, scratch, first_slot)
+end
+
+"""
+    tensor_gradient!(result, data, coefficients, scratch[, first_scratch_slot])
+
+Evaluate the physical gradient of a scalar full tensor-product local coefficient
+vector at all quadrature points. `result` is a `D x point_count` matrix and is
+overwritten.
+
+The helper uses `D + 1` vector scratch slots beginning at `first_scratch_slot`,
+which defaults to `1`. The coefficient and result buffers must not alias those
+work slots.
+"""
+function tensor_gradient!(result::AbstractMatrix{T}, data::TensorProductValues{D,T},
+                          coefficients::AbstractVector{T},
+                          scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_gradient!(result, data, coefficients, scratch, 1)
+end
+
+function tensor_gradient!(result::AbstractMatrix{T}, data::TensorProductValues{D,T},
+                          coefficients::AbstractVector{T}, scratch::KernelScratch{T},
+                          first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_full_tensor(data)
+  _require_length(coefficients, tensor_mode_count(data), "tensor coefficient vector")
+  size(result, 1) == D ||
+    throw(ArgumentError("tensor gradient result row count must match the dimension"))
+  size(result, 2) == tensor_point_count(data) ||
+    throw(ArgumentError("tensor gradient result column count must match the point count"))
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  values = scratch_vector(scratch, first_slot + D, tensor_point_count(data))
+
+  for axis in 1:D
+    _tensor_interpolate_with_axis!(values, data, coefficients, axis, scratch, first_slot)
+    @inbounds for point_index in 1:length(values)
+      result[axis, point_index] = values[point_index]
+    end
+  end
+
+  return result
+end
+
+function _tensor_project_with_axis!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                    weighted_values::AbstractVector{T}, derivative_axis::Int,
+                                    scratch::KernelScratch{T},
+                                    first_scratch_slot::Int) where {D,T<:AbstractFloat}
+  current = weighted_values
+  current_shape = data.quadrature_shape
+
+  for axis in 1:D
+    next_shape = _tensor_replace_axis(current_shape, axis, data.degrees[axis] + 1)
+    next = scratch_vector(scratch, first_scratch_slot + axis - 1, prod(next_shape))
+    table = axis == derivative_axis ? data.gradients[axis] : data.values[axis]
+    _tensor_contract_axis_transpose!(next, current, current_shape, next_shape, table, axis)
+    current = next
+    current_shape = next_shape
+  end
+
+  @inbounds for mode_index in eachindex(result)
+    result[mode_index] += current[mode_index]
+  end
+
+  return result
+end
+
+"""
+    tensor_project!(result, data, weighted_values, scratch[, first_scratch_slot])
+
+Accumulate the sum-factorized projection of quadrature-point scalar data onto a
+full tensor-product local result vector.
+
+The helper uses `D` vector scratch slots beginning at `first_scratch_slot`,
+which defaults to `1`. The weighted input and result buffers must not alias
+those work slots.
+"""
+function tensor_project!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                         weighted_values::AbstractVector{T},
+                         scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_project!(result, data, weighted_values, scratch, 1)
+end
+
+function tensor_project!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                         weighted_values::AbstractVector{T}, scratch::KernelScratch{T},
+                         first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_full_tensor(data)
+  _require_length(result, tensor_mode_count(data), "tensor projection result")
+  _require_length(weighted_values, tensor_point_count(data), "tensor weighted values")
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  return _tensor_project_with_axis!(result, data, weighted_values, 0, scratch, first_slot)
+end
+
+"""
+    tensor_project_gradient!(result, data, weighted_gradients, scratch[, first_scratch_slot])
+
+Accumulate the weak gradient projection of quadrature-point physical gradient
+data onto a full tensor-product local result vector.
+
+`weighted_gradients` must be a `D x point_count` matrix whose rows already
+include any material coefficients and quadrature weights.
+
+The helper uses `D + 1` vector scratch slots beginning at `first_scratch_slot`,
+which defaults to `1`. The weighted input and result buffers must not alias
+those work slots.
+"""
+function tensor_project_gradient!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                  weighted_gradients::AbstractMatrix{T},
+                                  scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_project_gradient!(result, data, weighted_gradients, scratch, 1)
+end
+
+function tensor_project_gradient!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                  weighted_gradients::AbstractMatrix{T}, scratch::KernelScratch{T},
+                                  first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_full_tensor(data)
+  _require_length(result, tensor_mode_count(data), "tensor gradient projection result")
+  size(weighted_gradients, 1) == D ||
+    throw(ArgumentError("weighted gradient row count must match the dimension"))
+  size(weighted_gradients, 2) == tensor_point_count(data) ||
+    throw(ArgumentError("weighted gradient column count must match the point count"))
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  weighted_axis = scratch_vector(scratch, first_slot + D, tensor_point_count(data))
+
+  for axis in 1:D
+    @inbounds for point_index in 1:length(weighted_axis)
+      weighted_axis[point_index] = weighted_gradients[axis, point_index]
+    end
+
+    _tensor_project_with_axis!(result, data, weighted_axis, axis, scratch, first_slot)
+  end
+
+  return result
+end
+
 const _NormalEvaluationValues = Union{FaceValues,SurfaceValues,_InterfaceSideValues}
 
 """
@@ -1443,11 +1934,13 @@ end
 
 function _compile_item_fields(layout::FieldLayout{D,T}, leaf::Int,
                               reference_points::Vector{NTuple{D,T}}, inverse_jacobian::NTuple{D,T},
-                              local_offset::Int=1) where {D,T<:AbstractFloat}
+                              local_offset::Int=1,
+                              tensor_shape::Union{Nothing,NTuple{D,Int}}=nothing) where {D,
+                                                                                         T<:AbstractFloat}
   next_offset = local_offset
   field_data = ntuple(index -> begin
                         data = _compile_field_values(layout.slots[index], leaf, reference_points,
-                                                     inverse_jacobian, next_offset)
+                                                     inverse_jacobian, next_offset, tensor_shape)
                         next_offset = last(data.block) + 1
                         data
                       end, field_count(layout))
@@ -1497,6 +1990,7 @@ function _compile_cell(layout::FieldLayout{D,T}, leaf::Int, override) where {D,T
   shape = ntuple(axis -> maximum(cell_quadrature_shape(slot.space, leaf)[axis]
                                  for slot in layout.slots), D)
   quadrature = override === nothing ? TensorQuadrature(T, shape) : override
+  tensor_shape = quadrature isa TensorQuadrature ? axis_point_counts(quadrature) : nothing
   domain_data = layout.slots[1].space.domain
   qcount = point_count(quadrature)
   reference_points = Vector{NTuple{D,T}}(undef, qcount)
@@ -1513,7 +2007,8 @@ function _compile_cell(layout::FieldLayout{D,T}, leaf::Int, override) where {D,T
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, leaf)
-  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian, 1,
+                                       tensor_shape)
   terms = _compiled_item_terms(field_data)
   interior_local_dofs = _interior_local_dofs(field_data,
                                              _compiled_leaf(layout.slots[1].space, leaf).local_modes)
@@ -1577,7 +2072,7 @@ function _compile_boundary_face(layout::FieldLayout{D,T}, leaf::Int, face_axis::
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, leaf)
-  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian, 1, shape)
   terms = _compiled_item_terms(field_data)
   normal_data = ntuple(axis -> axis == face_axis ? (side == LOWER ? -one(T) : one(T)) : zero(T), D)
   return FaceValues(leaf, face_axis, side, normal_data, points, weights, field_data,
@@ -1622,9 +2117,9 @@ function _compile_interface(layout::FieldLayout{D,T}, minus_leaf::Int, face_axis
   plus_reference_points = [map_to_biunit_cube(domain_data, plus_leaf, point)
                            for point in plus_points]
   minus_fields, next_offset = _compile_item_fields(layout, minus_leaf, minus_reference_points,
-                                                   minus_inverse)
+                                                   minus_inverse, 1, shape)
   plus_fields, _ = _compile_item_fields(layout, plus_leaf, plus_reference_points, plus_inverse,
-                                        next_offset)
+                                        next_offset, shape)
   all_fields = (minus_fields..., plus_fields...)
   terms = _compiled_item_terms(all_fields)
   normal_data = ntuple(axis -> axis == face_axis ? one(T) : zero(T), D)
@@ -1830,14 +2325,16 @@ end
 # constraints have been applied in the `HpSpace`.
 function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
                                reference_points::Vector{NTuple{D,T}}, inverse_jacobian::NTuple{D,T},
-                               local_offset::Int) where {D,T<:AbstractFloat}
+                               local_offset::Int,
+                               tensor_shape::Union{Nothing,NTuple{D,Int}}=nothing) where {D,
+                                                                                          T<:AbstractFloat}
   compiled_leaf = _compiled_leaf(slot.space, leaf)
   mode_count = length(compiled_leaf.local_modes)
   qcount = length(reference_points)
   values = Matrix{T}(undef, mode_count, qcount)
   gradients = Array{T}(undef, D, mode_count, qcount)
-  _fill_basis_tables!(values, gradients, compiled_leaf.local_modes, compiled_leaf.degrees,
-                      reference_points, inverse_jacobian)
+  tensor = _fill_basis_tables!(values, gradients, compiled_leaf.local_modes, compiled_leaf.degrees,
+                               reference_points, inverse_jacobian, tensor_shape)
 
   components = component_count(slot.field)
   local_dof_count = mode_count * components
@@ -1869,7 +2366,7 @@ function _compile_field_values(slot::_FieldSlot{D,T}, leaf::Int,
   single_term_indices, single_term_coefficients = _single_term_metadata(term_offsets, term_indices,
                                                                         term_coefficients)
   return _FieldValues{D,T,components}(_field_id(slot.field), slot.scalar_dof_count, mode_count,
-                                      block, values, gradients, term_offsets, term_indices,
+                                      block, values, gradients, tensor, term_offsets, term_indices,
                                       term_coefficients, single_term_indices,
                                       single_term_coefficients)
 end
@@ -1947,9 +2444,109 @@ end
 # tensor products. Because the geometry maps are axis-aligned affine maps, the
 # physical gradient transformation is just multiplication by the inverse diagonal
 # Jacobian entries.
+@inline function _tensor_shape_stride(shape::NTuple{D,Int}, axis::Int) where {D}
+  stride = 1
+
+  for current_axis in 1:(axis-1)
+    stride *= shape[current_axis]
+  end
+
+  return stride
+end
+
+@inline function _tensor_shape_axis_index(shape::NTuple{D,Int}, linear::Int, axis::Int) where {D}
+  return fld(linear, _tensor_shape_stride(shape, axis)) % shape[axis] + 1
+end
+
+@inline function _tensor_shape_axis_indices(shape::NTuple{D,Int}, linear::Int) where {D}
+  return ntuple(axis -> _tensor_shape_axis_index(shape, linear, axis), D)
+end
+
+@inline function _tensor_shape_linear_index(indices::NTuple{D,Int}, shape::NTuple{D,Int}) where {D}
+  linear = 0
+
+  for axis in 1:D
+    linear += (indices[axis] - 1) * _tensor_shape_stride(shape, axis)
+  end
+
+  return linear + 1
+end
+
+@inline function _tensor_replace_axis(shape::NTuple{D,Int}, axis::Int, value::Int) where {D}
+  return ntuple(current_axis -> current_axis == axis ? value : shape[current_axis], D)
+end
+
 function _fill_basis_tables!(values::Matrix{T}, gradients::Array{T,3}, local_modes,
                              degrees::NTuple{D,Int}, reference_points::Vector{NTuple{D,T}},
-                             inverse_jacobian::NTuple{D,T}) where {D,T<:AbstractFloat}
+                             inverse_jacobian::NTuple{D,T},
+                             tensor_shape::Union{Nothing,NTuple{D,Int}}=nothing) where {D,
+                                                                                        T<:AbstractFloat}
+  qcount = length(reference_points)
+  if tensor_shape !== nothing && prod(tensor_shape) != qcount
+    tensor_shape = nothing
+  end
+
+  if tensor_shape === nothing
+    _fill_pointwise_basis_tables!(values, gradients, local_modes, degrees, reference_points,
+                                  inverse_jacobian)
+    return nothing
+  end
+
+  axis_values = ntuple(axis -> Matrix{T}(undef, degrees[axis] + 1, tensor_shape[axis]), D)
+  axis_gradients = ntuple(axis -> Matrix{T}(undef, degrees[axis] + 1, tensor_shape[axis]), D)
+  buffer_values = ntuple(axis -> Vector{T}(undef, degrees[axis] + 1), D)
+  buffer_derivatives = ntuple(axis -> Vector{T}(undef, degrees[axis] + 1), D)
+
+  for axis in 1:D
+    for axis_point in 1:tensor_shape[axis]
+      indices = ntuple(current_axis -> current_axis == axis ? axis_point : 1, D)
+      point_index = _tensor_shape_linear_index(indices, tensor_shape)
+      _fe_basis_values_and_derivatives!(reference_points[point_index][axis], degrees[axis],
+                                        buffer_values[axis], buffer_derivatives[axis])
+
+      for local_index in eachindex(buffer_values[axis])
+        axis_values[axis][local_index, axis_point] = buffer_values[axis][local_index]
+        axis_gradients[axis][local_index, axis_point] = inverse_jacobian[axis] *
+                                                        buffer_derivatives[axis][local_index]
+      end
+    end
+  end
+
+  for point_index in 1:qcount
+    point_indices = _tensor_shape_axis_indices(tensor_shape, point_index - 1)
+
+    for mode_index in eachindex(local_modes)
+      mode = local_modes[mode_index]
+      value = one(T)
+
+      for axis in 1:D
+        value *= axis_values[axis][mode[axis]+1, point_indices[axis]]
+      end
+
+      values[mode_index, point_index] = value
+
+      for axis in 1:D
+        derivative = axis_gradients[axis][mode[axis]+1, point_indices[axis]]
+
+        for other_axis in 1:D
+          other_axis == axis && continue
+          derivative *= axis_values[other_axis][mode[other_axis]+1, point_indices[other_axis]]
+        end
+
+        gradients[axis, mode_index, point_index] = derivative
+      end
+    end
+  end
+
+  full_tensor = _is_full_tensor_modes(local_modes, degrees)
+  return TensorProductValues{D,T}(degrees, tensor_shape, local_modes, axis_values, axis_gradients,
+                                  full_tensor)
+end
+
+function _fill_pointwise_basis_tables!(values::Matrix{T}, gradients::Array{T,3}, local_modes,
+                                       degrees::NTuple{D,Int},
+                                       reference_points::Vector{NTuple{D,T}},
+                                       inverse_jacobian::NTuple{D,T}) where {D,T<:AbstractFloat}
   qcount = length(reference_points)
   axis_values = ntuple(axis -> Matrix{T}(undef, degrees[axis] + 1, qcount), D)
   axis_derivatives = ntuple(axis -> Matrix{T}(undef, degrees[axis] + 1, qcount), D)

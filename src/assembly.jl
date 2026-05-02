@@ -330,6 +330,7 @@ mutable struct _OperatorScratch{T<:AbstractFloat}
   input::Vector{T}
   output::Vector{T}
   rhs::Vector{T}
+  kernel::KernelScratch{T}
 end
 
 # Matrix-free passes scatter element contributions into global vectors. To keep
@@ -344,7 +345,7 @@ end
 
 function _OperatorScratch(::Type{T}, local_dof_count::Int) where {T<:AbstractFloat}
   count = max(local_dof_count, 0)
-  return _OperatorScratch(zeros(T, count), zeros(T, count), zeros(T, count))
+  return _OperatorScratch(zeros(T, count), zeros(T, count), zeros(T, count), KernelScratch(T))
 end
 
 function _scratch_buffer(::Type{T}, integration::_CompiledIntegration) where {T<:AbstractFloat}
@@ -690,28 +691,37 @@ function _diagonal_kernel_requirements_satisfied(plan::AssemblyPlan, scratch::_O
   return _diagonal_requirements_satisfied(scratch, traversal.cell_batches, plan.integration.cells,
                                           plan.cell_operators, cell_apply!, cell_diagonal!,
                                           _DEFAULT_CELL_APPLY_METHOD,
-                                          _DEFAULT_CELL_DIAGONAL_METHOD) &&
+                                          _DEFAULT_CELL_APPLY_SCRATCH_METHOD,
+                                          _DEFAULT_CELL_DIAGONAL_METHOD,
+                                          _DEFAULT_CELL_DIAGONAL_SCRATCH_METHOD) &&
          _filtered_diagonal_requirements_satisfied(scratch, traversal.boundary_batches,
                                                    plan.integration.boundary_faces,
                                                    plan.boundary_operators, face_apply!,
                                                    face_diagonal!, _DEFAULT_FACE_APPLY_METHOD,
-                                                   _DEFAULT_FACE_DIAGONAL_METHOD) &&
+                                                   _DEFAULT_FACE_APPLY_SCRATCH_METHOD,
+                                                   _DEFAULT_FACE_DIAGONAL_METHOD,
+                                                   _DEFAULT_FACE_DIAGONAL_SCRATCH_METHOD) &&
          _diagonal_requirements_satisfied(scratch, traversal.interface_batches,
                                           plan.integration.interfaces, plan.interface_operators,
                                           interface_apply!, interface_diagonal!,
                                           _DEFAULT_INTERFACE_APPLY_METHOD,
-                                          _DEFAULT_INTERFACE_DIAGONAL_METHOD) &&
+                                          _DEFAULT_INTERFACE_APPLY_SCRATCH_METHOD,
+                                          _DEFAULT_INTERFACE_DIAGONAL_METHOD,
+                                          _DEFAULT_INTERFACE_DIAGONAL_SCRATCH_METHOD) &&
          _filtered_diagonal_requirements_satisfied(scratch, traversal.surface_batches,
                                                    plan.integration.embedded_surfaces,
                                                    plan.surface_operators, surface_apply!,
                                                    surface_diagonal!, _DEFAULT_SURFACE_APPLY_METHOD,
-                                                   _DEFAULT_SURFACE_DIAGONAL_METHOD)
+                                                   _DEFAULT_SURFACE_APPLY_SCRATCH_METHOD,
+                                                   _DEFAULT_SURFACE_DIAGONAL_METHOD,
+                                                   _DEFAULT_SURFACE_DIAGONAL_SCRATCH_METHOD)
 end
 
 function _diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
                                           batches::Vector{_KernelBatch}, items, operators,
                                           apply_hook, diagonal_hook, default_apply_method,
-                                          default_diagonal_method) where {T<:AbstractFloat}
+                                          default_apply_scratch_method, default_diagonal_method,
+                                          default_diagonal_scratch_method) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return true
 
   for kernel_batch in batches
@@ -723,11 +733,13 @@ function _diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
     has_action = false
 
     for operator in operators
-      _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
-                           local_input) && continue
+      _uses_default_operator_method(apply_hook, default_apply_method, default_apply_scratch_method,
+                                    local_output, operator, item, local_input, scratch.kernel) &&
+        continue
       has_action = true
-      _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
-                           item) && return false
+      _uses_default_operator_method(diagonal_hook, default_diagonal_method,
+                                    default_diagonal_scratch_method, local_diagonal, operator, item,
+                                    scratch.kernel) && return false
     end
 
     has_action || continue
@@ -745,7 +757,9 @@ function _filtered_diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
                                                    batches::Vector{_FilteredKernelBatch}, items,
                                                    operators, apply_hook, diagonal_hook,
                                                    default_apply_method,
-                                                   default_diagonal_method) where {T<:AbstractFloat}
+                                                   default_apply_scratch_method,
+                                                   default_diagonal_method,
+                                                   default_diagonal_scratch_method) where {T<:AbstractFloat}
   isempty(batches) && return true
 
   for kernel_batch in batches
@@ -759,11 +773,13 @@ function _filtered_diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
     for operator_index in kernel_batch.operator_indices
       wrapped = @inbounds operators[operator_index]
       operator = wrapped.operator
-      _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
-                           local_input) && continue
+      _uses_default_operator_method(apply_hook, default_apply_method, default_apply_scratch_method,
+                                    local_output, operator, item, local_input, scratch.kernel) &&
+        continue
       has_action = true
-      _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
-                           item) && return false
+      _uses_default_operator_method(diagonal_hook, default_diagonal_method,
+                                    default_diagonal_scratch_method, local_diagonal, operator, item,
+                                    scratch.kernel) && return false
     end
 
     has_action || continue
@@ -779,6 +795,14 @@ end
 
 function _uses_default_method(hook, default_method, arguments...)
   return which(hook, Base.typesof(arguments...)) === default_method
+end
+
+function _uses_default_operator_method(hook, default_method, default_scratch_method,
+                                       arguments_and_scratch...)
+  scratch = arguments_and_scratch[end]
+  arguments = ntuple(index -> arguments_and_scratch[index], length(arguments_and_scratch) - 1)
+  return _uses_default_method(hook, default_scratch_method, arguments..., scratch) &&
+         _uses_default_method(hook, default_method, arguments...)
 end
 
 function _expand_reduced!(full_values::AbstractVector{T}, map::_ReducedOperatorMap{T},
@@ -1005,41 +1029,45 @@ end
 
 # Local traversal helpers.
 
-@inline _rhs_operators!(local_rhs, ::Tuple{}, item, rhs_hook) = nothing
+@inline _rhs_operators!(local_rhs, ::Tuple{}, item, rhs_hook, scratch) = nothing
 
-@inline function _rhs_operators!(local_rhs, operators::Tuple, item, rhs_hook)
-  rhs_hook(local_rhs, first(operators), item)
-  return _rhs_operators!(local_rhs, Base.tail(operators), item, rhs_hook)
+@inline function _rhs_operators!(local_rhs, operators::Tuple, item, rhs_hook, scratch)
+  rhs_hook(local_rhs, first(operators), item, scratch)
+  return _rhs_operators!(local_rhs, Base.tail(operators), item, rhs_hook, scratch)
 end
 
-@inline _apply_operators!(local_output, ::Tuple{}, item, local_input, apply_hook) = nothing
+@inline _apply_operators!(local_output, ::Tuple{}, item, local_input, apply_hook, scratch) = nothing
 
-@inline function _apply_operators!(local_output, operators::Tuple, item, local_input, apply_hook)
-  apply_hook(local_output, first(operators), item, local_input)
-  return _apply_operators!(local_output, Base.tail(operators), item, local_input, apply_hook)
+@inline function _apply_operators!(local_output, operators::Tuple, item, local_input, apply_hook,
+                                   scratch)
+  apply_hook(local_output, first(operators), item, local_input, scratch)
+  return _apply_operators!(local_output, Base.tail(operators), item, local_input, apply_hook,
+                           scratch)
 end
 
-@inline _diagonal_operators!(local_diagonal, ::Tuple{}, item, diagonal_hook) = nothing
+@inline _diagonal_operators!(local_diagonal, ::Tuple{}, item, diagonal_hook, scratch) = nothing
 
-@inline function _diagonal_operators!(local_diagonal, operators::Tuple, item, diagonal_hook)
-  diagonal_hook(local_diagonal, first(operators), item)
-  return _diagonal_operators!(local_diagonal, Base.tail(operators), item, diagonal_hook)
+@inline function _diagonal_operators!(local_diagonal, operators::Tuple, item, diagonal_hook,
+                                      scratch)
+  diagonal_hook(local_diagonal, first(operators), item, scratch)
+  return _diagonal_operators!(local_diagonal, Base.tail(operators), item, diagonal_hook, scratch)
 end
 
-@inline _residual_operators!(local_rhs, ::Tuple{}, item, state, residual_hook) = nothing
+@inline _residual_operators!(local_rhs, ::Tuple{}, item, state, residual_hook, scratch) = nothing
 
-@inline function _residual_operators!(local_rhs, operators::Tuple, item, state, residual_hook)
-  residual_hook(local_rhs, first(operators), item, state)
-  return _residual_operators!(local_rhs, Base.tail(operators), item, state, residual_hook)
+@inline function _residual_operators!(local_rhs, operators::Tuple, item, state, residual_hook,
+                                      scratch)
+  residual_hook(local_rhs, first(operators), item, state, scratch)
+  return _residual_operators!(local_rhs, Base.tail(operators), item, state, residual_hook, scratch)
 end
 
-@inline _tangent_apply_operators!(local_output, ::Tuple{}, item, state, local_input, apply_hook) = nothing
+@inline _tangent_apply_operators!(local_output, ::Tuple{}, item, state, local_input, apply_hook, scratch) = nothing
 
 @inline function _tangent_apply_operators!(local_output, operators::Tuple, item, state, local_input,
-                                           apply_hook)
-  apply_hook(local_output, first(operators), item, state, local_input)
+                                           apply_hook, scratch)
+  apply_hook(local_output, first(operators), item, state, local_input, scratch)
   return _tangent_apply_operators!(local_output, Base.tail(operators), item, state, local_input,
-                                   apply_hook)
+                                   apply_hook, scratch)
 end
 
 @inline function _threaded_rhs_item!(scratch::_ThreadedOperatorScratch{T},
@@ -1050,7 +1078,7 @@ end
   local_rhs = view(local_scratch.rhs, 1:local_dof_count)
   item = @inbounds items[item_index]
   fill!(local_rhs, zero(T))
-  _rhs_operators!(local_rhs, operators, item, rhs_hook)
+  _rhs_operators!(local_rhs, operators, item, rhs_hook, local_scratch.kernel)
   _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
   return nothing
 end
@@ -1067,7 +1095,7 @@ end
 
   for operator_index in operator_indices
     wrapped = @inbounds operators[operator_index]
-    rhs_hook(local_rhs, wrapped.operator, item)
+    rhs_hook(local_rhs, wrapped.operator, item, local_scratch.kernel)
   end
 
   _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
@@ -1085,7 +1113,7 @@ end
   item = @inbounds items[item_index]
   _gather_local_coefficients!(local_input, item, coefficients)
   fill!(local_output, zero(T))
-  _apply_operators!(local_output, operators, item, local_input, apply_hook)
+  _apply_operators!(local_output, operators, item, local_input, apply_hook, local_scratch.kernel)
   _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
   return nothing
 end
@@ -1105,7 +1133,7 @@ end
 
   for operator_index in operator_indices
     wrapped = @inbounds operators[operator_index]
-    apply_hook(local_output, wrapped.operator, item, local_input)
+    apply_hook(local_output, wrapped.operator, item, local_input, local_scratch.kernel)
   end
 
   _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
@@ -1121,7 +1149,7 @@ end
   local_rhs = view(local_scratch.rhs, 1:local_dof_count)
   item = @inbounds items[item_index]
   fill!(local_rhs, zero(T))
-  _residual_operators!(local_rhs, operators, item, state, residual_hook)
+  _residual_operators!(local_rhs, operators, item, state, residual_hook, local_scratch.kernel)
   _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
   return nothing
 end
@@ -1139,7 +1167,7 @@ end
 
   for operator_index in operator_indices
     wrapped = @inbounds operators[operator_index]
-    residual_hook(local_rhs, wrapped.operator, item, state)
+    residual_hook(local_rhs, wrapped.operator, item, state, local_scratch.kernel)
   end
 
   _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
@@ -1157,7 +1185,8 @@ end
   item = @inbounds items[item_index]
   _gather_local_coefficients!(local_input, item, increment)
   fill!(local_output, zero(T))
-  _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook)
+  _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook,
+                            local_scratch.kernel)
   _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
   return nothing
 end
@@ -1179,7 +1208,7 @@ end
 
   for operator_index in operator_indices
     wrapped = @inbounds operators[operator_index]
-    apply_hook(local_output, wrapped.operator, item, state, local_input)
+    apply_hook(local_output, wrapped.operator, item, state, local_input, local_scratch.kernel)
   end
 
   _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
@@ -1487,7 +1516,7 @@ function _rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
       item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_rhs, zero(T))
 
-      _rhs_operators!(local_rhs, operators, item, rhs_hook)
+      _rhs_operators!(local_rhs, operators, item, rhs_hook, scratch.kernel)
       _scatter_local_vector!(result, item, local_rhs, fixed, blocked_rows)
     end
   end
@@ -1509,7 +1538,7 @@ function _boundary_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVecto
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        face_rhs!(local_rhs, wrapped.operator, face)
+        face_rhs!(local_rhs, wrapped.operator, face, scratch.kernel)
       end
 
       _scatter_local_vector!(result, face, local_rhs, fixed, blocked_rows)
@@ -1533,7 +1562,7 @@ function _surface_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        surface_rhs!(local_rhs, wrapped.operator, surface)
+        surface_rhs!(local_rhs, wrapped.operator, surface, scratch.kernel)
       end
 
       _scatter_local_vector!(result, surface, local_rhs, fixed, blocked_rows)
@@ -1558,7 +1587,7 @@ function _apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
       _gather_local_coefficients!(local_input, item, coefficients)
       fill!(local_output, zero(T))
 
-      _apply_operators!(local_output, operators, item, local_input, apply_hook)
+      _apply_operators!(local_output, operators, item, local_input, apply_hook, scratch.kernel)
       _scatter_local_vector!(result, item, local_output, fixed, blocked_rows)
     end
   end
@@ -1583,7 +1612,7 @@ function _boundary_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVec
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        face_apply!(local_output, wrapped.operator, face, local_input)
+        face_apply!(local_output, wrapped.operator, face, local_input, scratch.kernel)
       end
 
       _scatter_local_vector!(result, face, local_output, fixed, blocked_rows)
@@ -1610,7 +1639,7 @@ function _surface_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        surface_apply!(local_output, wrapped.operator, surface, local_input)
+        surface_apply!(local_output, wrapped.operator, surface, local_input, scratch.kernel)
       end
 
       _scatter_local_vector!(result, surface, local_output, fixed, blocked_rows)
@@ -1632,7 +1661,7 @@ function _diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T}
       item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_diagonal, zero(T))
 
-      _diagonal_operators!(local_diagonal, operators, item, diagonal_hook)
+      _diagonal_operators!(local_diagonal, operators, item, diagonal_hook, scratch.kernel)
       _scatter_local_diagonal!(result, item, local_diagonal)
     end
   end
@@ -1654,7 +1683,7 @@ function _boundary_diagonal_pass!(scratch::_OperatorScratch{T}, result::Abstract
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        face_diagonal!(local_diagonal, wrapped.operator, face)
+        face_diagonal!(local_diagonal, wrapped.operator, face, scratch.kernel)
       end
 
       _scatter_local_diagonal!(result, face, local_diagonal)
@@ -1678,7 +1707,7 @@ function _surface_diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractV
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        surface_diagonal!(local_diagonal, wrapped.operator, surface)
+        surface_diagonal!(local_diagonal, wrapped.operator, surface, scratch.kernel)
       end
 
       _scatter_local_diagonal!(result, surface, local_diagonal)
@@ -1701,7 +1730,7 @@ function _residual_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T}
       item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_rhs, zero(T))
 
-      _residual_operators!(local_rhs, operators, item, state, residual_hook)
+      _residual_operators!(local_rhs, operators, item, state, residual_hook, scratch.kernel)
       _scatter_local_vector!(result, item, local_rhs, fixed, blocked_rows)
     end
   end
@@ -1724,7 +1753,7 @@ function _boundary_residual_pass!(scratch::_OperatorScratch{T}, result::Abstract
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        face_residual!(local_rhs, wrapped.operator, face, state)
+        face_residual!(local_rhs, wrapped.operator, face, state, scratch.kernel)
       end
 
       _scatter_local_vector!(result, face, local_rhs, fixed, blocked_rows)
@@ -1749,7 +1778,7 @@ function _surface_residual_pass!(scratch::_OperatorScratch{T}, result::AbstractV
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        surface_residual!(local_rhs, wrapped.operator, surface, state)
+        surface_residual!(local_rhs, wrapped.operator, surface, state, scratch.kernel)
       end
 
       _scatter_local_vector!(result, surface, local_rhs, fixed, blocked_rows)
@@ -1774,7 +1803,8 @@ function _tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
       _gather_local_coefficients!(local_input, item, increment)
       fill!(local_output, zero(T))
 
-      _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook)
+      _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook,
+                                scratch.kernel)
       _scatter_local_vector!(result, item, local_output, fixed, blocked_rows)
     end
   end
@@ -1800,7 +1830,8 @@ function _boundary_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::Abs
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        face_tangent_apply!(local_output, wrapped.operator, face, state, local_input)
+        face_tangent_apply!(local_output, wrapped.operator, face, state, local_input,
+                            scratch.kernel)
       end
 
       _scatter_local_vector!(result, face, local_output, fixed, blocked_rows)
@@ -1828,7 +1859,8 @@ function _surface_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::Abst
 
       for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
-        surface_tangent_apply!(local_output, wrapped.operator, surface, state, local_input)
+        surface_tangent_apply!(local_output, wrapped.operator, surface, state, local_input,
+                               scratch.kernel)
       end
 
       _scatter_local_vector!(result, surface, local_output, fixed, blocked_rows)

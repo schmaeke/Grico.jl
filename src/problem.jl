@@ -552,6 +552,79 @@ end
 
 # Operator extension surface.
 
+"""
+    KernelScratch(T)
+    KernelScratch{T}()
+
+Reusable per-worker scratch storage passed to scratch-aware local kernels.
+
+The matrix-free traversal owns one scratch object per worker slot and reuses it
+across cells, faces, interfaces, and embedded surfaces. Local operators may use
+[`scratch_vector`](@ref) and [`scratch_matrix`](@ref) to obtain temporary
+buffers without allocating inside hot kernels.
+"""
+mutable struct KernelScratch{T<:AbstractFloat}
+  vectors::Vector{Vector{T}}
+  matrices::Vector{Matrix{T}}
+end
+
+function KernelScratch(::Type{T}) where {T<:AbstractFloat}
+  KernelScratch{T}(Vector{Vector{T}}(), Vector{Matrix{T}}())
+end
+KernelScratch{T}() where {T<:AbstractFloat} = KernelScratch(T)
+
+Base.eltype(::KernelScratch{T}) where {T<:AbstractFloat} = T
+
+_scratch_slot(slot::Integer) = _checked_positive(slot, "scratch slot")
+
+"""
+    scratch_vector(scratch, slot, length)
+
+Return a reusable vector buffer from `scratch`.
+
+`slot` lets one kernel keep several independent temporaries alive at once. The
+returned vector has exactly `length` entries. Its contents are not initialized.
+"""
+function scratch_vector(scratch::KernelScratch{T}, slot::Integer,
+                        buffer_length::Integer) where {T<:AbstractFloat}
+  checked_slot = _scratch_slot(slot)
+  checked_length = _checked_nonnegative(buffer_length, "scratch vector length")
+  while length(scratch.vectors) < checked_slot
+    push!(scratch.vectors, T[])
+  end
+
+  buffer = scratch.vectors[checked_slot]
+  resize!(buffer, checked_length)
+  return buffer
+end
+
+"""
+    scratch_matrix(scratch, slot, rows, columns)
+
+Return a reusable matrix buffer from `scratch`.
+
+The matrix has exactly `rows` by `columns` entries. Its contents are not
+initialized.
+"""
+function scratch_matrix(scratch::KernelScratch{T}, slot::Integer, rows::Integer,
+                        columns::Integer) where {T<:AbstractFloat}
+  checked_slot = _scratch_slot(slot)
+  checked_rows = _checked_nonnegative(rows, "scratch matrix row count")
+  checked_columns = _checked_nonnegative(columns, "scratch matrix column count")
+
+  while length(scratch.matrices) < checked_slot
+    push!(scratch.matrices, Matrix{T}(undef, 0, 0))
+  end
+
+  matrix = scratch.matrices[checked_slot]
+  if size(matrix, 1) != checked_rows || size(matrix, 2) != checked_columns
+    matrix = Matrix{T}(undef, checked_rows, checked_columns)
+    scratch.matrices[checked_slot] = matrix
+  end
+
+  return matrix
+end
+
 # These no-op methods define the operator extension surface of the library.
 # User-defined operator types implement whichever callbacks are relevant for the
 # geometric entities and problem class they participate in. Assembly then calls
@@ -571,6 +644,17 @@ overload this function when they contribute a bilinear volume term.
 cell_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
+    cell_apply!(local_result, operator, values, local_coefficients, scratch)
+
+Scratch-aware form of [`cell_apply!`](@ref). Operators can overload this method
+for allocation-free high-performance kernels. The default method delegates to
+the four-argument callback.
+"""
+function cell_apply!(local_result, operator, values, local_coefficients, scratch::KernelScratch)
+  cell_apply!(local_result, operator, values, local_coefficients)
+end
+
+"""
     cell_diagonal!(local_diagonal, operator, values)
 
 Accumulate the local diagonal of an affine cell operator into
@@ -587,6 +671,16 @@ preconditioning. The default method does nothing.
 cell_diagonal!(local_diagonal, operator, values) = nothing
 
 """
+    cell_diagonal!(local_diagonal, operator, values, scratch)
+
+Scratch-aware form of [`cell_diagonal!`](@ref). The default method delegates to
+the three-argument callback.
+"""
+function cell_diagonal!(local_diagonal, operator, values, scratch::KernelScratch)
+  cell_diagonal!(local_diagonal, operator, values)
+end
+
+"""
     cell_rhs!(local_rhs, operator, values)
 
 Accumulate the affine cell right-hand-side contribution of `operator` on one
@@ -598,12 +692,26 @@ this function when they contribute a linear volume term.
 cell_rhs!(local_rhs, operator, values) = nothing
 
 """
+    cell_rhs!(local_rhs, operator, values, scratch)
+
+Scratch-aware form of [`cell_rhs!`](@ref). The default method delegates to the
+three-argument callback.
+"""
+function cell_rhs!(local_rhs, operator, values, scratch::KernelScratch)
+  cell_rhs!(local_rhs, operator, values)
+end
+
+"""
     face_apply!(local_result, operator, values, local_coefficients)
 
 Accumulate the matrix-free affine boundary-face action of `operator` on one
 [`FaceValues`](@ref) item into `local_result`.
 """
 face_apply!(local_result, operator, values, local_coefficients) = nothing
+
+function face_apply!(local_result, operator, values, local_coefficients, scratch::KernelScratch)
+  face_apply!(local_result, operator, values, local_coefficients)
+end
 
 """
     face_diagonal!(local_diagonal, operator, values)
@@ -621,6 +729,10 @@ nothing.
 """
 face_diagonal!(local_diagonal, operator, values) = nothing
 
+function face_diagonal!(local_diagonal, operator, values, scratch::KernelScratch)
+  face_diagonal!(local_diagonal, operator, values)
+end
+
 """
     face_rhs!(local_rhs, operator, values)
 
@@ -629,6 +741,10 @@ on one [`FaceValues`](@ref) item into `local_rhs`.
 """
 face_rhs!(local_rhs, operator, values) = nothing
 
+function face_rhs!(local_rhs, operator, values, scratch::KernelScratch)
+  face_rhs!(local_rhs, operator, values)
+end
+
 """
     surface_apply!(local_result, operator, values, local_coefficients)
 
@@ -636,6 +752,10 @@ Accumulate the matrix-free affine embedded-surface action of `operator` on one
 [`SurfaceValues`](@ref) item into `local_result`.
 """
 surface_apply!(local_result, operator, values, local_coefficients) = nothing
+
+function surface_apply!(local_result, operator, values, local_coefficients, scratch::KernelScratch)
+  surface_apply!(local_result, operator, values, local_coefficients)
+end
 
 """
     surface_diagonal!(local_diagonal, operator, values)
@@ -651,6 +771,10 @@ back to identity preconditioning.
 """
 surface_diagonal!(local_diagonal, operator, values) = nothing
 
+function surface_diagonal!(local_diagonal, operator, values, scratch::KernelScratch)
+  surface_diagonal!(local_diagonal, operator, values)
+end
+
 """
     surface_rhs!(local_rhs, operator, values)
 
@@ -659,6 +783,10 @@ Accumulate the affine embedded-surface right-hand-side contribution of
 """
 surface_rhs!(local_rhs, operator, values) = nothing
 
+function surface_rhs!(local_rhs, operator, values, scratch::KernelScratch)
+  surface_rhs!(local_rhs, operator, values)
+end
+
 """
     interface_apply!(local_result, operator, values, local_coefficients)
 
@@ -666,6 +794,11 @@ Accumulate the matrix-free affine interface action of `operator` on one
 [`InterfaceValues`](@ref) item into `local_result`.
 """
 interface_apply!(local_result, operator, values, local_coefficients) = nothing
+
+function interface_apply!(local_result, operator, values, local_coefficients,
+                          scratch::KernelScratch)
+  interface_apply!(local_result, operator, values, local_coefficients)
+end
 
 """
     interface_diagonal!(local_diagonal, operator, values)
@@ -683,6 +816,10 @@ preconditioning falls back to the identity. The default method does nothing.
 """
 interface_diagonal!(local_diagonal, operator, values) = nothing
 
+function interface_diagonal!(local_diagonal, operator, values, scratch::KernelScratch)
+  interface_diagonal!(local_diagonal, operator, values)
+end
+
 """
     interface_rhs!(local_rhs, operator, values)
 
@@ -690,6 +827,10 @@ Accumulate the affine interface right-hand-side contribution of `operator` on
 one [`InterfaceValues`](@ref) item into `local_rhs`.
 """
 interface_rhs!(local_rhs, operator, values) = nothing
+
+function interface_rhs!(local_rhs, operator, values, scratch::KernelScratch)
+  interface_rhs!(local_rhs, operator, values)
+end
 
 """
     cell_residual!(local_residual, operator, values, state)
@@ -702,6 +843,10 @@ nothing.
 """
 cell_residual!(local_residual, operator, values, state) = nothing
 
+function cell_residual!(local_residual, operator, values, state, scratch::KernelScratch)
+  cell_residual!(local_residual, operator, values, state)
+end
+
 """
     cell_tangent_apply!(local_result, operator, values, state, local_increment)
 
@@ -713,6 +858,11 @@ current `state`, applied to `local_increment`. The default method does nothing.
 """
 cell_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
+function cell_tangent_apply!(local_result, operator, values, state, local_increment,
+                             scratch::KernelScratch)
+  cell_tangent_apply!(local_result, operator, values, state, local_increment)
+end
+
 """
     face_residual!(local_residual, operator, values, state)
 
@@ -720,6 +870,10 @@ Accumulate the nonlinear boundary-face residual contribution of `operator` on
 one [`FaceValues`](@ref) item into `local_residual`.
 """
 face_residual!(local_residual, operator, values, state) = nothing
+
+function face_residual!(local_residual, operator, values, state, scratch::KernelScratch)
+  face_residual!(local_residual, operator, values, state)
+end
 
 """
     face_tangent_apply!(local_result, operator, values, state, local_increment)
@@ -729,6 +883,11 @@ Accumulate the matrix-free boundary-face tangent action of `operator` on one
 """
 face_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
+function face_tangent_apply!(local_result, operator, values, state, local_increment,
+                             scratch::KernelScratch)
+  face_tangent_apply!(local_result, operator, values, state, local_increment)
+end
+
 """
     surface_residual!(local_residual, operator, values, state)
 
@@ -736,6 +895,10 @@ Accumulate the nonlinear embedded-surface residual contribution of `operator`
 on one [`SurfaceValues`](@ref) item into `local_residual`.
 """
 surface_residual!(local_residual, operator, values, state) = nothing
+
+function surface_residual!(local_residual, operator, values, state, scratch::KernelScratch)
+  surface_residual!(local_residual, operator, values, state)
+end
 
 """
     surface_tangent_apply!(local_result, operator, values, state, local_increment)
@@ -745,6 +908,11 @@ Accumulate the matrix-free embedded-surface tangent action of `operator` on one
 """
 surface_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
+function surface_tangent_apply!(local_result, operator, values, state, local_increment,
+                                scratch::KernelScratch)
+  surface_tangent_apply!(local_result, operator, values, state, local_increment)
+end
+
 """
     interface_residual!(local_residual, operator, values, state)
 
@@ -752,6 +920,10 @@ Accumulate the nonlinear interface residual contribution of `operator` on one
 [`InterfaceValues`](@ref) item into `local_residual`.
 """
 interface_residual!(local_residual, operator, values, state) = nothing
+
+function interface_residual!(local_residual, operator, values, state, scratch::KernelScratch)
+  interface_residual!(local_residual, operator, values, state)
+end
 
 """
     interface_tangent_apply!(local_result, operator, values, state, local_increment)
@@ -761,6 +933,11 @@ Accumulate the matrix-free interface tangent action of `operator` on one
 """
 interface_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
+function interface_tangent_apply!(local_result, operator, values, state, local_increment,
+                                  scratch::KernelScratch)
+  interface_tangent_apply!(local_result, operator, values, state, local_increment)
+end
+
 const _DEFAULT_CELL_DIAGONAL_METHOD = which(cell_diagonal!, Tuple{Any,Any,Any})
 const _DEFAULT_FACE_DIAGONAL_METHOD = which(face_diagonal!, Tuple{Any,Any,Any})
 const _DEFAULT_SURFACE_DIAGONAL_METHOD = which(surface_diagonal!, Tuple{Any,Any,Any})
@@ -769,3 +946,17 @@ const _DEFAULT_CELL_APPLY_METHOD = which(cell_apply!, Tuple{Any,Any,Any,Any})
 const _DEFAULT_FACE_APPLY_METHOD = which(face_apply!, Tuple{Any,Any,Any,Any})
 const _DEFAULT_SURFACE_APPLY_METHOD = which(surface_apply!, Tuple{Any,Any,Any,Any})
 const _DEFAULT_INTERFACE_APPLY_METHOD = which(interface_apply!, Tuple{Any,Any,Any,Any})
+const _DEFAULT_CELL_DIAGONAL_SCRATCH_METHOD = which(cell_diagonal!,
+                                                    Tuple{Any,Any,Any,KernelScratch})
+const _DEFAULT_FACE_DIAGONAL_SCRATCH_METHOD = which(face_diagonal!,
+                                                    Tuple{Any,Any,Any,KernelScratch})
+const _DEFAULT_SURFACE_DIAGONAL_SCRATCH_METHOD = which(surface_diagonal!,
+                                                       Tuple{Any,Any,Any,KernelScratch})
+const _DEFAULT_INTERFACE_DIAGONAL_SCRATCH_METHOD = which(interface_diagonal!,
+                                                         Tuple{Any,Any,Any,KernelScratch})
+const _DEFAULT_CELL_APPLY_SCRATCH_METHOD = which(cell_apply!, Tuple{Any,Any,Any,Any,KernelScratch})
+const _DEFAULT_FACE_APPLY_SCRATCH_METHOD = which(face_apply!, Tuple{Any,Any,Any,Any,KernelScratch})
+const _DEFAULT_SURFACE_APPLY_SCRATCH_METHOD = which(surface_apply!,
+                                                    Tuple{Any,Any,Any,Any,KernelScratch})
+const _DEFAULT_INTERFACE_APPLY_SCRATCH_METHOD = which(interface_apply!,
+                                                      Tuple{Any,Any,Any,Any,KernelScratch})

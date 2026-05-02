@@ -150,7 +150,8 @@ export AffineProblem, BoundaryFace, Dirichlet, MeanValue, ResidualProblem, add_b
        cell_rhs!, cell_tangent_apply!, constrain!, face_apply!, face_diagonal!, face_residual!,
        face_rhs!, face_tangent_apply!, interface_apply!, interface_diagonal!, interface_residual!,
        interface_rhs!, interface_tangent_apply!, surface_apply!, surface_diagonal!,
-       surface_residual!, surface_rhs!, surface_tangent_apply!
+       surface_residual!, surface_rhs!, surface_tangent_apply!, KernelScratch, scratch_matrix,
+       scratch_vector
 
 include("embedded.jl")
 export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
@@ -160,7 +161,10 @@ include("integration.jl")
 export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_side, jump,
        local_dof_index, normal, normal_component, normal_gradient, gradient, field_gradient,
        InterfaceValues, minus, plus, shape_gradient, shape_gradients, shape_normal_gradient,
-       shape_value, shape_values, value
+       shape_value, shape_values, TensorProductValues, tensor_axis_gradients, tensor_axis_values,
+       tensor_degrees, tensor_gradient!, tensor_interpolate!, tensor_local_modes, tensor_mode_count,
+       tensor_mode_shape, tensor_point_count, tensor_project!, tensor_project_gradient!,
+       tensor_quadrature_shape, tensor_values, value, is_full_tensor
 
 include("plans.jl")
 export AssemblyPlan, compile

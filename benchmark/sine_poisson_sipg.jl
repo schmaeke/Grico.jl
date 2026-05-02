@@ -10,7 +10,7 @@ end
 function sine_interface_sipg_problem(field, options)
   operator = SineInterfaceSIPGPoisson(field, options["penalty"])
   problem = AffineProblem(field)
-  add_sine_interface_poisson_cells!(problem, field)
+  add_sine_interface_poisson_cells!(problem, field, get(options, "tensor_kernels", true))
   add_interface!(problem, operator)
 
   for axis in 1:2

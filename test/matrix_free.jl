@@ -40,6 +40,11 @@ struct _MatrixFreeDiffusion{F,T}
   coefficient::T
 end
 
+struct _MatrixFreeTensorDiffusion{F,T}
+  field::F
+  coefficient::T
+end
+
 struct _MatrixFreeBoundaryMass{F,T}
   field::F
   coefficient::T
@@ -127,6 +132,31 @@ function Grico.cell_diagonal!(local_diagonal, operator::_MatrixFreeDiffusion, va
     end
   end
 
+  return nothing
+end
+
+function Grico.cell_apply!(local_result, operator::_MatrixFreeTensorDiffusion, values,
+                           local_coefficients, scratch::KernelScratch)
+  field = operator.field
+  tensor = tensor_values(values, field)
+  tensor !== nothing ||
+    return Grico.cell_apply!(local_result, _MatrixFreeDiffusion(field, operator.coefficient),
+                             values, local_coefficients)
+  @assert is_full_tensor(tensor)
+  local_input = block(local_coefficients, values, field)
+  local_output = block(local_result, values, field)
+  gradients = scratch_matrix(scratch, 1, length(tensor_degrees(tensor)), tensor_point_count(tensor))
+  tensor_gradient!(gradients, tensor, local_input, scratch)
+
+  for point_index in 1:tensor_point_count(tensor)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for axis in 1:size(gradients, 1)
+      gradients[axis, point_index] *= weighted
+    end
+  end
+
+  tensor_project_gradient!(local_output, tensor, gradients, scratch)
   return nothing
 end
 
@@ -445,6 +475,34 @@ end
   diffusion_diagonal_selected, diffusion_diagonal = _kernel_reduced_diagonal(diffusion_plan)
   @test diffusion_diagonal_selected
   @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
+
+  tensor_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+  tensor_space = HpSpace(tensor_domain,
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2),
+                                      continuity=:dg))
+  tensor_field = ScalarField(tensor_space; name=:u)
+  tensor_problem = AffineProblem(tensor_field)
+  add_cell!(tensor_problem, _MatrixFreeTensorDiffusion(tensor_field, 1.75))
+  tensor_plan = compile(tensor_problem)
+  tensor_coefficients = [sin(0.3 * index) for index in 1:field_dof_count(tensor_field)]
+  @test apply(tensor_plan, tensor_coefficients) ≈
+        _reference_cell_action(tensor_plan, tensor_coefficients,
+                               (local_matrix, values) -> _local_reference_diffusion!(local_matrix,
+                                                                                     tensor_field,
+                                                                                     values, 1.75))
+  tensor_item = tensor_plan.integration.cells[1]
+  tensor_data = tensor_values(tensor_item, tensor_field)
+  @test tensor_data !== nothing
+  @test is_full_tensor(tensor_data)
+  @test tensor_degrees(tensor_data) == (2, 2)
+  @test tensor_quadrature_shape(tensor_data) == (3, 3)
+  tensor_scratch = KernelScratch(Float64)
+  tensor_input = scratch_vector(tensor_scratch, 1, tensor_mode_count(tensor_data))
+  copyto!(tensor_input, tensor_coefficients)
+  tensor_point_values = zeros(Float64, tensor_point_count(tensor_data))
+  tensor_interpolate!(tensor_point_values, tensor_data, tensor_input, tensor_scratch, 2)
+  @test tensor_point_values ≈ [value(tensor_item, tensor_coefficients, tensor_field, point_index)
+                               for point_index in 1:point_count(tensor_item)]
 
   boundary_problem = AffineProblem(dg_field)
   add_boundary!(boundary_problem, BoundaryFace(1, UPPER), _MatrixFreeBoundaryMass(dg_field, 3.0))

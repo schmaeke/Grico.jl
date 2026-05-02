@@ -240,12 +240,13 @@ function _time_local_affine_kernel!(rows, case_name, component, batch, item, ope
   isempty(operators) && return nothing
   local_input = _sample_vector(T, batch.local_dof_count)
   local_output = zeros(T, batch.local_dof_count)
+  scratch = KernelScratch(T)
 
   _measure!(rows, case_name, "micro", component, repetitions) do
     fill!(local_output, zero(T))
 
     for operator in operators
-      hook(local_output, operator, item, local_input)
+      hook(local_output, operator, item, local_input, scratch)
     end
 
     nothing
@@ -258,12 +259,13 @@ function _time_local_rhs_kernel!(rows, case_name, component, batch, item, operat
                                  repetitions::Int, ::Type{T}) where {T<:AbstractFloat}
   isempty(operators) && return nothing
   local_rhs = zeros(T, batch.local_dof_count)
+  scratch = KernelScratch(T)
 
   _measure!(rows, case_name, "micro", component, repetitions) do
     fill!(local_rhs, zero(T))
 
     for operator in operators
-      hook(local_rhs, operator, item)
+      hook(local_rhs, operator, item, scratch)
     end
 
     nothing
@@ -276,12 +278,13 @@ function _time_local_residual_kernel!(rows, case_name, component, batch, item, o
                                       state, repetitions::Int, ::Type{T}) where {T<:AbstractFloat}
   isempty(operators) && return nothing
   local_rhs = zeros(T, batch.local_dof_count)
+  scratch = KernelScratch(T)
 
   _measure!(rows, case_name, "micro", component, repetitions) do
     fill!(local_rhs, zero(T))
 
     for operator in operators
-      hook(local_rhs, operator, item, state)
+      hook(local_rhs, operator, item, state, scratch)
     end
 
     nothing
@@ -295,12 +298,13 @@ function _time_local_tangent_kernel!(rows, case_name, component, batch, item, op
   isempty(operators) && return nothing
   local_increment = _sample_vector(T, batch.local_dof_count)
   local_output = zeros(T, batch.local_dof_count)
+  scratch = KernelScratch(T)
 
   _measure!(rows, case_name, "micro", component, repetitions) do
     fill!(local_output, zero(T))
 
     for operator in operators
-      hook(local_output, operator, item, state, local_increment)
+      hook(local_output, operator, item, state, local_increment, scratch)
     end
 
     nothing
@@ -633,7 +637,8 @@ function _parse_args(args)
   options = Dict{String,Any}("output" => joinpath(@__DIR__, "output",
                                                   "matrix_free_performance_study.csv"),
                              "cases" => collect(CASE_ORDER), "repetitions" => 3,
-                             "local_repetitions" => 500, "warmup" => true, "preset" => :real)
+                             "local_repetitions" => 500, "warmup" => true, "preset" => :real,
+                             "tensor_kernels" => true, "degree" => nothing)
   index = 1
 
   while index <= length(args)
@@ -649,12 +654,19 @@ function _parse_args(args)
         --repetitions N            whole-plan repetitions for apply/residual micro phases
         --local-repetitions N      local-kernel repetitions
         --preset NAME              real, large, or smoke (default: real)
+        --degree P                 override the preset polynomial degree
+        --shape-kernels            use the full shape-table benchmark kernels
+        --tensor-kernels           use tensor-product benchmark kernels when available
         --no-warmup                include first-use Julia compilation latency
         --help                     show this message
       """)
       exit(0)
     elseif arg == "--no-warmup"
       options["warmup"] = false
+    elseif arg == "--shape-kernels"
+      options["tensor_kernels"] = false
+    elseif arg == "--tensor-kernels"
+      options["tensor_kernels"] = true
     elseif startswith(arg, "--output=")
       options["output"] = split(arg, "=", limit=2)[2]
     elseif arg == "--output"
@@ -685,6 +697,12 @@ function _parse_args(args)
       index < length(args) || throw(ArgumentError("--preset requires a value"))
       index += 1
       options["preset"] = Symbol(args[index])
+    elseif startswith(arg, "--degree=")
+      options["degree"] = parse(Int, split(arg, "=", limit=2)[2])
+    elseif arg == "--degree"
+      index < length(args) || throw(ArgumentError("--degree requires a value"))
+      index += 1
+      options["degree"] = parse(Int, args[index])
     else
       throw(ArgumentError("unknown option $arg"))
     end
@@ -696,6 +714,9 @@ function _parse_args(args)
   options["local_repetitions"] >= 1 || throw(ArgumentError("--local-repetitions must be positive"))
   options["preset"] in (:real, :large, :smoke) ||
     throw(ArgumentError("--preset must be real, large, or smoke"))
+  options["degree"] === nothing ||
+    options["degree"] >= 0 ||
+    throw(ArgumentError("--degree must be nonnegative"))
   return options
 end
 
@@ -708,6 +729,8 @@ function main(args=ARGS)
 
   for case in options["cases"]
     config = _case_config(case, options["preset"])
+    config.options["tensor_kernels"] = options["tensor_kernels"]
+    options["degree"] === nothing || (config.options["degree"] = options["degree"])
 
     if options["warmup"]
       @printf("warming up %s\n", case)

@@ -17,7 +17,7 @@ _cg_initial_field(options) = sine_interface_poisson_field(options; continuity=:c
 
 function _cg_poisson_problem(field, options)
   problem = AffineProblem(field)
-  add_sine_interface_poisson_cells!(problem, field)
+  add_sine_interface_poisson_cells!(problem, field, get(options, "tensor_kernels", true))
 
   for axis in 1:2
     add_constraint!(problem, Dirichlet(field, BoundaryFace(axis, LOWER), 0.0))
