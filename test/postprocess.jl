@@ -1,5 +1,19 @@
 using Test
 using Grico
+import Grico: SampledPostprocess, postprocess_supported, sample_mesh_skeleton
+
+function _throws_argument_message(f, needle::AbstractString)
+  try
+    f()
+  catch exception
+    @test exception isa ArgumentError
+    @test occursin(needle, sprint(showerror, exception))
+    return nothing
+  end
+
+  @test false
+  return nothing
+end
 
 @testset "Postprocess Sampling" begin
   @test postprocess_supported(1)
@@ -102,11 +116,46 @@ using Grico
   @test active_leaves(ordered_space) != active_leaves(grid(ordered_domain))
   @test sample_postprocess(ordered_domain; state=ordered_state) isa SampledPostprocess
 
-  @test_throws ArgumentError write_vtk("unloaded", domain)
-  @test_throws ArgumentError write_pvd("unloaded.pvd", String[])
-  @test_throws ArgumentError plot_field(sampled, :u)
-  @test_throws ArgumentError plot_field(state, :u)
-  @test_throws ArgumentError plot_mesh(refined_domain)
+  _throws_argument_message(() -> write_vtk("unloaded", domain), "requires WriteVTK")
+  _throws_argument_message(() -> write_pvd("unloaded.pvd", String[]), "requires WriteVTK")
+  _throws_argument_message(() -> plot_field(sampled, :u), "requires Makie")
+  _throws_argument_message(() -> plot_field!(nothing, sampled, :u), "requires Makie")
+  _throws_argument_message(() -> plot_field(state, :u), "requires Makie")
+  _throws_argument_message(() -> plot_mesh(refined_domain), "requires Makie")
+  _throws_argument_message(() -> plot_mesh!(nothing, refined_domain), "requires Makie")
+
+  fallback_script = raw"""
+using Grico
+
+function _throws_argument_message(f, needle::AbstractString)
+  try
+    f()
+  catch exception
+    exception isa ArgumentError || error("expected ArgumentError")
+    message = sprint(showerror, exception)
+    occursin(needle, message) || error("missing expected message")
+    return nothing
+  end
+
+  error("expected ArgumentError")
+end
+
+domain = Domain((0.0,), (1.0,), (1,))
+space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
+u = ScalarField(space; name=:u)
+state = State(FieldLayout((u,)), zeros(field_dof_count(u)))
+sampled = sample_postprocess(state)
+
+_throws_argument_message(() -> write_vtk("unloaded", domain), "requires WriteVTK")
+_throws_argument_message(() -> write_vtk("unloaded", sampled), "requires WriteVTK")
+_throws_argument_message(() -> write_pvd("unloaded.pvd", String[]), "requires WriteVTK")
+_throws_argument_message(() -> plot_field(sampled, :u), "requires Makie")
+_throws_argument_message(() -> plot_field!(nothing, sampled, :u), "requires Makie")
+_throws_argument_message(() -> plot_mesh(domain), "requires Makie")
+_throws_argument_message(() -> plot_mesh!(nothing, domain), "requires Makie")
+"""
+  fallback_command = `$(Base.julia_cmd()) --project=$(dirname(Base.active_project())) -e $fallback_script`
+  @test success(fallback_command)
 
   @test_throws ArgumentError sample_postprocess(domain; fields=(u,))
   @test sample_postprocess(copied_domain; state=state) isa SampledPostprocess
@@ -128,4 +177,8 @@ using Grico
   @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=(() -> 1.0),))
   @test_throws ArgumentError sample_postprocess(domain; subdivisions=0)
   @test_throws ArgumentError sample_postprocess(domain; sample_degree=0)
+  _throws_argument_message(() -> sample_postprocess(domain; subdivisions=1.5),
+                           "subdivisions must be a positive Int-representable integer")
+  _throws_argument_message(() -> sample_postprocess(domain; sample_degree=1.5),
+                           "sample_degree must be a positive Int-representable integer")
 end

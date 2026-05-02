@@ -15,9 +15,10 @@
 # `Dirichlet`, and `MeanValue`.
 #
 # Next comes the shared mutable storage used by the public `AffineProblem` and
-# `ResidualProblem` wrappers. These wrappers keep the public API simple while
-# letting later compilation stages work with one normalized internal
-# representation.
+# `ResidualProblem` wrappers. The storage is deliberately internal: users build
+# problems with `add_cell!`, `add_boundary!`, `add_interface!`, `add_surface!`,
+# `add_*_quadrature!`, and `add_constraint!`, while later compilation stages
+# work with one normalized representation.
 #
 # After that, the file provides the incremental mutation API used to build
 # problems operator by operator and constraint by constraint.
@@ -154,31 +155,31 @@ const _SurfaceTag = Union{Nothing,Symbol}
 # Internal wrapper pairing one boundary operator with the boundary face on which
 # it acts. Boundary operators are stored separately from cell/interface/surface
 # operators because they carry this extra geometric selector.
-struct _BoundaryContribution
+struct _BoundaryContribution{O}
   boundary::BoundaryFace
-  operator
+  operator::O
 end
 
 # Internal wrapper pairing one embedded-surface operator with the optional
 # symbolic tag that selects the embedded surfaces on which it should act.
-struct _SurfaceContribution
+struct _SurfaceContribution{O}
   tag::_SurfaceTag
-  operator
+  operator::O
 end
 
 # Internal wrapper pairing one embedded-surface attachment with the optional
 # symbolic tag under which it is registered in one problem description.
-struct _SurfaceAttachment
+struct _SurfaceAttachment{S}
   tag::_SurfaceTag
-  surface
+  surface::S
 end
 
 # Internal storage for user-supplied per-cell quadrature overrides. The public
 # constructor lives in `embedded.jl`, but the problem object keeps the validated
 # attachments in this compact form.
-struct _CellQuadratureAttachment
+struct _CellQuadratureAttachment{Q<:AbstractQuadrature}
   leaf::Int
-  quadrature::AbstractQuadrature
+  quadrature::Q
 end
 
 # Internal storage used by both affine and residual problem wrappers.
@@ -197,17 +198,10 @@ mutable struct _ProblemData
   dirichlet_constraints::Vector{Dirichlet}
   mean_constraints::Vector{MeanValue}
 
-  function _ProblemData(fields::Vector{AbstractField}, cell_operators::Vector{Any},
-                        boundary_operators::Vector{_BoundaryContribution},
-                        interface_operators::Vector{Any},
-                        surface_operators::Vector{_SurfaceContribution},
-                        cell_quadratures::Vector{_CellQuadratureAttachment},
-                        embedded_surfaces::Vector{_SurfaceAttachment},
-                        dirichlet_constraints::Vector{Dirichlet},
-                        mean_constraints::Vector{MeanValue})
-    return new(_checked_problem_fields(fields), cell_operators, boundary_operators,
-               interface_operators, surface_operators, cell_quadratures, embedded_surfaces,
-               dirichlet_constraints, mean_constraints)
+  function _ProblemData(fields::Vector{AbstractField})
+    return new(_checked_problem_fields(fields), Any[], _BoundaryContribution[], Any[],
+               _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
+               Dirichlet[], MeanValue[])
   end
 end
 
@@ -215,32 +209,35 @@ abstract type _AbstractProblem end
 
 function _empty_problem_data(fields::AbstractField...)
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
-  return _ProblemData(AbstractField[fields...], Any[], _BoundaryContribution[], Any[],
-                      _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
-                      Dirichlet[], MeanValue[])
+  return _ProblemData(AbstractField[fields...])
 end
 
-_problem_data(problem::_AbstractProblem) = getfield(problem, :data)
+_problem_data(problem::_AbstractProblem) = getfield(problem, :_data)
 
-# Forward property access from the public wrapper to the shared `_ProblemData`
-# storage. This lets `problem.cell_operators` and similar expressions behave as
-# if the collections were stored directly on the wrapper type, while still
-# centralizing the actual mutable state in one internal container.
+const _PROBLEM_STORAGE_PROPERTIES = fieldnames(_ProblemData)
+
+# Keep raw mutable storage out of the public problem API. The field remains
+# reachable through Julia's reflective internals, but ordinary property access
+# now points users toward the mutation/accessor functions that maintain
+# invariants.
 function Base.getproperty(problem::_AbstractProblem, name::Symbol)
-  name === :data && return getfield(problem, :data)
-  hasfield(_ProblemData, name) && return getfield(_problem_data(problem), name)
+  if name === :data || name in _PROBLEM_STORAGE_PROPERTIES
+    throw(ArgumentError("problem storage is internal; use fields(problem), field_count(problem), and add_*! mutation functions"))
+  end
+
   return getfield(problem, name)
 end
 
 function Base.setproperty!(problem::_AbstractProblem, name::Symbol, value)
-  name === :data && return setfield!(problem, :data, value)
-  hasfield(_ProblemData, name) && return setfield!(_problem_data(problem), name, value)
+  if name === :data || name === :_data || name in _PROBLEM_STORAGE_PROPERTIES
+    throw(ArgumentError("problem storage is internal; build or change problems with add_*! mutation functions"))
+  end
+
   return setfield!(problem, name, value)
 end
 
 function Base.propertynames(::_AbstractProblem, private::Bool=false)
-  public_names = fieldnames(_ProblemData)
-  return private ? (:data, public_names...) : public_names
+  return private ? (:_data,) : ()
 end
 
 # Public problem wrapper types.
@@ -269,41 +266,12 @@ The problem object itself does not evaluate anything yet. It is purely a
 mutable declaration of what should later be compiled and traversed by operator
 plans.
 """
-mutable struct AffineProblem <: _AbstractProblem
-  data::_ProblemData
-end
+struct AffineProblem <: _AbstractProblem
+  _data::_ProblemData
 
-@inline _problem_wrapper(::Type{P}, data::_ProblemData) where {P<:_AbstractProblem} = P(data)
-
-function _problem_wrapper(::Type{P}, fields::Vector{AbstractField}, cell_operators::Vector{Any},
-                          boundary_operators::Vector{_BoundaryContribution},
-                          interface_operators::Vector{Any},
-                          surface_operators::Vector{_SurfaceContribution},
-                          cell_quadratures::Vector{_CellQuadratureAttachment},
-                          embedded_surfaces::Vector{_SurfaceAttachment},
-                          dirichlet_constraints::Vector{Dirichlet},
-                          mean_constraints::Vector{MeanValue}) where {P<:_AbstractProblem}
-  return _problem_wrapper(P,
-                          _ProblemData(fields, cell_operators, boundary_operators,
-                                       interface_operators, surface_operators, cell_quadratures,
-                                       embedded_surfaces, dirichlet_constraints, mean_constraints))
-end
-
-function AffineProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
-                       boundary_operators::Vector{_BoundaryContribution},
-                       interface_operators::Vector{Any},
-                       surface_operators::Vector{_SurfaceContribution},
-                       cell_quadratures::Vector{_CellQuadratureAttachment},
-                       embedded_surfaces::Vector{_SurfaceAttachment},
-                       dirichlet_constraints::Vector{Dirichlet},
-                       mean_constraints::Vector{MeanValue})
-  return _problem_wrapper(AffineProblem, fields, cell_operators, boundary_operators,
-                          interface_operators, surface_operators, cell_quadratures,
-                          embedded_surfaces, dirichlet_constraints, mean_constraints)
-end
-
-function AffineProblem(fields::AbstractField...)
-  return _problem_wrapper(AffineProblem, _empty_problem_data(fields...))
+  function AffineProblem(fields::AbstractField...)
+    return new(_empty_problem_data(fields...))
+  end
 end
 
 """
@@ -322,25 +290,12 @@ The internal storage layout is intentionally the same as for
 appears later when operator evaluation dispatches to affine versus nonlinear
 operator callbacks.
 """
-mutable struct ResidualProblem <: _AbstractProblem
-  data::_ProblemData
-end
+struct ResidualProblem <: _AbstractProblem
+  _data::_ProblemData
 
-function ResidualProblem(fields::Vector{AbstractField}, cell_operators::Vector{Any},
-                         boundary_operators::Vector{_BoundaryContribution},
-                         interface_operators::Vector{Any},
-                         surface_operators::Vector{_SurfaceContribution},
-                         cell_quadratures::Vector{_CellQuadratureAttachment},
-                         embedded_surfaces::Vector{_SurfaceAttachment},
-                         dirichlet_constraints::Vector{Dirichlet},
-                         mean_constraints::Vector{MeanValue})
-  return _problem_wrapper(ResidualProblem, fields, cell_operators, boundary_operators,
-                          interface_operators, surface_operators, cell_quadratures,
-                          embedded_surfaces, dirichlet_constraints, mean_constraints)
-end
-
-function ResidualProblem(fields::AbstractField...)
-  return _problem_wrapper(ResidualProblem, _empty_problem_data(fields...))
+  function ResidualProblem(fields::AbstractField...)
+    return new(_empty_problem_data(fields...))
+  end
 end
 
 """
@@ -429,8 +384,8 @@ function _check_problem_constraint(fields::AbstractVector{<:AbstractField}, cons
   return constraint
 end
 
-@inline _problem_constraints(problem::_AbstractProblem, ::Dirichlet) = problem.dirichlet_constraints
-@inline _problem_constraints(problem::_AbstractProblem, ::MeanValue) = problem.mean_constraints
+@inline _problem_constraints(data::_ProblemData, ::Dirichlet) = data.dirichlet_constraints
+@inline _problem_constraints(data::_ProblemData, ::MeanValue) = data.mean_constraints
 
 # Revalidate the stored problem data. This is mainly used by later compilation
 # stages to assert that no invalid boundary or constraint data slipped into the
@@ -468,7 +423,7 @@ as [`cell_apply!`](@ref) and [`cell_rhs!`](@ref). For a
 chained.
 """
 function add_cell!(problem::_AbstractProblem, operator)
-  push!(problem.cell_operators, operator)
+  push!(_problem_data(problem).cell_operators, operator)
   return problem
 end
 
@@ -484,8 +439,9 @@ selector is stored alongside the operator so later compilation/evaluation stages
 can route the operator only to matching physical faces.
 """
 function add_boundary!(problem::_AbstractProblem, boundary::BoundaryFace, operator)
-  _check_problem_physical_boundary(problem.fields, boundary, "boundary operator")
-  push!(problem.boundary_operators, _BoundaryContribution(boundary, operator))
+  data = _problem_data(problem)
+  _check_problem_physical_boundary(data.fields, boundary, "boundary operator")
+  push!(data.boundary_operators, _BoundaryContribution(boundary, operator))
   return problem
 end
 
@@ -501,12 +457,12 @@ problem. The tagged form restricts the operator to embedded surfaces or surface
 quadratures attached with the same symbolic `tag`, for example `:outer`.
 """
 function add_surface!(problem::_AbstractProblem, operator)
-  push!(problem.surface_operators, _SurfaceContribution(nothing, operator))
+  push!(_problem_data(problem).surface_operators, _SurfaceContribution(nothing, operator))
   return problem
 end
 
 function add_surface!(problem::_AbstractProblem, tag::Symbol, operator)
-  push!(problem.surface_operators, _SurfaceContribution(tag, operator))
+  push!(_problem_data(problem).surface_operators, _SurfaceContribution(tag, operator))
   return problem
 end
 
@@ -519,7 +475,7 @@ Interface operators act on [`InterfaceValues`](@ref) items and therefore see
 both sides of an interior or periodic interface.
 """
 function add_interface!(problem::_AbstractProblem, operator)
-  push!(problem.interface_operators, operator)
+  push!(_problem_data(problem).interface_operators, operator)
   return problem
 end
 
@@ -536,8 +492,9 @@ compilation treats them as global algebraic conditions rather than as ordinary
 cell or face contributions.
 """
 function add_constraint!(problem::_AbstractProblem, constraint::Union{Dirichlet,MeanValue})
-  _check_problem_constraint(problem.fields, constraint)
-  push!(_problem_constraints(problem, constraint), constraint)
+  data = _problem_data(problem)
+  _check_problem_constraint(data.fields, constraint)
+  push!(_problem_constraints(data, constraint), constraint)
   return problem
 end
 

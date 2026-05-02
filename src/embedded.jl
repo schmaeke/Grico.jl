@@ -145,13 +145,13 @@ registers it only for surface operators added with the same symbolic `tag`,
 for example `:outer`.
 """
 function add_embedded_surface!(problem::_AbstractProblem, embedded_surface::EmbeddedSurface)
-  push!(problem.embedded_surfaces, _SurfaceAttachment(nothing, embedded_surface))
+  push!(_problem_data(problem).embedded_surfaces, _SurfaceAttachment(nothing, embedded_surface))
   return problem
 end
 
 function add_embedded_surface!(problem::_AbstractProblem, tag::Symbol,
                                embedded_surface::EmbeddedSurface)
-  push!(problem.embedded_surfaces, _SurfaceAttachment(tag, embedded_surface))
+  push!(_problem_data(problem).embedded_surfaces, _SurfaceAttachment(tag, embedded_surface))
   return problem
 end
 
@@ -171,12 +171,12 @@ constructs one from the given reference quadrature data. As with
 operators to the same symbolic `tag`, for example `:outer`.
 """
 function add_surface_quadrature!(problem::_AbstractProblem, surface::SurfaceQuadrature)
-  push!(problem.embedded_surfaces, _SurfaceAttachment(nothing, surface))
+  push!(_problem_data(problem).embedded_surfaces, _SurfaceAttachment(nothing, surface))
   return problem
 end
 
 function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol, surface::SurfaceQuadrature)
-  push!(problem.embedded_surfaces, _SurfaceAttachment(tag, surface))
+  push!(_problem_data(problem).embedded_surfaces, _SurfaceAttachment(tag, surface))
   return problem
 end
 
@@ -194,7 +194,7 @@ indeed lie in the standard reference cell `[-1, 1]^D`.
 """
 function add_cell_quadrature!(problem::_AbstractProblem, leaf::Integer,
                               quadrature::AbstractQuadrature)
-  push!(problem.cell_quadratures,
+  push!(_problem_data(problem).cell_quadratures,
         _CellQuadratureAttachment(_checked_positive(leaf, "leaf"), quadrature))
   return problem
 end
@@ -236,6 +236,12 @@ reference coordinates or `nothing` if the leaf contains no surface piece.
 The `space` method chooses a default `surface_point_count` from the cell
 quadrature shape already compiled for the leaf, so the default embedded-surface
 resolution tracks the local integration order of the space.
+
+Advanced API: the implicit extractor is a convenience backend for simple
+one- and two-dimensional level sets. It is useful for prototyping and teaching,
+but robust production workflows should prefer explicit [`SurfaceQuadrature`](@ref)
+attachments or a dedicated geometry backend when exact geometry handling is
+important.
 """
 function implicit_surface_quadrature(space::HpSpace{D,T}, leaf::Integer, classifier;
                                      subdivision_depth=2,
@@ -251,8 +257,10 @@ function implicit_surface_quadrature(space::HpSpace{D,T}, leaf::Integer, classif
       throw(ArgumentError("surface_point_count must be a positive Int-representable integer"))
     surface_point_count
   end
-  return implicit_surface_quadrature(domain(space), checked_leaf, classifier; subdivision_depth,
-                                     surface_point_count=point_count_value)
+  checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
+  checked_point_count = _checked_positive(point_count_value, "surface_point_count")
+  return _implicit_surface_quadrature_checked(domain(space), checked_leaf, classifier,
+                                              checked_depth, checked_point_count)
 end
 
 function implicit_surface_quadrature(domain::AbstractDomain{D,T}, leaf::Integer, classifier;
@@ -263,10 +271,17 @@ function implicit_surface_quadrature(domain::AbstractDomain{D,T}, leaf::Integer,
   surface_point_count isa Integer ||
     throw(ArgumentError("surface_point_count must be a positive Int-representable integer"))
   checked_leaf = _checked_cell(grid(domain), leaf)
-  _is_domain_active_leaf(domain, checked_leaf) ||
+  _is_current_domain_active_leaf(domain, checked_leaf) ||
     throw(ArgumentError("embedded surfaces can only be built on active leaves"))
   checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
   checked_point_count = _checked_positive(surface_point_count, "surface_point_count")
+  return _implicit_surface_quadrature_checked(domain, checked_leaf, classifier, checked_depth,
+                                              checked_point_count)
+end
+
+function _implicit_surface_quadrature_checked(domain::AbstractDomain{D,T}, checked_leaf::Int,
+                                              classifier, checked_depth::Int,
+                                              checked_point_count::Int) where {D,T<:AbstractFloat}
   D <= 2 ||
     throw(ArgumentError("default embedded-surface construction currently supports dimensions 1 and 2"))
   points = NTuple{D,T}[]

@@ -337,7 +337,8 @@ end
 # this race-free without imposing a coloring scheme on every traversal type, each
 # dense worker slot receives a local scratch block and, except for slot 1, a
 # full result buffer. The buffers are reduced once after all cells/faces/surfaces
-# in a pass have contributed.
+# in a pass have contributed. The slot count comes from the shared-memory CPU
+# runtime boundary in `common.jl`.
 struct _ThreadedOperatorScratch{T<:AbstractFloat}
   local_scratch::Vector{_OperatorScratch{T}}
   result_buffers::Vector{Vector{T}}
@@ -353,7 +354,7 @@ function _scratch_buffer(::Type{T}, integration::_CompiledIntegration) where {T<
 end
 
 function _threaded_scratch_buffer(::Type{T}, plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
-  thread_count = Base.Threads.nthreads()
+  thread_count = _runtime_worker_count(_SHARED_MEMORY_CPU_BACKEND)
   local_dof_count = _max_local_dof_count(plan.integration)
   local_scratch = [_OperatorScratch(T, local_dof_count) for _ in 1:thread_count]
   result_buffers = [zeros(T, dof_count(plan)) for _ in 2:thread_count]
@@ -415,6 +416,32 @@ function _merge_threaded_result!(result::AbstractVector{T},
 end
 
 """
+    OperatorWorkspace(plan)
+
+Reusable runtime storage for repeated affine [`rhs!`](@ref) and [`apply!`](@ref)
+calls on `plan`.
+
+The default two- and three-argument `rhs!`/`apply!` methods allocate a fresh
+workspace for convenience. Performance-critical loops should create one
+`OperatorWorkspace` for the compiled plan and pass it to the workspace-aware
+methods instead.
+"""
+struct OperatorWorkspace{T<:AbstractFloat,P<:AssemblyPlan}
+  plan::P
+  threaded_scratch::_ThreadedOperatorScratch{T}
+end
+
+function OperatorWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  return OperatorWorkspace{T,typeof(plan)}(plan, _threaded_scratch_buffer(T, plan))
+end
+
+function _check_operator_workspace(plan::AssemblyPlan, workspace::OperatorWorkspace)
+  workspace.plan === plan ||
+    throw(ArgumentError("operator workspace belongs to a different AssemblyPlan"))
+  return nothing
+end
+
+"""
     ResidualWorkspace(plan)
 
 Reusable runtime storage for repeated nonlinear residual and tangent-action
@@ -454,6 +481,7 @@ end
     rhs(problem)
     rhs(plan)
     rhs!(result, plan)
+    rhs!(result, plan, workspace)
 
 Evaluate the affine right-hand side associated with an [`AffineProblem`](@ref)
 or a compiled affine [`AssemblyPlan`](@ref).
@@ -471,9 +499,15 @@ function rhs(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
 end
 
 function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  return rhs!(result, plan, OperatorWorkspace(plan))
+end
+
+function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+              workspace::OperatorWorkspace{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
+  _check_operator_workspace(plan, workspace)
   _require_length(result, dof_count(plan), "result")
-  scratch = _threaded_scratch_buffer(T, plan)
+  scratch = workspace.threaded_scratch
   _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
@@ -495,6 +529,7 @@ end
 """
     apply(plan, coefficients)
     apply!(result, plan, coefficients)
+    apply!(result, plan, coefficients, workspace)
 
 Apply the affine operator compiled in `plan` directly to `coefficients`.
 
@@ -511,11 +546,18 @@ end
 
 function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                 coefficients::AbstractVector{T}) where {D,T<:AbstractFloat}
+  return apply!(result, plan, coefficients, OperatorWorkspace(plan))
+end
+
+function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                coefficients::AbstractVector{T},
+                workspace::OperatorWorkspace{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
+  _check_operator_workspace(plan, workspace)
   _require_length(result, dof_count(plan), "result")
   _require_length(coefficients, dof_count(plan), "coefficient vector")
   _check_no_alias(result, coefficients)
-  scratch = _threaded_scratch_buffer(T, plan)
+  scratch = workspace.threaded_scratch
   _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks

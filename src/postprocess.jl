@@ -124,8 +124,7 @@ end
 
 function sample_postprocess(space::HpSpace{D,T}; state::Union{Nothing,State}=nothing,
                             fields=nothing, point_data=(), cell_data=(), field_data=(),
-                            subdivisions::Integer=1,
-                            sample_degree::Integer=1) where {D,T<:AbstractFloat}
+                            subdivisions=1, sample_degree=1) where {D,T<:AbstractFloat}
   return _sample_postprocess(space; state=state, fields=fields, point_data=point_data,
                              cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
                              sample_degree=sample_degree)
@@ -133,23 +132,22 @@ end
 
 function sample_postprocess(domain_data::AbstractDomain{D,T}; state::Union{Nothing,State}=nothing,
                             fields=nothing, point_data=(), cell_data=(), field_data=(),
-                            subdivisions::Integer=1,
-                            sample_degree::Integer=1) where {D,T<:AbstractFloat}
+                            subdivisions=1, sample_degree=1) where {D,T<:AbstractFloat}
   return _sample_postprocess(domain_data; state=state, fields=fields, point_data=point_data,
                              cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
                              sample_degree=sample_degree)
 end
 
 function _sample_postprocess(reference; state::Union{Nothing,State}=nothing, fields=nothing,
-                             point_data=(), cell_data=(), field_data=(), subdivisions::Integer=1,
-                             sample_degree::Integer=1)
+                             point_data=(), cell_data=(), field_data=(), subdivisions=1,
+                             sample_degree=1)
   reference_domain = _postprocess_reference_domain(reference)
   D = dimension(reference_domain)
   T = eltype(origin(reference_domain))
   postprocess_supported(D) ||
     throw(ArgumentError("postprocessing requires a domain dimension between 1 and 3"))
-  subdivision_count = _checked_positive(subdivisions, "subdivisions")
-  checked_sample_degree = _checked_positive(sample_degree, "sample_degree")
+  subdivision_count = _checked_postprocess_positive_integer(subdivisions, "subdivisions")
+  checked_sample_degree = _checked_postprocess_positive_integer(sample_degree, "sample_degree")
   sampled_fields = _postprocess_fields(reference, state, fields)
   sampled_mesh = _sampled_mesh(reference, subdivision_count, checked_sample_degree)
   field_samples = _sample_postprocess_fields(sampled_fields, state, sampled_mesh, T)
@@ -160,6 +158,12 @@ function _sample_postprocess(reference; state::Union{Nothing,State}=nothing, fie
   _require_postprocess_dataset_sizes(point_datasets, size(sampled_mesh.points, 2), "point")
   _require_postprocess_dataset_sizes(cell_datasets, length(sampled_mesh.cell_leaves), "cell")
   return SampledPostprocess{D,T}(sampled_mesh, point_datasets, cell_datasets, field_datasets)
+end
+
+function _checked_postprocess_positive_integer(value, name::AbstractString)
+  value isa Integer ||
+    throw(ArgumentError("$name must be a positive Int-representable integer"))
+  return _checked_positive(value, name)
 end
 
 """

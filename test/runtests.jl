@@ -2,12 +2,18 @@ using Test
 using Grico
 
 @testset verbose = true "Grico" begin
+  include("api_surface.jl")
+  include("feature_stability.jl")
+  include("problem_api.jl")
+  include("runtime_contracts.jl")
+
   @testset verbose = true "Core Numerics" begin
     include("core.jl")
   end
 
   @testset verbose = true "Mesh And Geometry" begin
     include("topology_geometry.jl")
+    include("embedded_geometry.jl")
   end
 
   @testset verbose = true "Space And Fields" begin

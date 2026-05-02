@@ -18,8 +18,7 @@ end
 function Grico.plot_field(reference::Union{Grico.HpSpace{D,T},Grico.AbstractDomain{D,T}},
                           name::Union{Symbol,AbstractString};
                           state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
-                          cell_data=(), field_data=(), subdivisions::Integer=1,
-                          sample_degree::Integer=1, mesh=false,
+                          cell_data=(), field_data=(), subdivisions=1, sample_degree=1, mesh=false,
                           kwargs...) where {D,T<:AbstractFloat}
   data = _makie_sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                    cell_data=cell_data, field_data=field_data,
@@ -60,8 +59,8 @@ end
 function Grico.plot_field!(axis, reference::Union{Grico.HpSpace{D,T},Grico.AbstractDomain{D,T}},
                            name::Union{Symbol,AbstractString};
                            state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
-                           cell_data=(), field_data=(), subdivisions::Integer=1,
-                           sample_degree::Integer=1, kwargs...) where {D,T<:AbstractFloat}
+                           cell_data=(), field_data=(), subdivisions=1, sample_degree=1,
+                           kwargs...) where {D,T<:AbstractFloat}
   data = _makie_sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                    cell_data=cell_data, field_data=field_data,
                                    subdivisions=subdivisions, sample_degree=sample_degree)
@@ -164,7 +163,7 @@ end
 # counts therefore remains centralized in `sample_postprocess`.
 function _makie_sample_postprocess(reference; state::Union{Nothing,Grico.State}=nothing,
                                    fields=nothing, point_data=(), cell_data=(), field_data=(),
-                                   subdivisions::Integer=1, sample_degree::Integer=1)
+                                   subdivisions=1, sample_degree=1)
   return Grico.sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                   cell_data=cell_data, field_data=field_data,
                                   subdivisions=subdivisions, sample_degree=sample_degree)

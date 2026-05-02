@@ -1,9 +1,10 @@
 using Test
 using Grico
-import Grico: coefficient_coarsening_indicators, h_adaptation_axes, h_coarsening_candidates,
-              interface_jump_indicators, is_domain_boundary, p_degree_change,
-              multiresolution_indicators, projection_coarsening_indicators, source_leaves,
-              target_space
+import Grico: adaptivity_plan, coefficient_coarsening_indicators, h_adaptation_axes,
+              h_coarsening_candidates, interface_jump_indicators, is_domain_boundary, level,
+              local_modes, map_to_biunit_cube, multiresolution_indicators, p_degree_change,
+              periodic_axes, projection_coarsening_indicators, source_leaves, snapshot,
+              target_space, derived_adaptivity_plan
 
 const ADAPTIVITY_TOL = 1.0e-8
 
@@ -126,6 +127,58 @@ end
   @test field_dof_range(field_layout(transferred), u) ==
         field_dof_range(field_layout(transferred), new_u)
   @test field_values(transferred, u) == field_values(transferred, new_u)
+
+  for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
+    @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = ADAPTIVITY_TOL
+  end
+end
+
+@testset "Transfer Strategy Boundary" begin
+  cg_domain = Domain((0.0,), (1.0,), (1,))
+  cg_space = HpSpace(cg_domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  cg_plan = AdaptivityPlan(cg_space)
+  request_h_refinement!(cg_plan, 1, 1)
+  cg_transition = transition(cg_plan)
+  custom_solve = (A, b) -> A \ b
+
+  @test Grico._transfer_strategy(cg_transition, Grico.default_linear_solve) ===
+        Grico._LOCAL_PROJECTION_TRANSFER
+  @test Grico._transfer_strategy(cg_transition, custom_solve) === Grico._VARIATIONAL_TRANSFER
+
+  dg_domain = Domain((0.0,), (1.0,), (1,))
+  dg_space = HpSpace(dg_domain,
+                     SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
+                                  continuity=:dg))
+  dg_plan = AdaptivityPlan(dg_space)
+  request_h_refinement!(dg_plan, 1, 1)
+  dg_transition = transition(dg_plan)
+
+  @test Grico._transfer_strategy(dg_transition, Grico.default_linear_solve) ===
+        Grico._CELLWISE_DG_TRANSFER
+  @test Grico._transfer_strategy(dg_transition, custom_solve) === Grico._CELLWISE_DG_TRANSFER
+end
+
+@testset "Manual Transfer And Indicator Policy Separation" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((u,)), [0.3, -0.8, 0.45])
+
+  manual_plan = AdaptivityPlan(space)
+  request_h_refinement!(manual_plan, 1, 1)
+  heuristic_plan = adaptivity_plan(state, u; tolerance=0.0,
+                                   limits=AdaptivityLimits(space; min_h_level=0,
+                                                           max_h_level=0, min_p=2,
+                                                           max_p=3))
+
+  @test h_adaptation_axes(manual_plan, 1) == (true,)
+  @test p_degree_change(manual_plan, 1) == (0,)
+  @test h_adaptation_axes(heuristic_plan, 1) == (false,)
+  @test p_degree_change(heuristic_plan, 1) == (1,)
+
+  manual_transition = transition(manual_plan)
+  new_u = adapted_field(manual_transition, u)
+  transferred = transfer_state(manual_transition, state, u, new_u)
 
   for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
     @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = ADAPTIVITY_TOL

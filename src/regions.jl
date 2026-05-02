@@ -106,6 +106,12 @@ therefore trimmed as well.
 
 `PhysicalDomain` does not modify the wrapped background mesh. It only changes
 how later discretization layers interpret that mesh.
+
+Stability: `PhysicalDomain`, `ImplicitRegion`, `PhysicalMeasure`, and
+`FiniteCellExtension` are the stable codimension-0 geometry API. The
+moment-fitted quadrature reduction used for cut cells is an advanced numerical
+policy; users who need direct access should call
+[`finite_cell_quadrature`](@ref) explicitly.
 """
 struct PhysicalDomain{D,T<:AbstractFloat,B<:Domain{D,T},R<:AbstractPhysicalRegion,
                       M<:AbstractCellMeasure} <: AbstractDomain{D,T}
@@ -147,13 +153,14 @@ The classifier uses the finite-cell sign convention
   classifier(x) > 0  outside.
 
 Boolean classifiers are also accepted: `true` means inside and `false` means
-outside. `ImplicitRegion` caches leaf classifications and cut-cell quadratures
-by a geometry-aware signature of each background cell. Reusing the same region
-object across copied or adaptively rebuilt domains therefore also reuses those
-caches, while domains with different physical boxes get independent cache
-entries. For codimension-0 integration, cells with only measure-zero contact to
-the physical region are classified as outside so the active-leaf set remains a
-true volume discretization.
+outside. Classifiers are expected to be pure functions of the physical point:
+`ImplicitRegion` caches leaf classifications and cut-cell quadratures by a
+geometry-aware signature of each background cell. Reusing the same region object
+across copied or adaptively rebuilt domains therefore also reuses those caches,
+while domains with different physical boxes, root grids, or leaf coordinates get
+independent cache entries. For codimension-0 integration, cells with only
+measure-zero contact to the physical region are classified as outside so the
+active-leaf set remains a true volume discretization.
 """
 struct ImplicitRegion{F} <: AbstractPhysicalRegion
   classifier::F
@@ -162,7 +169,9 @@ struct ImplicitRegion{F} <: AbstractPhysicalRegion
   cut_quadrature_cache::Dict{_QuadratureSignature,AbstractQuadrature}
 end
 
-function ImplicitRegion(classifier; subdivision_depth::Integer=2)
+function ImplicitRegion(classifier; subdivision_depth=2)
+  subdivision_depth isa Integer ||
+    throw(ArgumentError("subdivision_depth must be a non-negative Int-representable integer"))
   checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
   return ImplicitRegion(classifier, checked_depth, Dict{_LeafSignature,Symbol}(),
                         Dict{_QuadratureSignature,AbstractQuadrature}())
@@ -224,15 +233,24 @@ function _store_cut_quadrature!(region::ImplicitRegion, signature, quadrature)
   return quadrature
 end
 
-# Domain-level active leaves. Plain background domains keep their full active
-# frontier, while physical domains keep only the non-outside portion selected by
-# the owning region. The region backend is responsible for providing a usable
-# default quadrature on every cut leaf that remains active.
+# Domain-level active leaves used to build or filter snapshot frontiers.
+# Append-only adaptivity can make stored child cells active in a `GridSnapshot`
+# without changing the owning grid's current `active` flags, so
+# `_is_domain_active_leaf` deliberately means "admissible for this domain
+# frontier" rather than "active in the current grid state". Use
+# `_is_current_domain_active_leaf` for public operations that address the
+# domain's current frontier directly.
 _domain_active_leaves(domain::Domain) = active_leaves(grid(domain))
 
 @inline _is_domain_active_leaf(domain::Domain, leaf::Int) = 1 <=
                                                             leaf <=
                                                             stored_cell_count(grid(domain))
+
+@inline function _is_current_domain_active_leaf(domain::Domain, leaf::Int)
+  grid_data = grid(domain)
+  1 <= leaf <= stored_cell_count(grid_data) || return false
+  return _is_active_leaf(grid_data, leaf)
+end
 
 function _domain_active_leaves(domain::PhysicalDomain{D,T}) where {D,T<:AbstractFloat}
   grid_data = grid(domain)
@@ -249,6 +267,11 @@ function _domain_active_leaves(domain::PhysicalDomain{D,T}) where {D,T<:Abstract
 end
 
 @inline function _is_domain_active_leaf(domain::PhysicalDomain, leaf::Int)
+  return _classify_leaf(domain.region, domain, leaf) !== :outside
+end
+
+@inline function _is_current_domain_active_leaf(domain::PhysicalDomain, leaf::Int)
+  _is_current_domain_active_leaf(_background_domain(domain), leaf) || return false
   return _classify_leaf(domain.region, domain, leaf) !== :outside
 end
 
@@ -363,10 +386,17 @@ is returned on the biunit reference cell of `leaf`.
 
 This is the same finite-cell backend that [`PhysicalDomain`](@ref) uses
 automatically during problem compilation.
+
+Advanced API: this helper exposes the finite-cell moment-fitting backend
+directly. Its call signature is supported, but the reduction policy, candidate
+selection, and tolerances are numerical details that may be tuned as the
+finite-cell backend matures. The construction is dimension-independent, but the
+recursive candidate search and full-tensor moment basis grow quickly with
+dimension and quadrature order.
 """
 function finite_cell_quadrature(domain::AbstractDomain{D,T}, leaf::Integer,
                                 quadrature_shape::NTuple{D,<:Integer}, classifier;
-                                subdivision_depth::Integer=2) where {D,T<:AbstractFloat}
+                                subdivision_depth=2) where {D,T<:AbstractFloat}
   region = ImplicitRegion(classifier; subdivision_depth=subdivision_depth)
   return _cut_cell_quadrature(region, domain, leaf, quadrature_shape)
 end

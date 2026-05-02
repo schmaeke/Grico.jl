@@ -204,9 +204,9 @@ their coefficients side by side without ambiguity. It is therefore the bridge
 between semantic unknowns and raw algebraic storage.
 
 Algebraically, the layout fixes the basis ordering of the direct sum of all
-field spaces. Later matrix assembly, solver reconstruction, and VTK export all
-rely on this one ordering to interpret slices of a monolithic vector as named
-field blocks again.
+field spaces. Later matrix assembly, solver reconstruction, and sampled
+postprocessing all rely on this one ordering to interpret slices of a
+monolithic vector as named field blocks again.
 """
 struct FieldLayout{D,T<:AbstractFloat}
   slots::Vector{_FieldSlot{D,T}}

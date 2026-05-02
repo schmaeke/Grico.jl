@@ -21,6 +21,19 @@ function vtk_data_array(xml::AbstractString, name::AbstractString, ::Type{T}) wh
   return parse.(T, split(strip(match_data.captures[1])))
 end
 
+function throws_argument_message(f, needle::AbstractString)
+  try
+    f()
+  catch exception
+    @test exception isa ArgumentError
+    @test occursin(needle, sprint(showerror, exception))
+    return nothing
+  end
+
+  @test false
+  return nothing
+end
+
 @testset "VTK Export" begin
   domain = Domain((0.0,), (1.0,), (1,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
@@ -262,5 +275,41 @@ end
                                          append=false, ascii=true)
     @test_throws ArgumentError write_vtk(joinpath(directory, "baddegree"), domain; sample_degree=0,
                                          append=false, ascii=true)
+  end
+
+  @testset "Extension Boundaries" begin
+    domain4 = Domain(ntuple(_ -> 0.0, 4), ntuple(_ -> 1.0, 4), ntuple(_ -> 1, 4))
+    mesh4 = Grico.SampledMesh{4,Float64}(zeros(4, 1), [1], zeros(4, 1), [1], [1],
+                                         zeros(4, 1), zeros(4, 1), 1, 1, 1, 1)
+    sampled4 = Grico.SampledPostprocess{4,Float64}(mesh4,
+                                                   Pair{String,Union{AbstractVector,
+                                                                     AbstractMatrix}}[],
+                                                   Pair{String,Union{AbstractVector,
+                                                                     AbstractMatrix}}[],
+                                                   Pair{String,Any}[])
+    skeleton2 = Grico.sample_mesh_skeleton(Domain((0.0, 0.0), (1.0, 1.0), (1, 1)))
+    sampled1 = sample_postprocess(state)
+
+    mktempdir() do directory
+      throws_argument_message(() -> write_vtk(joinpath(directory, "unsupported"), domain4;
+                                              append=false, ascii=true),
+                              "dimension between 1 and 3")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "unsupported_sampled"),
+                                              sampled4; append=false, ascii=true),
+                              "dimension between 1 and 3")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "missing_mesh"), sampled1;
+                                              mesh=true, append=false, ascii=true),
+                              "requires skeleton")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "wrong_mesh"), sampled1;
+                                              mesh=true, skeleton=skeleton2, append=false,
+                                              ascii=true),
+                              "skeleton dimension")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "badsub"), domain;
+                                              subdivisions=1.5, append=false, ascii=true),
+                              "subdivisions must be a positive Int-representable integer")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "baddegree"), domain;
+                                              sample_degree=1.5, append=false, ascii=true),
+                              "sample_degree must be a positive Int-representable integer")
+    end
   end
 end

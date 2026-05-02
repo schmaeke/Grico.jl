@@ -1,26 +1,44 @@
 # This file collects small internal utilities that are shared across several
 # layers of the library. They are intentionally kept low-level: basic argument
-# validation and compact sparse-term evaluation utilities. Centralizing them
-# here avoids repeating the same defensive checks and tight inner-loop patterns
-# throughout topology, assembly, adaptivity, and post-processing code.
+# validation, the shared-memory CPU runtime boundary, and compact sparse-term
+# evaluation utilities. Centralizing them here avoids repeating the same
+# defensive checks and tight inner-loop patterns throughout topology, assembly,
+# adaptivity, and post-processing code.
+
+# Runtime boundary for the current matrix-free backend. Grico is presently a
+# shared-memory CPU package; distributed memory and GPU execution should be
+# added behind a similarly small backend boundary instead of threading backend
+# assumptions through numerical kernels.
+abstract type _ExecutionBackend end
+
+struct _SharedMemoryCPUBackend <: _ExecutionBackend end
+
+const _SHARED_MEMORY_CPU_BACKEND = _SharedMemoryCPUBackend()
+
+@inline _runtime_worker_count(::_SharedMemoryCPUBackend) = Base.Threads.nthreads()
+
+@inline function _runtime_uses_polyester(::Type{_SharedMemoryCPUBackend})
+  return !(Sys.KERNEL === :Darwin && Sys.ARCH === :aarch64)
+end
 
 macro _threaded_loop(expr)
-  # Polyester gives the low-overhead path we want on Linux. On Apple silicon,
-  # some user-kernel loops still hit Polyester's cfunction closure limitation,
-  # so we use Julia's static scheduler as a portable fallback there.
-  threaded_expr = @static if Sys.KERNEL === :Darwin && Sys.ARCH === :aarch64
+  # Polyester gives the low-overhead CPU path we want on Linux. On Apple
+  # silicon, some user-kernel loops still hit Polyester's cfunction closure
+  # limitation, so the shared-memory CPU backend uses Julia's static scheduler
+  # as a portable fallback there.
+  threaded_expr = @static if _runtime_uses_polyester(_SharedMemoryCPUBackend)
+    quote
+      @batch per=thread $(expr)
+    end
+  else
     quote
       let
-        if Base.Threads.nthreads() == 1
+        if _runtime_worker_count(_SHARED_MEMORY_CPU_BACKEND) == 1
           $(expr)
         else
           Base.Threads.@threads :static $(expr)
         end
       end
-    end
-  else
-    quote
-      @batch per=thread $(expr)
     end
   end
 

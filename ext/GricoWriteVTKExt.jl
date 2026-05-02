@@ -23,9 +23,8 @@ end
 
 function Grico.write_vtk(path::AbstractString, space::Grico.HpSpace{D,T};
                          state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
-                         cell_data=(), field_data=(), subdivisions::Integer=1,
-                         sample_degree::Integer=1, mesh::Bool=false,
-                         vtk_kwargs...) where {D,T<:AbstractFloat}
+                         cell_data=(), field_data=(), subdivisions=1, sample_degree=1,
+                         mesh::Bool=false, vtk_kwargs...) where {D,T<:AbstractFloat}
   return _write_vtk(path, space; state=state, fields=fields, point_data=point_data,
                     cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
                     sample_degree=sample_degree, mesh=mesh, vtk_kwargs...)
@@ -33,9 +32,8 @@ end
 
 function Grico.write_vtk(path::AbstractString, domain_data::Grico.AbstractDomain{D,T};
                          state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
-                         cell_data=(), field_data=(), subdivisions::Integer=1,
-                         sample_degree::Integer=1, mesh::Bool=false,
-                         vtk_kwargs...) where {D,T<:AbstractFloat}
+                         cell_data=(), field_data=(), subdivisions=1, sample_degree=1,
+                         mesh::Bool=false, vtk_kwargs...) where {D,T<:AbstractFloat}
   return _write_vtk(path, domain_data; state=state, fields=fields, point_data=point_data,
                     cell_data=cell_data, field_data=field_data, subdivisions=subdivisions,
                     sample_degree=sample_degree, mesh=mesh, vtk_kwargs...)
@@ -43,11 +41,11 @@ end
 
 function Grico.write_vtk(path::AbstractString, data::Grico.SampledPostprocess; mesh::Bool=false,
                          skeleton=nothing, vtk_kwargs...)
+  _require_vtk_dimension(data.mesh)
   grid_kwargs = _vtk_grid_kwargs(vtk_kwargs)
 
   if mesh
-    skeleton === nothing &&
-      throw(ArgumentError("mesh=true with sampled data requires skeleton=sample_mesh_skeleton(...)"))
+    skeleton = _require_vtk_skeleton(data, skeleton)
     return _write_vtk_multiblock(path, data, skeleton, grid_kwargs)
   end
 
@@ -60,8 +58,7 @@ end
 # an additional active-leaf mesh skeleton.
 function _write_vtk(path::AbstractString, reference; state::Union{Nothing,Grico.State}=nothing,
                     fields=nothing, point_data=(), cell_data=(), field_data=(),
-                    subdivisions::Integer=1, sample_degree::Integer=1, mesh::Bool=false,
-                    vtk_kwargs...)
+                    subdivisions=1, sample_degree=1, mesh::Bool=false, vtk_kwargs...)
   data = Grico.sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                   cell_data=cell_data, field_data=field_data,
                                   subdivisions=subdivisions, sample_degree=sample_degree)
@@ -73,6 +70,30 @@ function _write_vtk(path::AbstractString, reference; state::Union{Nothing,Grico.
   end
 
   return only(_write_vtk_solution_grid(path, data, grid_kwargs))
+end
+
+function _require_vtk_dimension(mesh::Union{Grico.SampledMesh{D},
+                                            Grico.SampledMeshSkeleton{D}}) where {D}
+  Grico.postprocess_supported(D) ||
+    throw(ArgumentError("VTK export requires sampled data with dimension between 1 and 3"))
+  return nothing
+end
+
+function _require_vtk_skeleton(data::Grico.SampledPostprocess{D},
+                               skeleton::Grico.SampledMeshSkeleton{D}) where {D}
+  _require_vtk_dimension(skeleton)
+  return skeleton
+end
+
+function _require_vtk_skeleton(data::Grico.SampledPostprocess{D},
+                               ::Grico.SampledMeshSkeleton{S}) where {D,S}
+  throw(ArgumentError("mesh skeleton dimension $S does not match sampled data dimension $D"))
+end
+
+function _require_vtk_skeleton(::Grico.SampledPostprocess, skeleton)
+  skeleton === nothing &&
+    throw(ArgumentError("mesh=true with sampled data requires skeleton=sample_mesh_skeleton(...)"))
+  throw(ArgumentError("mesh=true with sampled data requires a SampledMeshSkeleton"))
 end
 
 # WriteVTK's default VTK XML version may change with package versions. Grico pins
@@ -87,6 +108,7 @@ end
 # coordinates to the three-component point matrix required by WriteVTK.
 function _write_vtk_solution_grid(path::AbstractString, data::Grico.SampledPostprocess, grid_kwargs)
   mesh = data.mesh
+  _require_vtk_dimension(mesh)
   return vtk_grid(path, _vtk_point_matrix(mesh), _vtk_lagrange_cells(mesh); grid_kwargs...) do vtk
     _write_vtk_datasets!(vtk, data.point_data, data.cell_data, data.field_data)
   end
@@ -98,6 +120,8 @@ end
 # the same stem so a time series remains easy to manage.
 function _write_vtk_multiblock(path::AbstractString, data::Grico.SampledPostprocess,
                                skeleton::Grico.SampledMeshSkeleton, grid_kwargs)
+  _require_vtk_dimension(data.mesh)
+  _require_vtk_dimension(skeleton)
   base_path = _vtk_multiblock_base_path(path)
   vtm = vtk_multiblock(base_path)
 

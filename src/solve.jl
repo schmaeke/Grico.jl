@@ -18,6 +18,17 @@ provide a custom `linear_solve`.
 """
 struct JacobiPreconditioner end
 
+"""
+    default_linear_solve(plan, reduced_rhs; workspace=..., preconditioner=nothing, kwargs...)
+
+Default matrix-free CG solve for affine reduced systems.
+
+This is the stable reference implementation for the `linear_solve` callback
+used by affine [`solve`](@ref). It accepts the same keyword contract that custom
+affine solvers should support: a reusable reduced-operator workspace,
+optional preconditioner, tolerances, iteration limit, and optional initial
+solution.
+"""
 function default_linear_solve(plan::AssemblyPlan{D,T}, reduced_rhs::AbstractVector{T};
                               workspace=_ReducedOperatorWorkspace(plan), preconditioner=nothing,
                               relative_tolerance=sqrt(eps(T)), absolute_tolerance=zero(T),
@@ -219,6 +230,19 @@ function _preconditioner_data(plan, workspace, preconditioner)
   throw(ArgumentError("unsupported matrix-free preconditioner $(typeof(preconditioner))"))
 end
 
+"""
+    default_tangent_linear_solve(plan, state, reduced_rhs; workspace=...,
+                                 residual_workspace=..., preconditioner=nothing, kwargs...)
+
+Default matrix-free CG solve for Newton tangent corrections.
+
+Advanced API: this function defines Grico's built-in residual-solve policy. It
+is useful as a reference and as the default for [`solve`](@ref) on residual
+plans, but nonlinear preconditioning and globalization remain application
+policy. Passing a preconditioner to this default method is intentionally
+rejected; provide a custom `linear_solve` when tangent preconditioning is
+required.
+"""
 function default_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T},
                                       reduced_rhs::AbstractVector{T};
                                       workspace=_ReducedOperatorWorkspace(plan),

@@ -423,11 +423,12 @@ end
 # Direct compiled-leaf evaluation.
 #
 # Some library subsystems need point samples on a compiled leaf without building
-# full `CellValues`: adaptivity indicators, state transfer, and VTK export all
-# evaluate modal expansions at many reference points. The helpers below share
-# one allocation-conscious path for that work. Callers prepare component
-# coefficient views once, reuse one basis-vector scratch, and then evaluate
-# scalar components from the compiled local-to-global mode expansion.
+# full `CellValues`: adaptivity indicators, state transfer, and sampled
+# postprocessing all evaluate modal expansions at many reference points. The
+# helpers below share one allocation-conscious path for that work. Callers
+# prepare component coefficient views once, reuse one basis-vector scratch, and
+# then evaluate scalar components from the compiled local-to-global mode
+# expansion.
 function _component_coefficient_views(state::State, field::AbstractField)
   return [field_component_values(state, field, component) for component in 1:component_count(field)]
 end
