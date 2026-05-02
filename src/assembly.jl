@@ -10,12 +10,28 @@
 
 # Matrix-free plan structure.
 
-struct _MatrixFreeAssemblyStructure{K} end
+struct _ReducedOperatorMap{T<:AbstractFloat}
+  full_dof_count::Int
+  solve_dofs::Vector{Int}
+  reduced_index::Vector{Int}
+  shift::Vector{T}
+  row_offsets::Vector{Int}
+  row_indices::Vector{Int}
+  row_coefficients::Vector{T}
+end
+
+struct _MatrixFreeAssemblyStructure{K,T<:AbstractFloat,M}
+  reduced_map::M
+end
 
 function _compile_assembly_structure(::Val{K}, layout, cell_operators, boundary_operators,
                                      interface_operators, surface_operators, integration,
                                      dirichlet, mean_constraints, constraint_masks) where {K}
-  return _MatrixFreeAssemblyStructure{K}()
+  T = eltype(origin(field_space(layout.slots[1].field)))
+  reduced_map = K === :affine ? _compile_reduced_operator_map(T, dof_count(layout),
+                                                              dirichlet, mean_constraints,
+                                                              constraint_masks) : nothing
+  return _MatrixFreeAssemblyStructure{K,T,typeof(reduced_map)}(reduced_map)
 end
 
 @inline _matrix_free_kind(::_MatrixFreeAssemblyStructure{K}) where {K} = K
@@ -27,6 +43,276 @@ function _require_matrix_free_kind(plan::AssemblyPlan, expected::Symbol)
   _matrix_free_kind(structure) == expected ||
     throw(ArgumentError("operation requires a plan compiled from $(expected) problem"))
   return nothing
+end
+
+@inline function _reduced_map(plan::AssemblyPlan)
+  return plan.assembly_structure.reduced_map
+end
+
+reduced_dof_count(plan::AssemblyPlan) = length(_reduced_map(plan).solve_dofs)
+reduced_dof_count(map::_ReducedOperatorMap) = length(map.solve_dofs)
+
+mutable struct _BaseConstraintExpansion{T<:AbstractFloat}
+  shift::T
+  reduced::Dict{Int,T}
+  mean::Dict{Int,T}
+end
+
+mutable struct _ReducedExpansion{T<:AbstractFloat}
+  shift::T
+  reduced::Dict{Int,T}
+end
+
+_BaseConstraintExpansion(::Type{T}) where {T<:AbstractFloat} =
+  _BaseConstraintExpansion(zero(T), Dict{Int,T}(), Dict{Int,T}())
+
+_ReducedExpansion(::Type{T}) where {T<:AbstractFloat} =
+  _ReducedExpansion(zero(T), Dict{Int,T}())
+
+@inline function _accumulate!(target::Dict{Int,T}, index::Int,
+                              value::T) where {T<:AbstractFloat}
+  iszero(value) && return target
+  target[index] = get(target, index, zero(T)) + value
+  return target
+end
+
+function _add_scaled_expansion!(target::_BaseConstraintExpansion{T},
+                                source::_BaseConstraintExpansion{T},
+                                scale::T) where {T<:AbstractFloat}
+  target.shift += scale * source.shift
+
+  for pair in source.reduced
+    _accumulate!(target.reduced, pair.first, scale * pair.second)
+  end
+
+  for pair in source.mean
+    _accumulate!(target.mean, pair.first, scale * pair.second)
+  end
+
+  return target
+end
+
+function _add_scaled_expansion!(target::_ReducedExpansion{T},
+                                source::_ReducedExpansion{T},
+                                scale::T) where {T<:AbstractFloat}
+  target.shift += scale * source.shift
+
+  for pair in source.reduced
+    _accumulate!(target.reduced, pair.first, scale * pair.second)
+  end
+
+  return target
+end
+
+function _compile_reduced_operator_map(::Type{T}, ndofs::Int,
+                                       dirichlet::_CompiledDirichlet{T},
+                                       mean_constraints::Vector{_CompiledLinearConstraint{T}},
+                                       masks::_ConstraintMasks{T}) where {T<:AbstractFloat}
+  constrained = masks.fixed .| masks.eliminated .| masks.constraint_rows
+  solve_dofs = [dof for dof in 1:ndofs if !constrained[dof]]
+  reduced_index = zeros(Int, ndofs)
+
+  for index in eachindex(solve_dofs)
+    reduced_index[solve_dofs[index]] = index
+  end
+
+  mean_pivots = [constraint.pivot for constraint in mean_constraints]
+  mean_index = zeros(Int, ndofs)
+
+  for index in eachindex(mean_pivots)
+    pivot = mean_pivots[index]
+    mean_index[pivot] == 0 || throw(ArgumentError("mean constraint pivots must be unique"))
+    mean_index[pivot] = index
+  end
+
+  dirichlet_rows = Dict{Int,_CompiledAffineRelation{T}}()
+
+  for row in dirichlet.rows
+    haskey(dirichlet_rows, row.pivot) &&
+      throw(ArgumentError("Dirichlet relation pivots must be unique"))
+    dirichlet_rows[row.pivot] = row
+  end
+
+  base_cache = Vector{Union{Nothing,_BaseConstraintExpansion{T}}}(nothing, ndofs)
+  visiting = falses(ndofs)
+  base_expansion = dof -> _base_constraint_expansion!(base_cache, visiting, dof,
+                                                      reduced_index, masks.fixed,
+                                                      masks.fixed_values, mean_index,
+                                                      dirichlet_rows, T)
+  mean_shift, mean_reduced = _compile_mean_expansions(T, mean_constraints, mean_pivots,
+                                                      base_expansion)
+  final_cache = Vector{Union{Nothing,_ReducedExpansion{T}}}(nothing, ndofs)
+  final_visiting = falses(ndofs)
+  final_expansion = dof -> _final_reduced_expansion!(final_cache, final_visiting, dof,
+                                                     reduced_index, masks.fixed,
+                                                     masks.fixed_values, mean_index,
+                                                     mean_shift, mean_reduced,
+                                                     dirichlet_rows, T)
+  return _pack_reduced_operator_map(T, ndofs, solve_dofs, reduced_index, final_expansion)
+end
+
+function _base_constraint_expansion!(cache, visiting::BitVector, dof::Int,
+                                     reduced_index::Vector{Int}, fixed::BitVector,
+                                     fixed_values::Vector{T}, mean_index::Vector{Int},
+                                     dirichlet_rows, ::Type{T}) where {T<:AbstractFloat}
+  cached = cache[dof]
+  cached === nothing || return cached
+  visiting[dof] && throw(ArgumentError("cyclic Dirichlet constraint relation detected"))
+  expansion = _BaseConstraintExpansion(T)
+
+  if fixed[dof]
+    expansion.shift = fixed_values[dof]
+  elseif reduced_index[dof] != 0
+    expansion.reduced[reduced_index[dof]] = one(T)
+  elseif mean_index[dof] != 0
+    expansion.mean[mean_index[dof]] = one(T)
+  elseif haskey(dirichlet_rows, dof)
+    visiting[dof] = true
+    row = dirichlet_rows[dof]
+    expansion.shift = row.rhs
+
+    for index in eachindex(row.indices)
+      source = _base_constraint_expansion!(cache, visiting, row.indices[index], reduced_index,
+                                           fixed, fixed_values, mean_index, dirichlet_rows, T)
+      _add_scaled_expansion!(expansion, source, row.coefficients[index])
+    end
+
+    visiting[dof] = false
+  else
+    throw(ArgumentError("dof $dof has no reduced representation"))
+  end
+
+  cache[dof] = expansion
+  return expansion
+end
+
+function _compile_mean_expansions(::Type{T},
+                                  mean_constraints::Vector{_CompiledLinearConstraint{T}},
+                                  mean_pivots::Vector{Int},
+                                  base_expansion) where {T<:AbstractFloat}
+  mean_count = length(mean_constraints)
+  mean_shift = zeros(T, mean_count)
+  mean_reduced = [Dict{Int,T}() for _ in 1:mean_count]
+  mean_count == 0 && return mean_shift, mean_reduced
+  mean_matrix = zeros(T, mean_count, mean_count)
+  mean_rhs = zeros(T, mean_count)
+  reduced_columns = Dict{Int,Vector{T}}()
+
+  for row_index in eachindex(mean_constraints)
+    constraint = mean_constraints[row_index]
+    mean_rhs[row_index] = constraint.rhs
+
+    for index in eachindex(constraint.indices)
+      coefficient = constraint.coefficients[index]
+      expansion = base_expansion(constraint.indices[index])
+      mean_rhs[row_index] -= coefficient * expansion.shift
+
+      for pair in expansion.mean
+        mean_matrix[row_index, pair.first] += coefficient * pair.second
+      end
+
+      for pair in expansion.reduced
+        column = get!(reduced_columns, pair.first) do
+          zeros(T, mean_count)
+        end
+        column[row_index] -= coefficient * pair.second
+      end
+    end
+  end
+
+  factor = copy(mean_matrix)
+  pivots = Vector{Int}(undef, mean_count)
+  _dense_lu_factor!(factor, pivots)
+  _dense_lu_solve!(factor, pivots, mean_rhs)
+  copyto!(mean_shift, mean_rhs)
+
+  for pair in reduced_columns
+    rhs_column = pair.second
+    _dense_lu_solve!(factor, pivots, rhs_column)
+
+    for mean_index in 1:mean_count
+      _accumulate!(mean_reduced[mean_index], pair.first, rhs_column[mean_index])
+    end
+  end
+
+  return mean_shift, mean_reduced
+end
+
+function _final_reduced_expansion!(cache, visiting::BitVector, dof::Int,
+                                   reduced_index::Vector{Int}, fixed::BitVector,
+                                   fixed_values::Vector{T}, mean_index::Vector{Int},
+                                   mean_shift::Vector{T}, mean_reduced,
+                                   dirichlet_rows, ::Type{T}) where {T<:AbstractFloat}
+  cached = cache[dof]
+  cached === nothing || return cached
+  visiting[dof] && throw(ArgumentError("cyclic reduced constraint relation detected"))
+  expansion = _ReducedExpansion(T)
+
+  if fixed[dof]
+    expansion.shift = fixed_values[dof]
+  elseif reduced_index[dof] != 0
+    expansion.reduced[reduced_index[dof]] = one(T)
+  elseif mean_index[dof] != 0
+    index = mean_index[dof]
+    expansion.shift = mean_shift[index]
+
+    for pair in mean_reduced[index]
+      expansion.reduced[pair.first] = pair.second
+    end
+  elseif haskey(dirichlet_rows, dof)
+    visiting[dof] = true
+    row = dirichlet_rows[dof]
+    expansion.shift = row.rhs
+
+    for index in eachindex(row.indices)
+      source = _final_reduced_expansion!(cache, visiting, row.indices[index], reduced_index,
+                                         fixed, fixed_values, mean_index, mean_shift,
+                                         mean_reduced, dirichlet_rows, T)
+      _add_scaled_expansion!(expansion, source, row.coefficients[index])
+    end
+
+    visiting[dof] = false
+  else
+    throw(ArgumentError("dof $dof has no reduced representation"))
+  end
+
+  cache[dof] = expansion
+  return expansion
+end
+
+function _pack_reduced_operator_map(::Type{T}, ndofs::Int, solve_dofs::Vector{Int},
+                                    reduced_index::Vector{Int},
+                                    final_expansion) where {T<:AbstractFloat}
+  shift = zeros(T, ndofs)
+  row_offsets = ones(Int, ndofs + 1)
+  expansion_cache = Vector{_ReducedExpansion{T}}(undef, ndofs)
+  tolerance = 1000 * eps(T)
+
+  for dof in 1:ndofs
+    expansion = final_expansion(dof)
+    expansion_cache[dof] = expansion
+    shift[dof] = expansion.shift
+    stored = count(pair -> abs(pair.second) > tolerance, expansion.reduced)
+    row_offsets[dof+1] = row_offsets[dof] + stored
+  end
+
+  row_indices = Vector{Int}(undef, row_offsets[end] - 1)
+  row_coefficients = Vector{T}(undef, row_offsets[end] - 1)
+
+  for dof in 1:ndofs
+    pointer = row_offsets[dof]
+    pairs = sort!(collect(expansion_cache[dof].reduced); by=first)
+
+    for pair in pairs
+      abs(pair.second) > tolerance || continue
+      row_indices[pointer] = pair.first
+      row_coefficients[pointer] = pair.second
+      pointer += 1
+    end
+  end
+
+  return _ReducedOperatorMap(ndofs, solve_dofs, reduced_index, shift, row_offsets, row_indices,
+                             row_coefficients)
 end
 
 # Basic plan/state convenience API.
@@ -177,6 +463,136 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return result
 end
 
+mutable struct _ReducedOperatorWorkspace{T<:AbstractFloat}
+  scratch::_OperatorScratch{T}
+  full_input::Vector{T}
+  full_output::Vector{T}
+end
+
+function _ReducedOperatorWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration), zeros(T, dof_count(plan)),
+                                   zeros(T, dof_count(plan)))
+end
+
+function _rhs_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                        scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  _require_length(result, dof_count(plan), "result")
+  fill!(result, zero(T))
+  traversal = plan.traversal_plan
+  _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
+             plan.cell_operators, nothing, nothing, cell_rhs!)
+  _boundary_rhs_pass!(scratch, result, traversal.boundary_batches,
+                      plan.integration.boundary_faces, plan.boundary_operators, nothing,
+                      nothing)
+  _rhs_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
+             plan.interface_operators, nothing, nothing, interface_rhs!)
+  _surface_rhs_pass!(scratch, result, traversal.surface_batches,
+                     plan.integration.embedded_surfaces, plan.surface_operators, nothing,
+                     nothing)
+  return result
+end
+
+function _apply_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                          coefficients::AbstractVector{T},
+                          scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  _require_length(result, dof_count(plan), "result")
+  _require_length(coefficients, dof_count(plan), "coefficient vector")
+  fill!(result, zero(T))
+  traversal = plan.traversal_plan
+  _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
+               plan.cell_operators, coefficients, nothing, nothing, cell_apply!)
+  _boundary_apply_pass!(scratch, result, traversal.boundary_batches,
+                        plan.integration.boundary_faces, plan.boundary_operators, coefficients,
+                        nothing, nothing)
+  _apply_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
+               plan.interface_operators, coefficients, nothing, nothing, interface_apply!)
+  _surface_apply_pass!(scratch, result, traversal.surface_batches,
+                       plan.integration.embedded_surfaces, plan.surface_operators, coefficients,
+                       nothing, nothing)
+  return result
+end
+
+function _expand_reduced!(full_values::AbstractVector{T}, map::_ReducedOperatorMap{T},
+                          reduced_values::AbstractVector{T};
+                          include_shift::Bool=true) where {T<:AbstractFloat}
+  _require_length(full_values, map.full_dof_count, "full vector")
+  _require_length(reduced_values, reduced_dof_count(map), "reduced vector")
+
+  if include_shift
+    copyto!(full_values, map.shift)
+  else
+    fill!(full_values, zero(T))
+  end
+
+  for dof in 1:map.full_dof_count
+    value = full_values[dof]
+
+    @inbounds for pointer in map.row_offsets[dof]:(map.row_offsets[dof+1]-1)
+      value += map.row_coefficients[pointer] * reduced_values[map.row_indices[pointer]]
+    end
+
+    full_values[dof] = value
+  end
+
+  return full_values
+end
+
+function _project_reduced!(reduced_values::AbstractVector{T}, map::_ReducedOperatorMap{T},
+                           full_values::AbstractVector{T}) where {T<:AbstractFloat}
+  _require_length(reduced_values, reduced_dof_count(map), "reduced vector")
+  _require_length(full_values, map.full_dof_count, "full vector")
+  fill!(reduced_values, zero(T))
+
+  for dof in 1:map.full_dof_count
+    value = full_values[dof]
+
+    @inbounds for pointer in map.row_offsets[dof]:(map.row_offsets[dof+1]-1)
+      reduced_values[map.row_indices[pointer]] += map.row_coefficients[pointer] * value
+    end
+  end
+
+  return reduced_values
+end
+
+function _reduced_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                         reduced_coefficients::AbstractVector{T},
+                         workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
+  map = _reduced_map(plan)
+  _require_length(result, reduced_dof_count(map), "reduced result")
+  _require_length(reduced_coefficients, reduced_dof_count(map), "reduced coefficient vector")
+  _expand_reduced!(workspace.full_input, map, reduced_coefficients; include_shift=false)
+  _apply_physical!(workspace.full_output, plan, workspace.full_input, workspace.scratch)
+  _project_reduced!(result, map, workspace.full_output)
+  return result
+end
+
+function _reduced_rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                       workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
+  map = _reduced_map(plan)
+  _require_length(result, reduced_dof_count(map), "reduced rhs")
+  _rhs_physical!(workspace.full_output, plan, workspace.scratch)
+
+  if any(!iszero, map.shift)
+    _apply_physical!(workspace.full_input, plan, map.shift, workspace.scratch)
+
+    for index in 1:map.full_dof_count
+      workspace.full_output[index] -= workspace.full_input[index]
+    end
+  end
+
+  _project_reduced!(result, map, workspace.full_output)
+  return result
+end
+
+function _reconstruct_reduced_solution!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                                        reduced_solution::AbstractVector{T}) where {D,
+                                                                                   T<:AbstractFloat}
+  map = _reduced_map(plan)
+  return _expand_reduced!(result, map, reduced_solution; include_shift=true)
+end
+
 # Nonlinear residual and tangent action.
 
 """
@@ -279,8 +695,8 @@ end
 # Local traversal helpers.
 
 function _rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                    batches::Vector{_KernelBatch}, items, operators, fixed::BitVector,
-                    blocked_rows::BitVector, rhs_hook) where {T<:AbstractFloat}
+                    batches::Vector{_KernelBatch}, items, operators, fixed,
+                    blocked_rows, rhs_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
@@ -303,7 +719,7 @@ end
 
 function _boundary_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                              batches::Vector{_FilteredKernelBatch}, faces, operators,
-                             fixed::BitVector, blocked_rows::BitVector) where {T<:AbstractFloat}
+                             fixed, blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -327,7 +743,7 @@ end
 
 function _surface_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                             batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                            fixed::BitVector, blocked_rows::BitVector) where {T<:AbstractFloat}
+                            fixed, blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -351,8 +767,8 @@ end
 
 function _apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                       batches::Vector{_KernelBatch}, items, operators,
-                      coefficients::AbstractVector{T}, fixed::BitVector,
-                      blocked_rows::BitVector, apply_hook) where {T<:AbstractFloat}
+                      coefficients::AbstractVector{T}, fixed, blocked_rows,
+                      apply_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
@@ -377,8 +793,8 @@ end
 
 function _boundary_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                                batches::Vector{_FilteredKernelBatch}, faces, operators,
-                               coefficients::AbstractVector{T}, fixed::BitVector,
-                               blocked_rows::BitVector) where {T<:AbstractFloat}
+                               coefficients::AbstractVector{T}, fixed,
+                               blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -404,8 +820,8 @@ end
 
 function _surface_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                               batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                              coefficients::AbstractVector{T}, fixed::BitVector,
-                              blocked_rows::BitVector) where {T<:AbstractFloat}
+                              coefficients::AbstractVector{T}, fixed,
+                              blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -613,6 +1029,23 @@ end
 end
 
 function _scatter_local_vector!(result::AbstractVector{T}, item::_AssemblyValues,
+                                local_vector::AbstractVector{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for local_row in 1:item.local_dof_count
+    value = local_vector[local_row]
+    abs(value) > tolerance || continue
+
+    @inbounds for term_index in _local_term_range(item, local_row)
+      row = item.term_indices[term_index]
+      result[row] += item.term_coefficients[term_index] * value
+    end
+  end
+
+  return nothing
+end
+
+function _scatter_local_vector!(result::AbstractVector{T}, item::_AssemblyValues,
                                 local_vector::AbstractVector{T}, fixed::BitVector,
                                 blocked_rows::BitVector) where {T<:AbstractFloat}
   tolerance = 1000 * eps(T)
@@ -629,6 +1062,12 @@ function _scatter_local_vector!(result::AbstractVector{T}, item::_AssemblyValues
   end
 
   return nothing
+end
+
+function _scatter_local_vector!(result::AbstractVector{T}, item::_AssemblyValues,
+                                local_vector::AbstractVector{T}, ::Nothing,
+                                ::Nothing) where {T<:AbstractFloat}
+  return _scatter_local_vector!(result, item, local_vector)
 end
 
 # Constraint rows.

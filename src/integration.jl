@@ -825,6 +825,34 @@ function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractF
   return _field_value_component(data, coefficients(state), checked_component, checked_point)
 end
 
+"""
+    value(values, local_coefficients, field, point_index)
+    value(values, local_coefficients, field, component, point_index)
+
+Evaluate a field from a local coefficient vector inside a matrix-free local
+operator kernel.
+
+`local_coefficients` uses the flattened local numbering of `values`, i.e. the
+same numbering passed to `cell_apply!`, `face_apply!`, `interface_apply!`, and
+`surface_apply!`.
+"""
+function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+               field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_point = _checked_point_index(values, point_index)
+  return _local_field_value(data, local_coefficients, checked_point)
+end
+
+function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+               field::AbstractField, component::Integer,
+               point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_component = _checked_field_component(data, component)
+  checked_point = _checked_point_index(values, point_index)
+  return _local_field_value_component(data, local_coefficients, checked_component,
+                                      checked_point)
+end
+
 @inline function _field_value(data::_FieldValues{D,T,1}, state_coefficients::AbstractVector{T},
                               point_index::Int) where {D,T<:AbstractFloat}
   return _field_value_component(data, state_coefficients, 1, point_index)
@@ -861,6 +889,36 @@ end
   return result
 end
 
+@inline function _local_field_value(data::_FieldValues{D,T,1},
+                                    local_coefficients::AbstractVector{T},
+                                    point_index::Int) where {D,T<:AbstractFloat}
+  return _local_field_value_component(data, local_coefficients, 1, point_index)
+end
+
+@inline function _local_field_value(data::_FieldValues{D,T,C},
+                                    local_coefficients::AbstractVector{T},
+                                    point_index::Int) where {D,T<:AbstractFloat,C}
+  return ntuple(component -> _local_field_value_component(data, local_coefficients, component,
+                                                          point_index), Val(C))
+end
+
+@inline function _local_field_value_component(data::_FieldValues{D,T},
+                                              local_coefficients::AbstractVector{T},
+                                              component::Int,
+                                              point_index::Int) where {D,T<:AbstractFloat}
+  values = data.values
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    shape = values[mode_index, point_index]
+    shape == zero(T) && continue
+    result = muladd(shape, local_coefficients[offset+mode_index], result)
+  end
+
+  return result
+end
+
 """
     gradient(values, state, field, point_index)
     gradient(values, state, field, component, point_index)
@@ -889,6 +947,29 @@ end
   return _field_gradient(data, coefficients(state), checked_component, checked_point)
 end
 
+"""
+    gradient(values, local_coefficients, field, point_index)
+    gradient(values, local_coefficients, field, component, point_index)
+
+Evaluate a physical-space field gradient from a local coefficient vector inside
+a matrix-free local operator kernel.
+"""
+@inline function gradient(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+                          field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_point = _checked_point_index(values, point_index)
+  return _local_field_gradient(data, local_coefficients, checked_point)
+end
+
+@inline function gradient(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+                          field::AbstractField, component::Integer,
+                          point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_component = _checked_field_component(data, component)
+  checked_point = _checked_point_index(values, point_index)
+  return _local_field_gradient(data, local_coefficients, checked_component, checked_point)
+end
+
 @inline function _field_gradient(data::_FieldValues{D,T,1}, state_coefficients::AbstractVector{T},
                                  point_index::Int) where {D,T<:AbstractFloat}
   return _field_gradient(data, state_coefficients, 1, point_index)
@@ -898,6 +979,19 @@ end
                                  point_index::Int) where {D,T<:AbstractFloat,C}
   return ntuple(component -> _field_gradient(data, state_coefficients, component, point_index),
                 Val(C))
+end
+
+@inline function _local_field_gradient(data::_FieldValues{D,T,1},
+                                       local_coefficients::AbstractVector{T},
+                                       point_index::Int) where {D,T<:AbstractFloat}
+  return _local_field_gradient(data, local_coefficients, 1, point_index)
+end
+
+@inline function _local_field_gradient(data::_FieldValues{D,T,C},
+                                       local_coefficients::AbstractVector{T},
+                                       point_index::Int) where {D,T<:AbstractFloat,C}
+  return ntuple(component -> _local_field_gradient(data, local_coefficients, component,
+                                                   point_index), Val(C))
 end
 
 """
@@ -920,6 +1014,22 @@ the other on the reconstructed discrete field itself.
   return _field_normal_gradient(data, coefficients(state), checked_point, normal_value)
 end
 
+"""
+    normal_gradient(values, local_coefficients, field, point_index)
+
+Evaluate the normal derivative of a local coefficient vector on a face,
+interface side, or embedded surface item.
+"""
+@inline function normal_gradient(values::_NormalEvaluationValues,
+                                 local_coefficients::AbstractVector{T},
+                                 field::AbstractField,
+                                 point_index::Integer) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  checked_point = _checked_point_index(values, point_index)
+  normal_value = _point_normal(values, checked_point)
+  return _local_field_normal_gradient(data, local_coefficients, checked_point, normal_value)
+end
+
 @inline function _field_normal_gradient(data::_FieldValues{D,T,1},
                                         state_coefficients::AbstractVector{T}, point_index::Int,
                                         normal_value::NTuple{D,T}) where {D,T<:AbstractFloat}
@@ -931,6 +1041,23 @@ end
                                         normal_value::NTuple{D,T}) where {D,T<:AbstractFloat,C}
   return ntuple(component -> _field_normal_gradient(data, state_coefficients, component,
                                                     point_index, normal_value), Val(C))
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{D,T,1},
+                                              local_coefficients::AbstractVector{T},
+                                              point_index::Int,
+                                              normal_value::NTuple{D,T}) where {D,
+                                                                                T<:AbstractFloat}
+  return _local_field_normal_gradient(data, local_coefficients, 1, point_index, normal_value)
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{D,T,C},
+                                              local_coefficients::AbstractVector{T},
+                                              point_index::Int,
+                                              normal_value::NTuple{D,T}) where {D,T<:AbstractFloat,
+                                                                                C}
+  return ntuple(component -> _local_field_normal_gradient(data, local_coefficients, component,
+                                                          point_index, normal_value), Val(C))
 end
 
 # Low-level gradient evaluator shared by the scalar and vector-field interfaces.
@@ -1027,6 +1154,23 @@ end
   return result
 end
 
+@inline function _local_field_gradient(data::_FieldValues{D,T},
+                                       local_coefficients::AbstractVector{T}, component::Int,
+                                       point_index::Int) where {D,T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  result = ntuple(_ -> zero(T), D)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    result = ntuple(axis -> muladd(gradients[axis, mode_index, point_index], amplitude,
+                                   result[axis]), D)
+  end
+
+  return result
+end
+
 @inline function _field_normal_gradient(data::_FieldValues{1,T},
                                         state_coefficients::AbstractVector{T}, component::Int,
                                         point_index::Int,
@@ -1114,6 +1258,15 @@ end
                                         normal_value::NTuple{D,T}) where {D,T<:AbstractFloat}
   return normal_component(_field_gradient(data, state_coefficients, component, point_index),
                           normal_value)
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{D,T},
+                                              local_coefficients::AbstractVector{T},
+                                              component::Int, point_index::Int,
+                                              normal_value::NTuple{D,T}) where {D,
+                                                                                T<:AbstractFloat}
+  return normal_component(_local_field_gradient(data, local_coefficients, component,
+                                                point_index), normal_value)
 end
 
 # Compilation of local integration caches for all entity types.
