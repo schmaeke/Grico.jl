@@ -1,6 +1,10 @@
 function blast_wave_history_entry(step, time, context)
   return (; step, time=Float64(time), active_leaves=active_leaf_count(context.space),
-          dofs=length(coefficients(context.state)), dt=context.dt)
+          dofs=length(coefficients(context.state)), dt=context.dt,
+          limited_cells=context.limiter_stats.limited_cell_count,
+          limiter_theta=context.limiter_stats.minimum_theta,
+          min_density=context.limiter_stats.minimum_density,
+          min_pressure=context.limiter_stats.minimum_pressure)
 end
 
 sampled_conserved(values, field) = getproperty(values, field_name(field))
@@ -55,6 +59,9 @@ function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__
   return write_vtk(joinpath(output_directory, @sprintf("blast_wave_euler_%04d", entry.step)),
                    context.state; fields=(context.conserved,),
                    point_data=(density=(x, values) -> sampled_conserved(values, context.conserved)[1],
+                               log_density=(x, values) -> log(max(sampled_conserved(values,
+                                                                                    context.conserved)[1],
+                                                                  DENSITY_FLOOR)),
                                velocity=(x, values) -> begin
                                  q = sampled_conserved(values, context.conserved)
                                  velocity(q, context.gamma)
@@ -80,15 +87,15 @@ function print_blast_wave_header(context, final_time; save_interval=SAVE_INTERVA
                                  initial_refinement_layers=INITIAL_BLAST_REFINEMENT_LAYERS,
                                  initial_refinement_radius=INITIAL_BLAST_REFINEMENT_RADIUS)
   println("blast_wave_euler/driver.jl")
-  @printf("  domain             : [%.1f, %.1f] x [%.1f, %.1f] (quarter model with symmetry)\n",
+  @printf("  domain             : [%.1f, %.1f] x [%.1f, %.1f] (periodic Sedov setup)\n",
           origin(context.domain, 1), origin(context.domain, 1) + extent(context.domain, 1),
           origin(context.domain, 2), origin(context.domain, 2) + extent(context.domain, 2))
   @printf("  roots              : %d x %d\n", root_cell_counts(grid(context.domain))...)
   @printf("  base degree        : %d\n", context.degree)
   @printf("  cfl                : %.3f\n", context.cfl)
-  @printf("  blast radius       : %.3f\n", BLAST_RADIUS)
-  @printf("  p_in / p_out       : %.2f / %.2f\n", INNER_PRESSURE, OUTER_PRESSURE)
-  @printf("  transition width   : %.3f\n", BLAST_TRANSITION_WIDTH)
+  @printf("  ambient rho / p    : %.2f / %.1e\n", BACKGROUND_DENSITY, BACKGROUND_PRESSURE)
+  @printf("  sigma rho / p      : %.3f / %.3f\n", DENSITY_SIGMA, PRESSURE_SIGMA)
+  @printf("  positivity limiter : %s\n", context.limiter.enabled ? "on" : "off")
   @printf("  initial h layers   : %d\n", initial_refinement_layers)
   @printf("  initial ref radius : %.3f\n", initial_refinement_radius)
   @printf("  save interval      : %.3f\n", save_interval)
@@ -97,10 +104,11 @@ function print_blast_wave_header(context, final_time; save_interval=SAVE_INTERVA
   @printf("  adapt tolerance    : %.2e\n", adaptivity_tolerance)
 
   @printf("  final time         : %.3f\n", final_time)
-  println("  step time leaves dofs dt")
+  println("  step time leaves dofs dt limited theta min_rho min_p")
 end
 
 function print_blast_wave_history_entry(entry)
-  @printf("  %4d %.3f %5d %5d %.6e\n", entry.step, entry.time, entry.active_leaves, entry.dofs,
-          entry.dt)
+  @printf("  %4d %.3f %5d %7d %.6e %5d %.3e %.3e %.3e\n", entry.step, entry.time,
+          entry.active_leaves, entry.dofs, entry.dt, entry.limited_cells, entry.limiter_theta,
+          entry.min_density, entry.min_pressure)
 end

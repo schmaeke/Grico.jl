@@ -49,12 +49,13 @@ function run_blast_wave_euler_example(; root_counts=ROOT_COUNTS, degree=POLYDEG,
   end
 
   for step in 1:(length(times)-1)
-    segment_state, segment_solution = solve_fixed_mesh_segment(context,
-                                                               (times[step], times[step + 1]);
-                                                               solver=solver,
-                                                               return_solution=store_segment_solutions)
+    segment_state, segment_solution, limiter_stats = solve_fixed_mesh_segment(context,
+                                                                              (times[step],
+                                                                               times[step + 1]);
+                                                                              solver=solver,
+                                                                              return_solution=store_segment_solutions)
     store_segment_solutions && push!(segment_solutions, segment_solution)
-    context = refresh_blast_wave_context(context, segment_state)
+    context = refresh_blast_wave_context(context, segment_state; limiter_stats)
 
     while save_index <= length(save_times) && same_time(save_times[save_index], times[step + 1])
       entry = blast_wave_history_entry(length(history), save_times[save_index], context)

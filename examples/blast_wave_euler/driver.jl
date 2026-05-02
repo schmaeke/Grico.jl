@@ -14,31 +14,33 @@ import Grico: cell_apply!, cell_diagonal!, cell_residual!, cell_rhs!, face_resid
 #
 #   q = (ρ, ρu, ρv, E),
 #
-# on the quarter domain
+# on the periodic Sedov domain
 #
-#   Ω = [0, 1]².
+#   Ω = [-1.5, 1.5]².
 #
-# The setup is a quarter-domain reduction of the standard symmetric blast-wave
-# problem on `[-1, 1]²`: the faces `x = 0` and `y = 0` are symmetry planes,
-# while `x = 1` and `y = 1` are the physical walls of the box. A smooth
-# overpressure region is centered at the origin, so the solution remains
-# symmetric and the quarter model reproduces the full-box dynamics at lower
-# cost.
+# The physical and geometric setup follows the Sedov blast test in
+# Rueda-Ramírez and Gassner, arXiv:2102.06017v1, Section 5.2: the initial gas
+# is at rest, density and pressure are Gaussian concentrations in a homogeneous
+# ambient medium, and all outer faces are periodic. The discretization remains
+# Grico-specific: adaptive Cartesian `h`-refinement, matrix-free residuals, and
+# sum-factorized cell kernels are used instead of the paper's DGSEM/FV subcell
+# blend.
 #
 # Directory organization:
 #
 # - `driver.jl` loads the example environment and runs the time loop.
 # - `parameters.jl` selects physical, DG, adaptivity, and output parameters.
-# - `euler_physics.jl` defines conservative-variable helpers and the smooth blast profile.
+# - `euler_physics.jl` defines conservative-variable helpers and the Sedov blast profile.
 # - `projection.jl` applies the DG mass operator and projects the initial state.
 # - `dg_residual.jl` defines the semidiscrete volume, interface, and wall residuals.
 # - `runtime_context.jl` builds timestep estimates, mass inverses, contexts, adaptation, and ODE helpers.
 # - `output.jl` creates history entries, VTK data, and compact terminal summaries.
 # - `time_driver.jl` runs the fixed-mesh time segments interleaved with adaptation.
 
-# The pressure jump is intentionally smoothed because this example does not yet
-# include a positivity limiter. Small density and pressure floors are therefore
-# retained as a last line of defense against unphysical roundoff excursions.
+# A cell-average positivity limiter is applied after accepted ODE steps. It
+# preserves the local conservative mean and scales troubled DG polynomials
+# toward that mean, which gives this example the same practical role as the
+# paper's positivity fallback without adding a second FV discretization path.
 
 Base.include(@__MODULE__, joinpath(@__DIR__, "parameters.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "euler_physics.jl"))

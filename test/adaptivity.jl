@@ -172,6 +172,42 @@ end
   end
 end
 
+@testset "Alternating Snapshot H Refinement Axes" begin
+  domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+  space = HpSpace(domain,
+                  SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1), continuity=:dg))
+  u = ScalarField(space; name=:u)
+  state = State(FieldLayout((u,)), collect(1.0:scalar_dof_count(space)))
+
+  x_plan = AdaptivityPlan(space)
+  request_h_refinement!(x_plan, 1, 1)
+  x_transition = transition(x_plan)
+  x_space = target_space(x_transition)
+  x_u = adapted_field(x_transition, u)
+  x_state = transfer_state(x_transition, state, u, x_u)
+
+  coarsen_plan = AdaptivityPlan(x_space)
+  request_h_derefinement!(coarsen_plan, 1, 1)
+  coarsen_transition = transition(coarsen_plan)
+  coarse_again = target_space(coarsen_transition)
+  coarse_u = adapted_field(coarsen_transition, x_u)
+  coarse_state = transfer_state(coarsen_transition, x_state, x_u, coarse_u)
+
+  y_plan = AdaptivityPlan(coarse_again)
+  request_h_refinement!(y_plan, 1, 2)
+  y_transition = transition(y_plan)
+  y_space = target_space(y_transition)
+  y_u = adapted_field(y_transition, coarse_u)
+  y_state = transfer_state(y_transition, coarse_state, coarse_u, y_u)
+
+  @test active_leaf_count(y_space) == 2
+  @test all(leaf -> level(grid(y_space), leaf) == (0, 1), active_leaves(y_space))
+
+  for x in ((0.2, 0.2), (0.7, 0.3), (0.4, 0.8))
+    @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(y_u, y_state, x) atol = ADAPTIVITY_TOL
+  end
+end
+
 @testset "Projection H Coarsening Indicators" begin
   coarse_domain = Domain((0.0,), (1.0,), (1,))
   coarse_space = HpSpace(coarse_domain,

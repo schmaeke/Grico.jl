@@ -52,6 +52,59 @@ function cell_residual!(local_rhs, operator::CompressibleEulerVolume, values::Ce
   return nothing
 end
 
+function cell_residual!(local_rhs, operator::CompressibleEulerVolume, values::CellValues,
+                        state::State, scratch::KernelScratch)
+  tensor = tensor_values(values, operator.field)
+  if tensor === nothing || !is_full_tensor(tensor)
+    return cell_residual!(local_rhs, operator, values, state)
+  end
+
+  component_total = component_count(operator.field)
+  component_total == 4 ||
+    throw(ArgumentError("compressible Euler residual expects four conserved components"))
+  mode_count = tensor_mode_count(tensor)
+  point_count_value = tensor_point_count(tensor)
+  local_range = field_dof_range(values, operator.field)
+  state_coefficients = coefficients(state)
+  local_coefficients = scratch_vector(scratch, 4, mode_count)
+  component_values = scratch_vector(scratch, 5, point_count_value)
+  point_state = scratch_matrix(scratch, 1, component_total, point_count_value)
+  weighted_flux = scratch_matrix(scratch, 2, length(tensor_degrees(tensor)), point_count_value)
+  contribution = scratch_vector(scratch, 6, mode_count)
+
+  for component in 1:component_total
+    @inbounds for mode_index in 1:mode_count
+      local_row = component_local_index(mode_count, component, mode_index)
+      local_coefficients[mode_index] = state_coefficients[values.single_term_indices[first(local_range)+local_row-1]]
+    end
+
+    tensor_interpolate!(component_values, tensor, local_coefficients, scratch)
+
+    @inbounds for point_index in 1:point_count_value
+      point_state[component, point_index] = component_values[point_index]
+    end
+  end
+
+  for component in 1:component_total
+    @inbounds for point_index in 1:point_count_value
+      q = (point_state[1, point_index], point_state[2, point_index], point_state[3, point_index],
+           point_state[4, point_index])
+      flux = euler_flux(q, operator.gamma)
+      weighted = weight(values, point_index)
+
+      for axis in 1:size(weighted_flux, 1)
+        weighted_flux[axis, point_index] = flux[component][axis] * weighted
+      end
+    end
+
+    fill!(contribution, zero(eltype(contribution)))
+    tensor_project_gradient!(contribution, tensor, weighted_flux, scratch)
+    _add_component_tensor_output!(local_rhs, values, operator.field, component, contribution)
+  end
+
+  return nothing
+end
+
 # Interior-face term:
 #
 #   -∫_f φ⁻ F̂(q⁻, q⁺, n) ds   on the minus side,
@@ -133,7 +186,8 @@ function euler_residual_plan(field, gamma)
   add_interface!(problem, CompressibleEulerInterface(field, gamma))
 
   for axis in 1:2, side in (LOWER, UPPER)
-    add_boundary!(problem, BoundaryFace(axis, side), ReflectiveEulerWall(field, gamma))
+    is_periodic_axis(field_space(field), axis) ||
+      add_boundary!(problem, BoundaryFace(axis, side), ReflectiveEulerWall(field, gamma))
   end
 
   return compile(problem)

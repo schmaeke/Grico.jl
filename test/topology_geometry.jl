@@ -252,6 +252,18 @@ end
   @test Grico.check_snapshot(coarsened_snapshot) === nothing
   @test Grico.check_snapshot(tuple_refined_snapshot) === nothing
 
+  axis_reuse_grid = Grico.CartesianGrid((1, 1))
+  axis_source = Grico.snapshot(axis_reuse_grid)
+  axis_x_refined, _ = Grico._refine_snapshot_leaf!(axis_source, 1, (true, false))
+  axis_coarsened, _ = Grico._derefine_snapshot_cell(axis_x_refined, 1, 1)
+  axis_y_refined, axis_y_children = Grico._refine_snapshot_leaf!(axis_coarsened, 1, (false, true))
+  @test length(axis_y_children) == 2
+  @test all(leaf -> Grico.level(axis_reuse_grid, leaf) == (0, 1), axis_y_children)
+  @test Grico.check_snapshot(axis_source) === nothing
+  @test Grico.check_snapshot(axis_x_refined) === nothing
+  @test Grico.check_snapshot(axis_coarsened) === nothing
+  @test Grico.check_snapshot(axis_y_refined) === nothing
+
   append_domain = Grico.Domain(append_only, Grico.Geometry((0.0, 0.0), (1.0, 1.0)))
   compact_source_domain, compact_source_snapshot, source_old_to_new = Grico.compact(append_domain,
                                                                                     source_snapshot)

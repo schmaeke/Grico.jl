@@ -213,7 +213,7 @@ function _collect_active_descendants!(leaves::Vector{Int}, grid_snapshot::GridSn
     return leaves
   end
 
-  first = first_child(grid(grid_snapshot), cell)
+  first = _snapshot_first_child(grid_snapshot, cell)
   first == NONE && return leaves
 
   for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
@@ -587,9 +587,9 @@ function _batched_h_derefinement_active!(mapping::Dict{Int,NTuple{D,Int}},
     checked_axis = _checked_axis(grid_data, candidate.axis)
     is_expanded(source_snapshot, checked_cell) ||
       throw(ArgumentError("candidate cell $checked_cell is not expanded"))
-    _structural_split_axis(grid_data, checked_cell) == checked_axis ||
+    _snapshot_structural_split_axis(source_snapshot, checked_cell) == checked_axis ||
       throw(ArgumentError("candidate cell $checked_cell is not split along axis $checked_axis"))
-    first = first_child(grid_data, checked_cell)
+    first = _snapshot_first_child(source_snapshot, checked_cell)
     first == NONE && throw(ArgumentError("candidate cell $checked_cell has no children"))
     expected_children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
     candidate.children == expected_children ||
@@ -788,9 +788,9 @@ function _checked_h_coarsening_candidate(space::HpSpace{D},
   is_expanded(space_snapshot, checked_cell) ||
     throw(ArgumentError("candidate cell $checked_cell is not expanded"))
   checked_axis = _checked_axis(grid(space), candidate.axis)
-  _structural_split_axis(grid(space), checked_cell) == checked_axis ||
+  _snapshot_structural_split_axis(space_snapshot, checked_cell) == checked_axis ||
     throw(ArgumentError("candidate cell $checked_cell is not split along axis $checked_axis"))
-  first = first_child(grid(space), checked_cell)
+  first = _snapshot_first_child(space_snapshot, checked_cell)
   first == NONE && throw(ArgumentError("candidate cell $checked_cell has no children"))
   expected_children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
   candidate.children == expected_children ||
@@ -844,9 +844,9 @@ function h_coarsening_candidates(space::HpSpace{D}; limits=AdaptivityLimits(spac
 
   for cell in 1:stored_cell_count(grid(space))
     is_expanded(space_snapshot, cell) || continue
-    axis = _structural_split_axis(grid(space), cell)
+    axis = _snapshot_structural_split_axis(space_snapshot, cell)
     level(grid(space), cell, axis) >= checked_limits.min_h_level[axis] || continue
-    first = first_child(grid(space), cell)
+    first = _snapshot_first_child(space_snapshot, cell)
     first == NONE && continue
     children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
     all(child -> is_active_leaf(space_snapshot, child) && space_snapshot.leaf_to_index[child] != 0,
@@ -1062,7 +1062,7 @@ function _collect_source_leaves!(leaves::Vector{Int}, source_snapshot::GridSnaps
     return leaves
   end
 
-  first = first_child(source_grid, source_cell)
+  first = _snapshot_first_child(source_snapshot, source_cell)
   first == NONE && return leaves
 
   for child in first:(first+_MIDPOINT_CHILD_COUNT-1)
@@ -2473,10 +2473,8 @@ end
 function _child_point_in_parent(space::HpSpace{D,T}, parent::Int, child::Int,
                                 ξ_child::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
   grid_data = grid(space)
-  split = _structural_split_axis(grid_data, parent)
-  split != 0 || throw(ArgumentError("parent cell $parent does not own a structural child block"))
-  parent_coordinate = logical_coordinate(grid_data, parent, split)
-  lower_child = logical_coordinate(grid_data, child, split) == 2 * parent_coordinate
+  split, child_offset = _direct_child_split_axis_and_offset(grid_data, parent, child)
+  lower_child = child_offset == 0
 
   return ntuple(axis -> begin
                   ξ = T(ξ_child[axis])

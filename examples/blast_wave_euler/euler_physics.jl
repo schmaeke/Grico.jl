@@ -93,26 +93,33 @@ end
 """
     blast_wave_initial_condition(x; gamma=GAMMA)
 
-Smooth quarter-domain blast-wave data on `[0, 1]^2`.
+Sedov blast-wave data on `[-1.5, 1.5]^2`.
 
-The state starts from rest with uniform density and a pressure bump centered at
-the origin. Together with reflective walls on all four faces, this reproduces
-the symmetric full-box blast on `[-1, 1]^2`. The transition is smoothed with a
-tanh profile so the example remains reasonably robust without a limiter.
+The state starts from rest in a periodic box. Density and pressure are
+initialized as Gaussian concentrations in a homogeneous ambient medium,
+following equation (22) of Rueda-Ramírez and Gassner,
+arXiv:2102.06017v1. The paper uses this smooth initialization to generate a
+strong expanding shock without imposing a discontinuous initial condition.
 """
 function blast_wave_initial_condition(x; gamma=GAMMA, center=BLAST_CENTER,
-                                      density=BACKGROUND_DENSITY, inner_pressure=INNER_PRESSURE,
-                                      outer_pressure=OUTER_PRESSURE, radius=BLAST_RADIUS,
-                                      transition_width=BLAST_TRANSITION_WIDTH)
-  transition_width > 0 || throw(ArgumentError("transition_width must be positive"))
-  r = hypot(x[1] - center[1], x[2] - center[2])
-  blend = 0.5 * (1.0 - tanh((r - radius) / transition_width))
-  pressure_value = outer_pressure + (inner_pressure - outer_pressure) * blend
-  return conservative_variables(density, (0.0, 0.0), pressure_value, gamma)
+                                      ambient_density=BACKGROUND_DENSITY,
+                                      ambient_pressure=BACKGROUND_PRESSURE,
+                                      density_sigma=DENSITY_SIGMA, pressure_sigma=PRESSURE_SIGMA)
+  density_sigma > 0 || throw(ArgumentError("density_sigma must be positive"))
+  pressure_sigma > 0 || throw(ArgumentError("pressure_sigma must be positive"))
+  radius_squared = (x[1] - center[1])^2 + (x[2] - center[2])^2
+  density_value = ambient_density +
+                  inv(4π * density_sigma^2) * exp(-0.5 * radius_squared / density_sigma^2)
+  pressure_value = ambient_pressure +
+                   (gamma - 1.0) *
+                   inv(4π * pressure_sigma^2) *
+                   exp(-0.5 * radius_squared / pressure_sigma^2)
+  return conservative_variables(density_value, (0.0, 0.0), pressure_value, gamma)
 end
 
 # Before time integration starts, we seed a few layers of `h`-refinement around
-# the blast so the sharp pressure transition is resolved from the first step.
+# the Gaussian concentration so the outgoing shock starts from a locally refined
+# mesh.
 @inline function squared_distance_to_box(point, lower, upper)
   distance = 0.0
 

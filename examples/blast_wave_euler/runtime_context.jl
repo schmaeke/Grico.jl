@@ -40,6 +40,191 @@ struct CellwiseMassInverse{B,V}
   workspace::V
 end
 
+struct PositivityLimiter{T}
+  gamma::T
+  density_floor::T
+  pressure_floor::T
+  enabled::Bool
+end
+
+# The limiter reports how much correction was needed during the most recent
+# application. `minimum_theta < 1` means at least one cell polynomial was scaled
+# toward its conservative mean; `minimum_theta == 0` means a transferred cell
+# mean itself had to be repaired to the admissible set.
+mutable struct PositivityLimiterStats{T}
+  limited_cell_count::Int
+  minimum_theta::T
+  minimum_density::T
+  minimum_pressure::T
+end
+
+function PositivityLimiter(gamma; density_floor=POSITIVITY_DENSITY_FLOOR,
+                           pressure_floor=POSITIVITY_PRESSURE_FLOOR,
+                           enabled=POSITIVITY_LIMITER_ENABLED)
+  T = typeof(float(gamma))
+  return PositivityLimiter{T}(T(gamma), T(density_floor), T(pressure_floor), enabled)
+end
+
+function _empty_limiter_stats(::Type{T}) where {T<:AbstractFloat}
+  return PositivityLimiterStats(0, one(T), T(Inf), T(Inf))
+end
+
+function _cell_mean_state(values::CellValues, state::State, field, gamma)
+  component_count(field) == 4 ||
+    throw(ArgumentError("Euler positivity limiter expects four conserved components"))
+  T = eltype(weight(values, 1))
+  density_mean = zero(T)
+  momentum1_mean = zero(T)
+  momentum2_mean = zero(T)
+  energy_mean = zero(T)
+  volume = zero(T)
+
+  for point_index in 1:point_count(values)
+    q = value(values, state, field, point_index)
+    weighted = weight(values, point_index)
+    volume += weighted
+    density_mean += q[1] * weighted
+    momentum1_mean += q[2] * weighted
+    momentum2_mean += q[3] * weighted
+    energy_mean += q[4] * weighted
+  end
+
+  mean_state = (density_mean / volume, momentum1_mean / volume, momentum2_mean / volume,
+                energy_mean / volume)
+  mean_density = mean_state[1]
+  mean_pressure = pressure(mean_state, gamma)
+  return mean_state, mean_density, mean_pressure
+end
+
+function _constant_mode_coefficient(mode, mean_state, component)
+  for axis_mode in mode
+    axis_mode <= 1 || return zero(eltype(mean_state))
+  end
+
+  return mean_state[component]
+end
+
+function _density_limiter_theta(theta, mean_density, density_value, density_floor)
+  density_value >= density_floor && return theta
+  mean_density > density_floor ||
+    throw(ArgumentError("cell mean density is below the positivity floor"))
+  denominator = mean_density - density_value
+  denominator > 0 || return zero(theta)
+  return min(theta, (mean_density - density_floor) / denominator)
+end
+
+function _pressure_limiter_theta(theta, mean_state, point_state, gamma, pressure_floor)
+  pressure(point_state, gamma) >= pressure_floor && return theta
+  pressure(mean_state, gamma) > pressure_floor ||
+    throw(ArgumentError("cell mean pressure is below the positivity floor"))
+
+  lower = zero(theta)
+  upper = theta
+
+  for _ in 1:32
+    midpoint = 0.5 * (lower + upper)
+    candidate = (mean_state[1] + midpoint * (point_state[1] - mean_state[1]),
+                 mean_state[2] + midpoint * (point_state[2] - mean_state[2]),
+                 mean_state[3] + midpoint * (point_state[3] - mean_state[3]),
+                 mean_state[4] + midpoint * (point_state[4] - mean_state[4]))
+
+    if pressure(candidate, gamma) >= pressure_floor
+      lower = midpoint
+    else
+      upper = midpoint
+    end
+  end
+
+  return lower
+end
+
+function _admissible_mean_state(mean_state, gamma, density_floor, pressure_floor)
+  repaired_density = max(mean_state[1], density_floor)
+  velocity_data = mean_state[1] > density_floor ?
+                  (mean_state[2] / mean_state[1], mean_state[3] / mean_state[1]) :
+                  (zero(repaired_density), zero(repaired_density))
+  repaired_pressure = max(pressure(mean_state, gamma), pressure_floor)
+  return conservative_variables(repaired_density, velocity_data, repaired_pressure, gamma)
+end
+
+# The integrated-Legendre basis represents constants by assigning the same
+# value to every tensor product of endpoint modes and zero to all interior
+# modes, since `(ψ₀ + ψ₁)^D = 1`. This lets the limiter scale a DG polynomial
+# around its cell mean directly in coefficient space.
+function _limit_cell_coefficients!(coefficients_data, item::CellValues, field, mean_state, theta)
+  tensor = tensor_values(item, field)
+  tensor !== nothing && is_full_tensor(tensor) ||
+    throw(ArgumentError("positivity limiter requires full tensor-product DG cells"))
+  modes = tensor_local_modes(tensor)
+  mode_count = length(modes)
+  component_total = component_count(field)
+  local_range = field_dof_range(item, field)
+
+  for component in 1:component_total
+    for mode_index in 1:mode_count
+      local_row = component_local_index(mode_count, component, mode_index)
+      dof = item.single_term_indices[first(local_range)+local_row-1]
+      mean_coefficient = _constant_mode_coefficient(modes[mode_index], mean_state, component)
+      coefficients_data[dof] = mean_coefficient +
+                               theta * (coefficients_data[dof] - mean_coefficient)
+    end
+  end
+
+  return coefficients_data
+end
+
+# This is a Zhang-Shu style cell-average limiter adapted to Grico's modal basis.
+# It preserves the conservative cell mean whenever that mean is admissible and
+# scales only the high-order part of the polynomial. The mean-repair branch is a
+# robustness fallback for projection/transfer artifacts after local h-adaptation;
+# it is deliberately visible through `minimum_theta == 0` in the reported stats.
+function apply_positivity_limiter!(coefficients_data, plan, field, limiter::PositivityLimiter)
+  T = eltype(coefficients_data)
+  stats = _empty_limiter_stats(T)
+  limiter.enabled || return stats
+  state = State(plan, coefficients_data)
+
+  for item in plan.integration.cells
+    mean_state, mean_density, mean_pressure = _cell_mean_state(item, state, field, limiter.gamma)
+    theta = one(T)
+    minimum_density = T(Inf)
+    minimum_pressure = T(Inf)
+
+    if mean_density <= limiter.density_floor || mean_pressure <= limiter.pressure_floor
+      repaired_mean = _admissible_mean_state(mean_state, limiter.gamma, limiter.density_floor,
+                                             limiter.pressure_floor)
+      stats.limited_cell_count += 1
+      stats.minimum_theta = zero(T)
+      stats.minimum_density = min(stats.minimum_density, mean_density)
+      stats.minimum_pressure = min(stats.minimum_pressure, mean_pressure)
+      _limit_cell_coefficients!(coefficients_data, item, field, repaired_mean, zero(T))
+      continue
+    end
+
+    for point_index in 1:point_count(item)
+      point_state = value(item, state, field, point_index)
+      density_value = point_state[1]
+      pressure_value = pressure(point_state, limiter.gamma)
+      minimum_density = min(minimum_density, density_value)
+      minimum_pressure = min(minimum_pressure, pressure_value)
+      theta = _density_limiter_theta(theta, mean_density, density_value, limiter.density_floor)
+      theta = _pressure_limiter_theta(theta, mean_state, point_state, limiter.gamma,
+                                      limiter.pressure_floor)
+    end
+
+    stats.minimum_density = min(stats.minimum_density, minimum_density)
+    stats.minimum_pressure = min(stats.minimum_pressure, minimum_pressure)
+
+    if theta < one(T)
+      stats.limited_cell_count += 1
+      stats.minimum_theta = min(stats.minimum_theta, theta)
+      _limit_cell_coefficients!(coefficients_data, item, field, mean_state, max(theta, zero(T)))
+    end
+  end
+
+  return stats
+end
+
 # On a DG mesh, the mass matrix is block diagonal by cell. We exploit that
 # structure and invert one small dense block per active cell.
 function local_mass_matrix(values::CellValues, field)
@@ -118,18 +303,23 @@ end
 # segment. The context carries only data needed to advance the semidiscrete
 # system; visual diagnostics are recovered from VTK output rather than from a
 # separate runtime quadrature pass.
-function blast_wave_context(conserved, state; gamma=GAMMA, cfl=CFL, degree=POLYDEG)
+function blast_wave_context(conserved, state; gamma=GAMMA, cfl=CFL, degree=POLYDEG,
+                            limiter=PositivityLimiter(gamma), limiter_stats=nothing)
   spatial_plan = euler_residual_plan(conserved, gamma)
+  limiter_stats === nothing &&
+    (limiter_stats = apply_positivity_limiter!(coefficients(state), spatial_plan, conserved,
+                                               limiter))
   mass_inverse = build_cellwise_mass_inverse(spatial_plan, conserved)
   dt = suggest_timestep(spatial_plan, state, conserved, gamma; cfl)
   return (; domain=field_space(conserved).domain, space=field_space(conserved), conserved, gamma,
-          cfl, degree, mass_inverse, spatial_plan, state, dt)
+          cfl, degree, limiter, limiter_stats, mass_inverse, spatial_plan, state, dt)
 end
 
-function refresh_blast_wave_context(context, state=context.state)
+function refresh_blast_wave_context(context, state=context.state;
+                                    limiter_stats=context.limiter_stats)
   dt = suggest_timestep(context.spatial_plan, state, context.conserved, context.gamma;
                         cfl=context.cfl)
-  return merge(context, (; state, dt))
+  return merge(context, (; state, limiter_stats, dt))
 end
 
 function build_blast_wave_euler_context(; root_counts=ROOT_COUNTS, degree=POLYDEG,
@@ -137,9 +327,9 @@ function build_blast_wave_euler_context(; root_counts=ROOT_COUNTS, degree=POLYDE
                                         gamma=GAMMA, cfl=CFL,
                                         initial_refinement_layers=INITIAL_BLAST_REFINEMENT_LAYERS,
                                         initial_refinement_radius=INITIAL_BLAST_REFINEMENT_RADIUS)
-  domain = Domain(DOMAIN_ORIGIN, DOMAIN_EXTENT, root_counts)
+  domain = Domain(DOMAIN_ORIGIN, DOMAIN_EXTENT, root_counts; periodic=PERIODIC_AXES)
   coarse_space = HpSpace(domain,
-                         SpaceOptions(basis=TrunkBasis(), degree=UniformDegree(degree),
+                         SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(degree),
                                       quadrature=DegreePlusQuadrature(quadrature_extra_points),
                                       continuity=:dg))
   space = pre_refine_blast_wave_space(coarse_space; layers=initial_refinement_layers,
@@ -175,27 +365,33 @@ function adapt_blast_wave_context(context; tolerance=ADAPTIVITY_TOLERANCE, max_h
   new_conserved = adapted_field(space_transition, context.conserved)
   new_state = transfer_state(space_transition, context.state, context.conserved, new_conserved;
                              linear_solve=linear_solve)
+  spatial_plan = euler_residual_plan(new_conserved, context.gamma)
+  limiter_stats = apply_positivity_limiter!(coefficients(new_state), spatial_plan, new_conserved,
+                                            context.limiter)
   return blast_wave_context(new_conserved, new_state; gamma=context.gamma, cfl=context.cfl,
-                            degree=context.degree), plan
+                            degree=context.degree, limiter=context.limiter, limiter_stats), plan
 end
 
 # `EulerSemidiscretization` is the object handed to `OrdinaryDiffEq.jl`. It owns
 # the reusable work arrays needed to evaluate `du = M⁻¹ R(u)`.
-struct EulerSemidiscretization{P,F,S,V,W,M}
+struct EulerSemidiscretization{P,F,S,V,W,M,L,R}
   plan::P
   field::F
   state::S
   residual_vector::V
   residual_workspace::W
   mass_inverse::M
+  limiter::L
+  limiter_stats::R
 end
 
-function EulerSemidiscretization(plan, field, initial_state, mass_inverse)
+function EulerSemidiscretization(plan, field, initial_state, mass_inverse, limiter)
   runtime_state = State(plan, copy(coefficients(initial_state)))
   residual_vector = similar(coefficients(initial_state))
   residual_workspace = ResidualWorkspace(plan)
+  limiter_stats = Ref(_empty_limiter_stats(eltype(residual_vector)))
   return EulerSemidiscretization(plan, field, runtime_state, residual_vector, residual_workspace,
-                                 mass_inverse)
+                                 mass_inverse, limiter, limiter_stats)
 end
 
 # Copy the ODE state into the reusable `State`, evaluate the DG residual, and
@@ -207,21 +403,33 @@ function euler_rhs!(du, u, semi::EulerSemidiscretization, t)
   return nothing
 end
 
+function limit_euler_solution!(integrator)
+  semi = integrator.p
+  semi.limiter_stats[] = apply_positivity_limiter!(integrator.u, semi.plan, semi.field,
+                                                   semi.limiter)
+  return nothing
+end
+
 # Integrate one time segment on a fixed mesh. Mesh changes happen only between
 # segments so that the ODE solve itself sees a time-independent semidiscrete
 # operator.
 function solve_fixed_mesh_segment(context, tspan; solver=nothing, return_solution=false)
   semi = EulerSemidiscretization(context.spatial_plan, context.conserved, context.state,
-                                 context.mass_inverse)
+                                 context.mass_inverse, context.limiter)
   problem = OrdinaryDiffEq.ODEProblem(euler_rhs!, copy(coefficients(context.state)), tspan, semi)
-  resolved_solver = solver === nothing ?
-                    OrdinaryDiffEq.CarpenterKennedy2N54(williamson_condition=false) : solver
+  resolved_solver = solver === nothing ? OrdinaryDiffEq.Tsit5() : solver
   step_size = min(context.dt, tspan[2] - tspan[1])
+  limiter_callback = OrdinaryDiffEq.DiscreteCallback((u, t, integrator) -> true,
+                                                     limit_euler_solution!;
+                                                     save_positions=(false, false))
   solution = OrdinaryDiffEq.solve(problem, resolved_solver; dt=step_size, adaptive=false,
                                   tstops=[tspan[2]], saveat=[tspan[2]], save_start=false,
-                                  save_everystep=false)
+                                  save_everystep=false, callback=limiter_callback)
   final_state = State(context.spatial_plan, copy(only(solution.u)))
-  return return_solution ? (final_state, solution) : (final_state, nothing)
+  limiter_stats = apply_positivity_limiter!(coefficients(final_state), context.spatial_plan,
+                                            context.conserved, context.limiter)
+  return return_solution ? (final_state, solution, limiter_stats) :
+         (final_state, nothing, limiter_stats)
 end
 
 function saved_times(tspan, save_interval)

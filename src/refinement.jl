@@ -12,11 +12,11 @@
 # - derefinement is allowed only when both children are still active leaves,
 # - the active-leaf list is rebuilt after every edit,
 # - child storage is retained across derefinement so a later re-refinement can
-#   reuse the same child block.
+#   reuse an existing same-axis child block or append a different-axis block.
 #
 # That last point is worth keeping in mind while reading the code: storage and
-# live topology are not the same thing. A derefined child block may remain in
-# the stored arrays even though it no longer belongs to the active tree.
+# live topology are not the same thing. Derefined child blocks may remain in the
+# stored arrays even though they no longer belong to the active tree.
 
 # Public topology edits.
 
@@ -130,9 +130,9 @@ function _derefine_snapshot_cell(snapshot::GridSnapshot, cell::Integer, axis::In
   checked_axis = _checked_axis(grid_data, axis)
   _is_expanded(snapshot, checked_cell) ||
     throw(ArgumentError("cell $checked_cell is not expanded in the snapshot"))
-  _structural_split_axis(grid_data, checked_cell) == checked_axis ||
+  _snapshot_structural_split_axis(snapshot, checked_cell) == checked_axis ||
     throw(ArgumentError("cell $checked_cell is not split along axis $checked_axis"))
-  first = _first_child(grid_data, checked_cell)
+  first = _snapshot_first_child(snapshot, checked_cell)
   first != NONE || throw(ArgumentError("cell $checked_cell is missing its child block"))
   children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
 
@@ -222,16 +222,11 @@ function _split_snapshot_leaf!(grid::CartesianGrid{D}, leaf::Int, axes::NTuple{D
 end
 
 function _append_snapshot_child_block!(grid::CartesianGrid{D}, cell::Int, axis::Int) where {D}
-  existing = _first_child(grid, cell)
-  if existing != NONE
-    _structural_split_axis(grid, cell) == axis ||
-      throw(ArgumentError("cell $cell already owns a child block on another axis"))
-    return existing
-  end
+  existing = _find_child_block(grid, cell, axis)
+  existing != NONE && return existing
 
   child_level = _require_refinable_axis(grid, cell, axis)
   first = _append_child_block!(grid)
-  grid.first_child[cell] = first
 
   for child_offset in 0:1
     child = first + child_offset
@@ -250,6 +245,7 @@ function _append_snapshot_child_block!(grid::CartesianGrid{D}, cell::Int, axis::
     @inbounds grid.coords[axis][child] = 2 * grid.coords[axis][cell] + child_offset
   end
 
+  _link_child_block!(grid, cell, first)
   return first
 end
 
