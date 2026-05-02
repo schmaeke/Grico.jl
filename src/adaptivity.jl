@@ -1335,6 +1335,15 @@ struct _CellwiseDGTransferPlan{D,T<:AbstractFloat,L,C,O,N,TR}
   max_local_dofs::Int
 end
 
+struct _LocalProjectionTransferPlan{D,T<:AbstractFloat,L,C,O,N,TR}
+  layout::L
+  cells::C
+  old_fields::O
+  new_fields::N
+  transition::TR
+  max_local_dofs::Int
+end
+
 # Dense local buffers are reused while solving cellwise projection systems.
 # Fully-DG cells have disjoint global dofs, so the final coefficient writes do
 # not need an accumulator.
@@ -1348,6 +1357,19 @@ function _CellwiseDGTransferScratch(::Type{T}, ::Val{D},
                                     local_dof_count::Int) where {D,T<:AbstractFloat}
   return _CellwiseDGTransferScratch{D,T}(Matrix{T}(undef, local_dof_count, local_dof_count),
                                          Vector{T}(undef, local_dof_count), ntuple(_ -> T[], D))
+end
+
+mutable struct _LocalProjectionTransferScratch{D,T<:AbstractFloat}
+  matrix::Matrix{T}
+  rhs::Vector{T}
+  source_basis::NTuple{D,Vector{T}}
+end
+
+function _LocalProjectionTransferScratch(::Type{T}, ::Val{D},
+                                         local_dof_count::Int) where {D,T<:AbstractFloat}
+  return _LocalProjectionTransferScratch{D,T}(Matrix{T}(undef, local_dof_count, local_dof_count),
+                                              Vector{T}(undef, local_dof_count),
+                                              ntuple(_ -> T[], D))
 end
 
 # Assemble the element-local mass matrix
@@ -1541,13 +1563,39 @@ end
 @inline function _cellwise_transfer_linear_solve(::Type{T}, local_matrix, local_rhs,
                                                  linear_solve) where {T<:AbstractFloat}
   solution = if linear_solve === default_linear_solve
-    _dense_cholesky_factor!(local_matrix)
-    _dense_cholesky_solve!(local_matrix, local_rhs)
+    _regularized_transfer_cholesky_solve!(local_matrix, local_rhs)
   else
     linear_solve(local_matrix, local_rhs)
   end
 
   return _checked_cellwise_transfer_solution(T, solution, length(local_rhs))
+end
+
+function _regularized_transfer_cholesky_solve!(matrix_data::AbstractMatrix{T},
+                                               rhs_data::AbstractVector{T}) where {T<:AbstractFloat}
+  n = _require_square_matrix(matrix_data, "regularized dense Cholesky matrix")
+  _require_length(rhs_data, n, "rhs")
+  scale = zero(T)
+
+  for index in 1:n
+    scale = max(scale, abs(@inbounds matrix_data[index, index]))
+  end
+
+  if scale == zero(T)
+    fill!(rhs_data, zero(T))
+    return rhs_data
+  end
+
+  # Cut-cell transfer mass blocks can be semidefinite when the physical cell
+  # support does not see every modal direction. A relative shift keeps the
+  # bounded local projection path robust without introducing an absolute scale.
+  shift = 1000 * eps(T) * scale
+  for index in 1:n
+    @inbounds matrix_data[index, index] += shift
+  end
+
+  _dense_cholesky_factor!(matrix_data)
+  return _dense_cholesky_solve!(matrix_data, rhs_data)
 end
 
 # Check the field pairs once before choosing a transfer implementation. The
@@ -1596,6 +1644,25 @@ function _compile_cellwise_dg_transfer_plan(transition::SpaceTransition{D,T}, ol
                                                                         max_local_dofs)
 end
 
+function _compile_local_projection_transfer_plan(transition::SpaceTransition{D,T},
+                                                 old_fields::Tuple,
+                                                 new_fields::Tuple) where {D,T<:AbstractFloat}
+  layout = FieldLayout(new_fields)
+  overrides = _cell_quadrature_overrides(layout, ())
+  cells = _compile_cells(layout, overrides)
+  max_local_dofs = 0
+
+  for cell in cells
+    max_local_dofs = max(max_local_dofs, cell.local_dof_count)
+  end
+
+  return _LocalProjectionTransferPlan{D,T,typeof(layout),typeof(cells),typeof(old_fields),
+                                      typeof(new_fields),typeof(transition)}(layout, cells,
+                                                                             old_fields, new_fields,
+                                                                             transition,
+                                                                             max_local_dofs)
+end
+
 function _assemble_cellwise_transfer_matrix!(local_matrix, cell::CellValues, new_fields::Tuple)
   for field in new_fields
     _assemble_transfer_mass!(local_matrix, cell, field)
@@ -1608,7 +1675,9 @@ end
 # is shared across field components at a quadrature point; the per-field kernel
 # is the same one used by the affine transfer fallback.
 function _assemble_cellwise_transfer_rhs!(local_rhs, cell::CellValues,
-                                          plan::_CellwiseDGTransferPlan{D,T}, source_coefficients,
+                                          plan::Union{_CellwiseDGTransferPlan{D,T},
+                                                      _LocalProjectionTransferPlan{D,T}},
+                                          source_coefficients,
                                           source_basis::NTuple{D,Vector{T}}) where {D,
                                                                                     T<:AbstractFloat}
   transition = plan.transition
@@ -1662,6 +1731,187 @@ function _transfer_cellwise_dg_state(plan::_CellwiseDGTransferPlan{D,T}, state::
   return State(plan.layout, state_coefficients)
 end
 
+function _add_transfer_coupling!(couplings::Dict{Tuple{Int,Int},T}, adjacency, first_dof::Int,
+                                 second_dof::Int, value::T) where {T<:AbstractFloat}
+  first_dof == second_dof && return couplings
+  row, col = first_dof < second_dof ? (first_dof, second_dof) : (second_dof, first_dof)
+  key = (row, col)
+
+  if !haskey(couplings, key)
+    adjacency[row] === nothing && (adjacency[row] = Int[])
+    adjacency[col] === nothing && (adjacency[col] = Int[])
+    push!(adjacency[row], col)
+    push!(adjacency[col], row)
+    couplings[key] = value
+  else
+    couplings[key] += value
+  end
+
+  return couplings
+end
+
+function _accumulate_transfer_normal_equation!(diagonal::AbstractVector{T}, rhs::AbstractVector{T},
+                                               couplings, adjacency, item::_AssemblyValues,
+                                               local_solution::AbstractVector{T}) where {T<:AbstractFloat}
+  for local_dof in 1:item.local_dof_count
+    value = local_solution[local_dof]
+    first_term = item.term_offsets[local_dof]
+    last_term = item.term_offsets[local_dof+1] - 1
+
+    for row_term in first_term:last_term
+      row = item.term_indices[row_term]
+      row_coefficient = item.term_coefficients[row_term]
+      diagonal[row] += row_coefficient * row_coefficient
+      rhs[row] += row_coefficient * value
+
+      for col_term in (row_term+1):last_term
+        col = item.term_indices[col_term]
+        col_coefficient = item.term_coefficients[col_term]
+        _add_transfer_coupling!(couplings, adjacency, row, col, row_coefficient * col_coefficient)
+      end
+    end
+  end
+
+  return rhs
+end
+
+function _transfer_component!(component::Vector{Int}, start::Int, adjacency, visited::BitVector)
+  empty!(component)
+  queue = Int[start]
+  visited[start] = true
+  cursor = 1
+
+  while cursor <= length(queue)
+    dof = queue[cursor]
+    cursor += 1
+    push!(component, dof)
+    neighbors = adjacency[dof]
+    neighbors === nothing && continue
+
+    for neighbor in neighbors
+      visited[neighbor] && continue
+      visited[neighbor] = true
+      push!(queue, neighbor)
+    end
+  end
+
+  return component
+end
+
+function _solve_transfer_component!(state_coefficients::AbstractVector{T}, component::Vector{Int},
+                                    diagonal::AbstractVector{T}, rhs::AbstractVector{T}, couplings,
+                                    adjacency) where {T<:AbstractFloat}
+  count = length(component)
+  local_index = Dict{Int,Int}()
+
+  for index in 1:count
+    local_index[component[index]] = index
+  end
+
+  matrix = zeros(T, count, count)
+  local_rhs = Vector{T}(undef, count)
+
+  for index in 1:count
+    dof = component[index]
+    matrix[index, index] = diagonal[dof]
+    local_rhs[index] = rhs[dof]
+  end
+
+  for row_global in component
+    row = local_index[row_global]
+    neighbors = adjacency[row_global]
+    neighbors === nothing && continue
+
+    for col_global in neighbors
+      row_global < col_global || continue
+      value = get(couplings, (row_global, col_global), zero(T))
+      iszero(value) && continue
+      col = local_index[col_global]
+      matrix[row, col] = value
+      matrix[col, row] = value
+    end
+  end
+
+  _regularized_transfer_cholesky_solve!(matrix, local_rhs)
+
+  for index in 1:count
+    state_coefficients[component[index]] = local_rhs[index]
+  end
+
+  return state_coefficients
+end
+
+function _finish_transfer_normal_equations!(state_coefficients::AbstractVector{T},
+                                            diagonal::AbstractVector{T}, rhs::AbstractVector{T},
+                                            couplings, adjacency) where {T<:AbstractFloat}
+  visited = falses(length(state_coefficients))
+  component = Int[]
+  tolerance = 1000 * eps(T)
+
+  for dof in eachindex(state_coefficients)
+    visited[dof] && continue
+    neighbors = adjacency[dof]
+
+    if neighbors === nothing
+      visited[dof] = true
+      diagonal[dof] > tolerance && (state_coefficients[dof] = rhs[dof] / diagonal[dof])
+      continue
+    end
+
+    _transfer_component!(component, dof, adjacency, visited)
+    _solve_transfer_component!(state_coefficients, component, diagonal, rhs, couplings, adjacency)
+  end
+
+  return state_coefficients
+end
+
+function _transfer_local_projection_state(plan::_LocalProjectionTransferPlan{D,T},
+                                          state::State{T}) where {D,T<:AbstractFloat}
+  state_coefficients = zeros(T, dof_count(plan.layout))
+  isempty(plan.cells) && return State(plan.layout, state_coefficients)
+  diagonal = zeros(T, length(state_coefficients))
+  rhs = zeros(T, length(state_coefficients))
+  couplings = Dict{Tuple{Int,Int},T}()
+  adjacency = Vector{Union{Nothing,Vector{Int}}}(nothing, length(state_coefficients))
+  scratch = _LocalProjectionTransferScratch(T, Val(D), plan.max_local_dofs)
+  source_coefficients = ntuple(index -> _component_coefficient_views(state, plan.old_fields[index]),
+                               length(plan.old_fields))
+
+  for cell in plan.cells
+    local_dofs = cell.local_dof_count
+    matrix_view = view(scratch.matrix, 1:local_dofs, 1:local_dofs)
+    rhs_view = view(scratch.rhs, 1:local_dofs)
+    fill!(matrix_view, zero(T))
+    fill!(rhs_view, zero(T))
+    _assemble_cellwise_transfer_matrix!(matrix_view, cell, plan.new_fields)
+    _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients,
+                                     scratch.source_basis)
+    _regularized_transfer_cholesky_solve!(matrix_view, rhs_view)
+    _accumulate_transfer_normal_equation!(diagonal, rhs, couplings, adjacency, cell, rhs_view)
+  end
+
+  _finish_transfer_normal_equations!(state_coefficients, diagonal, rhs, couplings, adjacency)
+  return State(plan.layout, state_coefficients)
+end
+
+function _transfer_variational_state(transition::SpaceTransition, state::State, old_fields::Tuple,
+                                     new_fields::Tuple; linear_solve=default_linear_solve)
+  problem = AffineProblem(new_fields...)
+
+  for index in eachindex(old_fields)
+    new_field = new_fields[index]
+    add_cell!(problem, _TransferMass(new_field))
+    add_cell!(problem,
+              _TransferSource(new_field, _component_coefficient_views(state, old_fields[index]),
+                              transition))
+  end
+
+  plan = compile(problem)
+  return disable_polyester_threads() do
+    solve(plan; linear_solve=linear_solve)
+  end
+end
+
 """
     transfer_state(transition, state, old_fields, new_fields; linear_solve=default_linear_solve)
     transfer_state(transition, state, old_field, new_field; linear_solve=default_linear_solve)
@@ -1675,14 +1925,15 @@ field form recreates the full field layout on the target space via
 [`adapted_fields`](@ref) and returns both the new fields and the transferred
 state.
 
-The transfer is purely geometric and variational: it depends on the old state,
-the source/target spaces, and the chosen linear solve path, but not on any
-specific PDE operator. On fully discontinuous target spaces, the transfer
-recognizes that the projection system is cellwise block diagonal and solves one
-local dense system per target cell instead of assembling a global sparse
-problem. On coupled target spaces, the transfer uses the same matrix-free solve
-API as ordinary affine problems, and the `linear_solve` keyword can be used to
-replace the default reduced CG solve.
+The transfer is purely geometric: it depends on the old state and the
+source/target spaces, but not on any specific PDE operator. Fully discontinuous
+target spaces are projected by independent dense cell solves. For the default
+coupled-space path, Grico computes the same cellwise target projection and then
+reconciles shared coefficients by the small normal-equation components induced
+by continuity and hanging-node substitutions. This keeps transfer bounded and
+separate from the PDE linear-solve path. Passing a custom `linear_solve` keeps
+the legacy global variational projection hook for callers that need to override
+the transfer solve explicitly.
 """
 function transfer_state(transition::SpaceTransition, state::State, old_fields::Tuple,
                         new_fields::Tuple; linear_solve=default_linear_solve)
@@ -1693,18 +1944,12 @@ function transfer_state(transition::SpaceTransition, state::State, old_fields::T
     return _transfer_cellwise_dg_state(plan, state; linear_solve=linear_solve)
   end
 
-  problem = AffineProblem(new_fields...)
-
-  for index in eachindex(old_fields)
-    new_field = new_fields[index]
-    add_cell!(problem, _TransferMass(new_field))
-    add_cell!(problem,
-              _TransferSource(new_field, _component_coefficient_views(state, old_fields[index]),
-                              transition))
+  if linear_solve !== default_linear_solve
+    return _transfer_variational_state(transition, state, old_fields, new_fields; linear_solve)
   end
 
-  plan = compile(problem)
-  return solve(plan; linear_solve=linear_solve)
+  plan = _compile_local_projection_transfer_plan(transition, old_fields, new_fields)
+  return _transfer_local_projection_state(plan, state)
 end
 
 function transfer_state(transition::SpaceTransition, state::State, old_field::AbstractField,

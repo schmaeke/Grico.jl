@@ -81,6 +81,7 @@ tracks the main abstractions rather than every implementation detail.
 module Grico
 
 using LinearAlgebra
+using Polyester: @batch, disable_polyester_threads
 
 # Part I. Internal utilities shared throughout the implementation. This file is
 # intentionally included first because nearly every later layer depends on its

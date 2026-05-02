@@ -206,12 +206,13 @@ end
 
 function surface_apply!(local_result, operator::AnnularNitscheDirichlet, values::SurfaceValues,
                         local_coefficients)
+  T = eltype(local_result)
   local_block = block(local_result, values, operator.field)
   shape_table = shape_values(values, operator.field)
   mode_count = local_mode_count(values, operator.field)
   domain_data = field_space(operator.field).domain
-  h = min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2))
-  penalty = operator.penalty / h
+  h = T(min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2)))::T
+  penalty = T(operator.penalty) / h
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
@@ -233,12 +234,13 @@ function surface_apply!(local_result, operator::AnnularNitscheDirichlet, values:
 end
 
 function surface_diagonal!(local_diagonal, operator::AnnularNitscheDirichlet, values::SurfaceValues)
+  T = eltype(local_diagonal)
   local_block = block(local_diagonal, values, operator.field)
   shape_table = shape_values(values, operator.field)
   mode_count = local_mode_count(values, operator.field)
   domain_data = field_space(operator.field).domain
-  h = min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2))
-  penalty = operator.penalty / h
+  h = T(min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2)))::T
+  penalty = T(operator.penalty) / h
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
@@ -256,14 +258,15 @@ function surface_diagonal!(local_diagonal, operator::AnnularNitscheDirichlet, va
 end
 
 function surface_rhs!(local_rhs, operator::AnnularNitscheDirichlet, values::SurfaceValues)
+  T = eltype(local_rhs)
   local_block = block(local_rhs, values, operator.field)
   mode_count = local_mode_count(values, operator.field)
   domain_data = field_space(operator.field).domain
-  h = min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2))
-  penalty = operator.penalty / h
+  h = T(min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2)))::T
+  penalty = T(operator.penalty) / h
 
   @inbounds for point_index in 1:point_count(values)
-    boundary_value = operator.data(point(values, point_index))
+    boundary_value = T(operator.data(point(values, point_index)))::T
     weighted = weight(values, point_index)
     normal_data = normal(values, point_index)
 

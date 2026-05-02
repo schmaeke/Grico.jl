@@ -513,21 +513,45 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
                                                face -> boundary_lookup[_boundary_lookup_slot(face.axis,
                                                                                              face.side)])
   slot_range = field_dof_range(layout, slot.field)
-  slot_matrix = zeros(T, length(slot_range), length(slot_range))
-  slot_rhs = zeros(T, length(slot_range))
-  local_matrix = zeros(T, max_local_dofs, max_local_dofs)
-  local_rhs = zeros(T, max_local_dofs)
-  _assemble_boundary_projection!(slot_matrix, slot_rhs, slot_range, local_matrix, local_rhs,
-                                 boundary_batches, selected_faces, operators)
-  involved = _active_projection_dofs(slot_matrix, slot_rhs)
+  involved = _boundary_projection_dofs(slot_range, selected_faces)
   isempty(involved) &&
     throw(ArgumentError("Dirichlet projection found no active trace dofs for field $(field_name(slot.field))"))
+  slot_to_compact = zeros(Int, length(slot_range))
+
+  for compact_index in eachindex(involved)
+    slot_to_compact[involved[compact_index]] = compact_index
+  end
+
+  compact_matrix = zeros(T, length(involved), length(involved))
+  compact_rhs = zeros(T, length(involved))
+  local_matrix = zeros(T, max_local_dofs, max_local_dofs)
+  local_rhs = zeros(T, max_local_dofs)
   dofs = [first(slot_range) + local_dof - 1 for local_dof in involved]
-  return dofs, slot_matrix[involved, involved], slot_rhs[involved]
+  _assemble_boundary_projection!(compact_matrix, compact_rhs, slot_range, slot_to_compact,
+                                 local_matrix, local_rhs, boundary_batches, selected_faces,
+                                 operators)
+  return dofs, compact_matrix, compact_rhs
 end
 
-function _assemble_boundary_projection!(slot_matrix::AbstractMatrix{T}, slot_rhs::AbstractVector{T},
-                                        slot_range::UnitRange{Int}, local_matrix::AbstractMatrix{T},
+function _boundary_projection_dofs(slot_range::UnitRange{Int}, faces)
+  active = falses(length(slot_range))
+
+  for face in faces
+    for local_dof in 1:face.local_dof_count
+      for term_index in _local_term_range(face, local_dof)
+        slot_index = _slot_index(slot_range, face.term_indices[term_index])
+        slot_index == 0 || (active[slot_index] = true)
+      end
+    end
+  end
+
+  return findall(active)
+end
+
+function _assemble_boundary_projection!(compact_matrix::AbstractMatrix{T},
+                                        compact_rhs::AbstractVector{T}, slot_range::UnitRange{Int},
+                                        slot_to_compact::Vector{Int},
+                                        local_matrix::AbstractMatrix{T},
                                         local_rhs::AbstractVector{T},
                                         batches::Vector{_FilteredKernelBatch}, faces,
                                         operators) where {T<:AbstractFloat}
@@ -546,7 +570,8 @@ function _assemble_boundary_projection!(slot_matrix::AbstractMatrix{T}, slot_rhs
         _face_projection_rhs!(rhs_view, wrapped.operator, face)
       end
 
-      _scatter_projection!(slot_matrix, slot_rhs, slot_range, face, matrix_view, rhs_view)
+      _scatter_projection!(compact_matrix, compact_rhs, slot_range, slot_to_compact, face,
+                           matrix_view, rhs_view)
     end
   end
 
@@ -564,8 +589,8 @@ end
 end
 
 function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::AbstractVector{T},
-                              slot_range::UnitRange{Int}, item::_AssemblyValues,
-                              local_matrix::AbstractMatrix{T},
+                              slot_range::UnitRange{Int}, slot_to_compact::Vector{Int},
+                              item::_AssemblyValues, local_matrix::AbstractMatrix{T},
                               local_rhs::AbstractVector{T}) where {T<:AbstractFloat}
   tolerance = 1000 * eps(T)
 
@@ -573,7 +598,9 @@ function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::Abstract
     rhs_value = local_rhs[local_row]
 
     for row_term in _local_term_range(item, local_row)
-      row = _slot_index(slot_range, item.term_indices[row_term])
+      row_slot = _slot_index(slot_range, item.term_indices[row_term])
+      row_slot == 0 && continue
+      row = slot_to_compact[row_slot]
       row == 0 && continue
       row_coefficient = item.term_coefficients[row_term]
       abs(rhs_value) > tolerance && (rhs_data[row] += row_coefficient * rhs_value)
@@ -583,7 +610,9 @@ function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::Abstract
         abs(coefficient) > tolerance || continue
 
         for col_term in _local_term_range(item, local_col)
-          col = _slot_index(slot_range, item.term_indices[col_term])
+          col_slot = _slot_index(slot_range, item.term_indices[col_term])
+          col_slot == 0 && continue
+          col = slot_to_compact[col_slot]
           col == 0 && continue
           matrix_data[row, col] += row_coefficient * coefficient * item.term_coefficients[col_term]
         end
@@ -756,25 +785,6 @@ function _face_projection_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
   end
 
   return nothing
-end
-
-# Identify the trace dofs that are actually active in the projection system.
-function _active_projection_dofs(matrix_data::AbstractMatrix{T},
-                                 rhs_data::AbstractVector{T}) where {T<:AbstractFloat}
-  active = falses(size(matrix_data, 1))
-  tolerance = 1000 * eps(T)
-
-  for col in axes(matrix_data, 2), row in axes(matrix_data, 1)
-    abs(matrix_data[row, col]) > tolerance || continue
-    active[row] = true
-    active[col] = true
-  end
-
-  for index in eachindex(rhs_data)
-    abs(rhs_data[index]) > tolerance && (active[index] = true)
-  end
-
-  return findall(active)
 end
 
 # Numerical rank tolerance for the boundary projection Gram matrix. The cutoff

@@ -5,6 +5,7 @@ authors = ["schmaeke <jan@schmaeke.dev>"]
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
 [weakdeps]
@@ -15,14 +16,15 @@ WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 GricoMakieExt = "Makie"
 GricoWriteVTKExt = "WriteVTK"
 
+[compat]
+Makie = "0.24"
+Polyester = "0.7.19"
+WriteVTK = "1.21"
+julia = "1.12"
+
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [targets]
 test = ["Test", "WriteVTK"]
-
-[compat]
-Makie = "0.24"
-WriteVTK = "1.21"
-julia = "1.12"

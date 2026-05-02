@@ -53,14 +53,16 @@ end
 # the local coefficient vector instead of materializing the face matrix.
 function interface_apply!(local_result, operator::SineInterfaceSIPGPoisson, values::InterfaceValues,
                           local_coefficients)
+  T = eltype(local_result)
   field = operator.field
   minus_values = minus(values)
   plus_values = plus(values)
   minus_modes = local_mode_count(minus_values, field)
   plus_modes = local_mode_count(plus_values, field)
   blocks = (block(local_result, minus_values, field), block(local_result, plus_values, field))
-  penalty = operator.penalty *
-            _interface_penalty_scale(field, values.minus_leaf, values.plus_leaf, values.axis)
+  penalty_scale = T(_interface_penalty_scale(field, values.minus_leaf, values.plus_leaf,
+                                             values.axis))::T
+  penalty = T(operator.penalty) * penalty_scale
 
   @inbounds for point_index in 1:point_count(values)
     minus_value = value(minus_values, local_coefficients, field, point_index)
@@ -94,12 +96,14 @@ end
 
 function interface_diagonal!(local_diagonal, operator::SineInterfaceSIPGPoisson,
                              values::InterfaceValues)
+  T = eltype(local_diagonal)
   field = operator.field
   minus_values = minus(values)
   plus_values = plus(values)
   blocks = (block(local_diagonal, minus_values, field), block(local_diagonal, plus_values, field))
-  penalty = operator.penalty *
-            _interface_penalty_scale(field, values.minus_leaf, values.plus_leaf, values.axis)
+  penalty_scale = T(_interface_penalty_scale(field, values.minus_leaf, values.plus_leaf,
+                                             values.axis))::T
+  penalty = T(operator.penalty) * penalty_scale
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
@@ -124,10 +128,12 @@ end
 # SIPG form. Since g = 0, only the operator action remains.
 function face_apply!(local_result, operator::SineInterfaceSIPGPoisson, values::FaceValues,
                      local_coefficients)
+  T = eltype(local_result)
   field = operator.field
   local_block = block(local_result, values, field)
   mode_count = local_mode_count(values, field)
-  penalty = operator.penalty * _boundary_penalty_scale(field, values.leaf, values.axis)
+  penalty_scale = T(_boundary_penalty_scale(field, values.leaf, values.axis))::T
+  penalty = T(operator.penalty) * penalty_scale
 
   @inbounds for point_index in 1:point_count(values)
     trial_value = value(values, local_coefficients, field, point_index)
@@ -147,10 +153,12 @@ function face_apply!(local_result, operator::SineInterfaceSIPGPoisson, values::F
 end
 
 function face_diagonal!(local_diagonal, operator::SineInterfaceSIPGPoisson, values::FaceValues)
+  T = eltype(local_diagonal)
   field = operator.field
   local_block = block(local_diagonal, values, field)
   mode_count = local_mode_count(values, field)
-  penalty = operator.penalty * _boundary_penalty_scale(field, values.leaf, values.axis)
+  penalty_scale = T(_boundary_penalty_scale(field, values.leaf, values.axis))::T
+  penalty = T(operator.penalty) * penalty_scale
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)

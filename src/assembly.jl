@@ -332,6 +332,16 @@ mutable struct _OperatorScratch{T<:AbstractFloat}
   rhs::Vector{T}
 end
 
+# Matrix-free passes scatter element contributions into global vectors. To keep
+# this race-free without imposing a coloring scheme on every traversal type, each
+# dense worker slot receives a local scratch block and, except for slot 1, a
+# full result buffer. The buffers are reduced once after all cells/faces/surfaces
+# in a pass have contributed.
+struct _ThreadedOperatorScratch{T<:AbstractFloat}
+  local_scratch::Vector{_OperatorScratch{T}}
+  result_buffers::Vector{Vector{T}}
+end
+
 function _OperatorScratch(::Type{T}, local_dof_count::Int) where {T<:AbstractFloat}
   count = max(local_dof_count, 0)
   return _OperatorScratch(zeros(T, count), zeros(T, count), zeros(T, count))
@@ -339,6 +349,68 @@ end
 
 function _scratch_buffer(::Type{T}, integration::_CompiledIntegration) where {T<:AbstractFloat}
   return _OperatorScratch(T, _max_local_dof_count(integration))
+end
+
+function _threaded_scratch_buffer(::Type{T}, plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  thread_count = Base.Threads.nthreads()
+  local_dof_count = _max_local_dof_count(plan.integration)
+  local_scratch = [_OperatorScratch(T, local_dof_count) for _ in 1:thread_count]
+  result_buffers = [zeros(T, dof_count(plan)) for _ in 2:thread_count]
+  return _ThreadedOperatorScratch(local_scratch, result_buffers)
+end
+
+@inline _threaded_slot_count(workspace::_ThreadedOperatorScratch) = length(workspace.local_scratch)
+
+@inline function _slot_range(item_count::Int, slot::Int, slot_count::Int)
+  block_size, remainder = divrem(item_count, slot_count)
+  first_index = (slot - 1) * block_size + min(slot - 1, remainder) + 1
+  last_index = first_index + block_size - 1 + (slot <= remainder ? 1 : 0)
+  return first_index:last_index
+end
+
+@inline function _threaded_buffers(workspace::_ThreadedOperatorScratch, result, slot::Int)
+  local_scratch = @inbounds workspace.local_scratch[slot]
+  local_result = slot == 1 ? result : @inbounds(workspace.result_buffers[slot-1])
+  return local_scratch, local_result
+end
+
+function _clear_threaded_result!(workspace::_ThreadedOperatorScratch{T},
+                                 result::AbstractVector{T}) where {T<:AbstractFloat}
+  buffers = workspace.result_buffers
+  zero_value = zero(T)
+
+  if isempty(buffers)
+    fill!(result, zero_value)
+    return result
+  end
+
+  @_threaded_loop for index in eachindex(result)
+    result[index] = zero_value
+
+    for buffer in buffers
+      buffer[index] = zero_value
+    end
+  end
+
+  return result
+end
+
+function _merge_threaded_result!(result::AbstractVector{T},
+                                 workspace::_ThreadedOperatorScratch{T}) where {T<:AbstractFloat}
+  buffers = workspace.result_buffers
+  isempty(buffers) && return result
+
+  @_threaded_loop for index in eachindex(result)
+    value = result[index]
+
+    for buffer in buffers
+      value += buffer[index]
+    end
+
+    result[index] = value
+  end
+
+  return result
 end
 
 """
@@ -351,11 +423,11 @@ A workspace is tied to the exact plan used to create it.
 """
 struct ResidualWorkspace{T<:AbstractFloat,P<:AssemblyPlan}
   plan::P
-  scratch::_OperatorScratch{T}
+  threaded_scratch::_ThreadedOperatorScratch{T}
 end
 
 function ResidualWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
-  return ResidualWorkspace{T,typeof(plan)}(plan, _scratch_buffer(T, plan.integration))
+  return ResidualWorkspace{T,typeof(plan)}(plan, _threaded_scratch_buffer(T, plan))
 end
 
 function _check_residual_workspace(plan::AssemblyPlan, workspace::ResidualWorkspace)
@@ -400,8 +472,8 @@ end
 function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   _require_length(result, dof_count(plan), "result")
-  scratch = _scratch_buffer(T, plan.integration)
-  fill!(result, zero(T))
+  scratch = _threaded_scratch_buffer(T, plan)
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
   _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
@@ -412,6 +484,7 @@ function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}) where {D,T<:Ab
              plan.interface_operators, masks.fixed, masks.blocked_rows, interface_rhs!)
   _surface_rhs_pass!(scratch, result, traversal.surface_batches, plan.integration.embedded_surfaces,
                      plan.surface_operators, masks.fixed, masks.blocked_rows)
+  _merge_threaded_result!(result, scratch)
   _write_constraint_rhs!(result, plan)
   return result
 end
@@ -441,8 +514,8 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _require_length(result, dof_count(plan), "result")
   _require_length(coefficients, dof_count(plan), "coefficient vector")
   _check_no_alias(result, coefficients)
-  scratch = _scratch_buffer(T, plan.integration)
-  fill!(result, zero(T))
+  scratch = _threaded_scratch_buffer(T, plan)
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
   _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
@@ -456,6 +529,7 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _surface_apply_pass!(scratch, result, traversal.surface_batches,
                        plan.integration.embedded_surfaces, plan.surface_operators, coefficients,
                        masks.fixed, masks.blocked_rows)
+  _merge_threaded_result!(result, scratch)
   _write_constraint_action!(result, plan, coefficients)
   return result
 end
@@ -466,6 +540,7 @@ end
 # wrapper on every Newton step.
 mutable struct _ReducedOperatorWorkspace{T<:AbstractFloat,S<:State{T}}
   scratch::_OperatorScratch{T}
+  threaded_scratch::_ThreadedOperatorScratch{T}
   full_input::Vector{T}
   full_output::Vector{T}
   full_state::Vector{T}
@@ -474,15 +549,16 @@ end
 
 function _ReducedOperatorWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
   full_state = zeros(T, dof_count(plan))
-  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration), zeros(T, dof_count(plan)),
+  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration),
+                                   _threaded_scratch_buffer(T, plan), zeros(T, dof_count(plan)),
                                    zeros(T, dof_count(plan)), full_state, State(plan, full_state))
 end
 
 function _rhs_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
-                        scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
+                        scratch::_ThreadedOperatorScratch{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   _require_length(result, dof_count(plan), "result")
-  fill!(result, zero(T))
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
              nothing, nothing, cell_rhs!)
@@ -492,16 +568,17 @@ function _rhs_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
              plan.interface_operators, nothing, nothing, interface_rhs!)
   _surface_rhs_pass!(scratch, result, traversal.surface_batches, plan.integration.embedded_surfaces,
                      plan.surface_operators, nothing, nothing)
+  _merge_threaded_result!(result, scratch)
   return result
 end
 
 function _apply_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                           coefficients::AbstractVector{T},
-                          scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
+                          scratch::_ThreadedOperatorScratch{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   _require_length(result, dof_count(plan), "result")
   _require_length(coefficients, dof_count(plan), "coefficient vector")
-  fill!(result, zero(T))
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
                coefficients, nothing, nothing, cell_apply!)
@@ -513,6 +590,7 @@ function _apply_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _surface_apply_pass!(scratch, result, traversal.surface_batches,
                        plan.integration.embedded_surfaces, plan.surface_operators, coefficients,
                        nothing, nothing)
+  _merge_threaded_result!(result, scratch)
   return result
 end
 
@@ -636,11 +714,11 @@ function _diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
                                           default_diagonal_method) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return true
 
-  for batch in batches
-    item = @inbounds items[first(batch.item_indices)]
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
-    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    item = @inbounds items[first(kernel_batch.item_indices)]
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
+    local_diagonal = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
     has_action = false
 
@@ -654,7 +732,7 @@ function _diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
 
     has_action || continue
 
-    for item_index in batch.item_indices
+    for item_index in kernel_batch.item_indices
       item = @inbounds items[item_index]
       _item_has_direct_diagonal_map(item, T) || return false
     end
@@ -670,15 +748,15 @@ function _filtered_diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
                                                    default_diagonal_method) where {T<:AbstractFloat}
   isempty(batches) && return true
 
-  for batch in batches
-    item = @inbounds items[first(batch.item_indices)]
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
-    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    item = @inbounds items[first(kernel_batch.item_indices)]
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
+    local_diagonal = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
     has_action = false
 
-    for operator_index in batch.operator_indices
+    for operator_index in kernel_batch.operator_indices
       wrapped = @inbounds operators[operator_index]
       operator = wrapped.operator
       _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
@@ -690,7 +768,7 @@ function _filtered_diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
 
     has_action || continue
 
-    for item_index in batch.item_indices
+    for item_index in kernel_batch.item_indices
       item = @inbounds items[item_index]
       _item_has_direct_diagonal_map(item, T) || return false
     end
@@ -764,7 +842,7 @@ function _reduced_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _require_length(result, reduced_dof_count(map), "reduced result")
   _require_length(reduced_coefficients, reduced_dof_count(map), "reduced coefficient vector")
   _expand_reduced!(workspace.full_input, map, reduced_coefficients; include_shift=false)
-  _apply_physical!(workspace.full_output, plan, workspace.full_input, workspace.scratch)
+  _apply_physical!(workspace.full_output, plan, workspace.full_input, workspace.threaded_scratch)
   _project_reduced!(result, map, workspace.full_output)
   return result
 end
@@ -773,10 +851,10 @@ function _reduced_rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                        workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
   map = _reduced_map(plan)
   _require_length(result, reduced_dof_count(map), "reduced rhs")
-  _rhs_physical!(workspace.full_output, plan, workspace.scratch)
+  _rhs_physical!(workspace.full_output, plan, workspace.threaded_scratch)
 
   if any(!iszero, map.shift)
-    _apply_physical!(workspace.full_input, plan, map.shift, workspace.scratch)
+    _apply_physical!(workspace.full_input, plan, map.shift, workspace.threaded_scratch)
 
     for index in 1:map.full_dof_count
       workspace.full_output[index] -= workspace.full_input[index]
@@ -854,10 +932,10 @@ function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, state::St
   _check_state(plan, state)
   _check_residual_workspace(plan, workspace)
   _require_length(result, dof_count(plan), "result")
-  fill!(result, zero(T))
+  scratch = workspace.threaded_scratch
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
-  scratch = workspace.scratch
   _residual_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
                   plan.cell_operators, state, masks.fixed, masks.blocked_rows, cell_residual!)
   _boundary_residual_pass!(scratch, result, traversal.boundary_batches,
@@ -869,6 +947,7 @@ function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, state::St
   _surface_residual_pass!(scratch, result, traversal.surface_batches,
                           plan.integration.embedded_surfaces, plan.surface_operators, state,
                           masks.fixed, masks.blocked_rows)
+  _merge_threaded_result!(result, scratch)
   _write_constraint_residual!(result, plan, coefficients(state))
   return result
 end
@@ -903,10 +982,10 @@ function tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, stat
   _require_length(result, dof_count(plan), "result")
   _require_length(increment, dof_count(plan), "increment vector")
   _check_no_alias(result, increment)
-  fill!(result, zero(T))
+  scratch = workspace.threaded_scratch
+  _clear_threaded_result!(scratch, result)
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
-  scratch = workspace.scratch
   _tangent_apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
                        plan.cell_operators, state, increment, masks.fixed, masks.blocked_rows,
                        cell_tangent_apply!)
@@ -919,28 +998,496 @@ function tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, stat
   _surface_tangent_apply_pass!(scratch, result, traversal.surface_batches,
                                plan.integration.embedded_surfaces, plan.surface_operators, state,
                                increment, masks.fixed, masks.blocked_rows)
+  _merge_threaded_result!(result, scratch)
   _write_constraint_action!(result, plan, increment)
   return result
 end
 
 # Local traversal helpers.
 
+@inline _rhs_operators!(local_rhs, ::Tuple{}, item, rhs_hook) = nothing
+
+@inline function _rhs_operators!(local_rhs, operators::Tuple, item, rhs_hook)
+  rhs_hook(local_rhs, first(operators), item)
+  return _rhs_operators!(local_rhs, Base.tail(operators), item, rhs_hook)
+end
+
+@inline _apply_operators!(local_output, ::Tuple{}, item, local_input, apply_hook) = nothing
+
+@inline function _apply_operators!(local_output, operators::Tuple, item, local_input, apply_hook)
+  apply_hook(local_output, first(operators), item, local_input)
+  return _apply_operators!(local_output, Base.tail(operators), item, local_input, apply_hook)
+end
+
+@inline _diagonal_operators!(local_diagonal, ::Tuple{}, item, diagonal_hook) = nothing
+
+@inline function _diagonal_operators!(local_diagonal, operators::Tuple, item, diagonal_hook)
+  diagonal_hook(local_diagonal, first(operators), item)
+  return _diagonal_operators!(local_diagonal, Base.tail(operators), item, diagonal_hook)
+end
+
+@inline _residual_operators!(local_rhs, ::Tuple{}, item, state, residual_hook) = nothing
+
+@inline function _residual_operators!(local_rhs, operators::Tuple, item, state, residual_hook)
+  residual_hook(local_rhs, first(operators), item, state)
+  return _residual_operators!(local_rhs, Base.tail(operators), item, state, residual_hook)
+end
+
+@inline _tangent_apply_operators!(local_output, ::Tuple{}, item, state, local_input, apply_hook) = nothing
+
+@inline function _tangent_apply_operators!(local_output, operators::Tuple, item, state, local_input,
+                                           apply_hook)
+  apply_hook(local_output, first(operators), item, state, local_input)
+  return _tangent_apply_operators!(local_output, Base.tail(operators), item, state, local_input,
+                                   apply_hook)
+end
+
+@inline function _threaded_rhs_item!(scratch::_ThreadedOperatorScratch{T},
+                                     result::AbstractVector{T}, slot::Int, items, item_index::Int,
+                                     local_dof_count::Int, operators, fixed, blocked_rows,
+                                     rhs_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_rhs = view(local_scratch.rhs, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  fill!(local_rhs, zero(T))
+  _rhs_operators!(local_rhs, operators, item, rhs_hook)
+  _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_filtered_rhs_item!(scratch::_ThreadedOperatorScratch{T},
+                                              result::AbstractVector{T}, slot::Int, items,
+                                              item_index::Int, local_dof_count::Int, operators,
+                                              operator_indices, fixed, blocked_rows,
+                                              rhs_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_rhs = view(local_scratch.rhs, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  fill!(local_rhs, zero(T))
+
+  for operator_index in operator_indices
+    wrapped = @inbounds operators[operator_index]
+    rhs_hook(local_rhs, wrapped.operator, item)
+  end
+
+  _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_apply_item!(scratch::_ThreadedOperatorScratch{T},
+                                       result::AbstractVector{T}, slot::Int, items, item_index::Int,
+                                       local_dof_count::Int, operators,
+                                       coefficients::AbstractVector{T}, fixed, blocked_rows,
+                                       apply_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_input = view(local_scratch.input, 1:local_dof_count)
+  local_output = view(local_scratch.output, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  _gather_local_coefficients!(local_input, item, coefficients)
+  fill!(local_output, zero(T))
+  _apply_operators!(local_output, operators, item, local_input, apply_hook)
+  _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_filtered_apply_item!(scratch::_ThreadedOperatorScratch{T},
+                                                result::AbstractVector{T}, slot::Int, items,
+                                                item_index::Int, local_dof_count::Int, operators,
+                                                operator_indices, coefficients::AbstractVector{T},
+                                                fixed, blocked_rows,
+                                                apply_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_input = view(local_scratch.input, 1:local_dof_count)
+  local_output = view(local_scratch.output, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  _gather_local_coefficients!(local_input, item, coefficients)
+  fill!(local_output, zero(T))
+
+  for operator_index in operator_indices
+    wrapped = @inbounds operators[operator_index]
+    apply_hook(local_output, wrapped.operator, item, local_input)
+  end
+
+  _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_residual_item!(scratch::_ThreadedOperatorScratch{T},
+                                          result::AbstractVector{T}, slot::Int, items,
+                                          item_index::Int, local_dof_count::Int, operators,
+                                          state::State{T}, fixed, blocked_rows,
+                                          residual_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_rhs = view(local_scratch.rhs, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  fill!(local_rhs, zero(T))
+  _residual_operators!(local_rhs, operators, item, state, residual_hook)
+  _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_filtered_residual_item!(scratch::_ThreadedOperatorScratch{T},
+                                                   result::AbstractVector{T}, slot::Int, items,
+                                                   item_index::Int, local_dof_count::Int, operators,
+                                                   operator_indices, state::State{T}, fixed,
+                                                   blocked_rows,
+                                                   residual_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_rhs = view(local_scratch.rhs, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  fill!(local_rhs, zero(T))
+
+  for operator_index in operator_indices
+    wrapped = @inbounds operators[operator_index]
+    residual_hook(local_rhs, wrapped.operator, item, state)
+  end
+
+  _scatter_local_vector!(local_result, item, local_rhs, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_tangent_apply_item!(scratch::_ThreadedOperatorScratch{T},
+                                               result::AbstractVector{T}, slot::Int, items,
+                                               item_index::Int, local_dof_count::Int, operators,
+                                               state::State{T}, increment::AbstractVector{T}, fixed,
+                                               blocked_rows, apply_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_input = view(local_scratch.input, 1:local_dof_count)
+  local_output = view(local_scratch.output, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  _gather_local_coefficients!(local_input, item, increment)
+  fill!(local_output, zero(T))
+  _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook)
+  _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
+  return nothing
+end
+
+@inline function _threaded_filtered_tangent_apply_item!(scratch::_ThreadedOperatorScratch{T},
+                                                        result::AbstractVector{T}, slot::Int, items,
+                                                        item_index::Int, local_dof_count::Int,
+                                                        operators, operator_indices,
+                                                        state::State{T},
+                                                        increment::AbstractVector{T}, fixed,
+                                                        blocked_rows,
+                                                        apply_hook) where {T<:AbstractFloat}
+  local_scratch, local_result = _threaded_buffers(scratch, result, slot)
+  local_input = view(local_scratch.input, 1:local_dof_count)
+  local_output = view(local_scratch.output, 1:local_dof_count)
+  item = @inbounds items[item_index]
+  _gather_local_coefficients!(local_input, item, increment)
+  fill!(local_output, zero(T))
+
+  for operator_index in operator_indices
+    wrapped = @inbounds operators[operator_index]
+    apply_hook(local_output, wrapped.operator, item, state, local_input)
+  end
+
+  _scatter_local_vector!(local_result, item, local_output, fixed, blocked_rows)
+  return nothing
+end
+
+function _rhs_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                    batches::Vector{_KernelBatch}, items, operators, fixed, blocked_rows,
+                    rhs_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_item_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_rhs_item!(scratch, result, slot, items, item_indices[batch_item_index],
+                            local_dof_count, operators, fixed, blocked_rows, rhs_hook)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_rhs_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                             batches::Vector{_FilteredKernelBatch}, faces, operators, fixed,
+                             blocked_rows) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_face_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_rhs_item!(scratch, result, slot, faces, item_indices[batch_face_index],
+                                     local_dof_count, operators, operator_indices, fixed,
+                                     blocked_rows, face_rhs!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _surface_rhs_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                            batches::Vector{_FilteredKernelBatch}, surfaces, operators, fixed,
+                            blocked_rows) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_surface_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_rhs_item!(scratch, result, slot, surfaces,
+                                     item_indices[batch_surface_index], local_dof_count, operators,
+                                     operator_indices, fixed, blocked_rows, surface_rhs!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _apply_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                      batches::Vector{_KernelBatch}, items, operators,
+                      coefficients::AbstractVector{T}, fixed, blocked_rows,
+                      apply_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_item_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_apply_item!(scratch, result, slot, items, item_indices[batch_item_index],
+                              local_dof_count, operators, coefficients, fixed, blocked_rows,
+                              apply_hook)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_apply_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                               batches::Vector{_FilteredKernelBatch}, faces, operators,
+                               coefficients::AbstractVector{T}, fixed,
+                               blocked_rows) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_face_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_apply_item!(scratch, result, slot, faces, item_indices[batch_face_index],
+                                       local_dof_count, operators, operator_indices, coefficients,
+                                       fixed, blocked_rows, face_apply!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _surface_apply_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                              batches::Vector{_FilteredKernelBatch}, surfaces, operators,
+                              coefficients::AbstractVector{T}, fixed,
+                              blocked_rows) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_surface_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_apply_item!(scratch, result, slot, surfaces,
+                                       item_indices[batch_surface_index], local_dof_count,
+                                       operators, operator_indices, coefficients, fixed,
+                                       blocked_rows, surface_apply!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _residual_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                         batches::Vector{_KernelBatch}, items, operators, state::State{T},
+                         fixed::BitVector, blocked_rows::BitVector,
+                         residual_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_item_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_residual_item!(scratch, result, slot, items, item_indices[batch_item_index],
+                                 local_dof_count, operators, state, fixed, blocked_rows,
+                                 residual_hook)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_residual_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                                  batches::Vector{_FilteredKernelBatch}, faces, operators,
+                                  state::State{T}, fixed::BitVector,
+                                  blocked_rows::BitVector) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_face_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_residual_item!(scratch, result, slot, faces,
+                                          item_indices[batch_face_index], local_dof_count,
+                                          operators, operator_indices, state, fixed, blocked_rows,
+                                          face_residual!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _surface_residual_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                                 batches::Vector{_FilteredKernelBatch}, surfaces, operators,
+                                 state::State{T}, fixed::BitVector,
+                                 blocked_rows::BitVector) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_surface_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_residual_item!(scratch, result, slot, surfaces,
+                                          item_indices[batch_surface_index], local_dof_count,
+                                          operators, operator_indices, state, fixed, blocked_rows,
+                                          surface_residual!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _tangent_apply_pass!(scratch::_ThreadedOperatorScratch{T}, result::AbstractVector{T},
+                              batches::Vector{_KernelBatch}, items, operators, state::State{T},
+                              increment::AbstractVector{T}, fixed::BitVector,
+                              blocked_rows::BitVector, apply_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_item_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_tangent_apply_item!(scratch, result, slot, items, item_indices[batch_item_index],
+                                      local_dof_count, operators, state, increment, fixed,
+                                      blocked_rows, apply_hook)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_tangent_apply_pass!(scratch::_ThreadedOperatorScratch{T},
+                                       result::AbstractVector{T},
+                                       batches::Vector{_FilteredKernelBatch}, faces, operators,
+                                       state::State{T}, increment::AbstractVector{T},
+                                       fixed::BitVector,
+                                       blocked_rows::BitVector) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_face_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_tangent_apply_item!(scratch, result, slot, faces,
+                                               item_indices[batch_face_index], local_dof_count,
+                                               operators, operator_indices, state, increment, fixed,
+                                               blocked_rows, face_tangent_apply!)
+      end
+    end
+  end
+
+  return nothing
+end
+
+function _surface_tangent_apply_pass!(scratch::_ThreadedOperatorScratch{T},
+                                      result::AbstractVector{T},
+                                      batches::Vector{_FilteredKernelBatch}, surfaces, operators,
+                                      state::State{T}, increment::AbstractVector{T},
+                                      fixed::BitVector,
+                                      blocked_rows::BitVector) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+  slot_count = _threaded_slot_count(scratch)
+
+  for kernel_batch in batches
+    item_indices = kernel_batch.item_indices
+    operator_indices = kernel_batch.operator_indices
+    local_dof_count = kernel_batch.local_dof_count
+
+    @_threaded_loop for slot in 1:slot_count
+      for batch_surface_index in _slot_range(length(item_indices), slot, slot_count)
+        _threaded_filtered_tangent_apply_item!(scratch, result, slot, surfaces,
+                                               item_indices[batch_surface_index], local_dof_count,
+                                               operators, operator_indices, state, increment, fixed,
+                                               blocked_rows, surface_tangent_apply!)
+      end
+    end
+  end
+
+  return nothing
+end
+
 function _rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                     batches::Vector{_KernelBatch}, items, operators, fixed, blocked_rows,
                     rhs_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_item_index in eachindex(batch.item_indices)
-      item = @inbounds items[batch.item_indices[batch_item_index]]
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_rhs, zero(T))
 
-      for operator in operators
-        rhs_hook(local_rhs, operator, item)
-      end
-
+      _rhs_operators!(local_rhs, operators, item, rhs_hook)
       _scatter_local_vector!(result, item, local_rhs, fixed, blocked_rows)
     end
   end
@@ -953,14 +1500,14 @@ function _boundary_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVecto
                              blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_face_index in eachindex(batch.item_indices)
-      face = @inbounds faces[batch.item_indices[batch_face_index]]
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
       fill!(local_rhs, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         face_rhs!(local_rhs, wrapped.operator, face)
       end
@@ -977,14 +1524,14 @@ function _surface_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector
                             blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_surface_index in eachindex(batch.item_indices)
-      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
       fill!(local_rhs, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         surface_rhs!(local_rhs, wrapped.operator, surface)
       end
@@ -1002,19 +1549,16 @@ function _apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                       apply_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_item_index in eachindex(batch.item_indices)
-      item = @inbounds items[batch.item_indices[batch_item_index]]
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       _gather_local_coefficients!(local_input, item, coefficients)
       fill!(local_output, zero(T))
 
-      for operator in operators
-        apply_hook(local_output, operator, item, local_input)
-      end
-
+      _apply_operators!(local_output, operators, item, local_input, apply_hook)
       _scatter_local_vector!(result, item, local_output, fixed, blocked_rows)
     end
   end
@@ -1028,16 +1572,16 @@ function _boundary_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVec
                                blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_face_index in eachindex(batch.item_indices)
-      face = @inbounds faces[batch.item_indices[batch_face_index]]
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
       _gather_local_coefficients!(local_input, face, coefficients)
       fill!(local_output, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         face_apply!(local_output, wrapped.operator, face, local_input)
       end
@@ -1055,16 +1599,16 @@ function _surface_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
                               blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_surface_index in eachindex(batch.item_indices)
-      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
       _gather_local_coefficients!(local_input, surface, coefficients)
       fill!(local_output, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         surface_apply!(local_output, wrapped.operator, surface, local_input)
       end
@@ -1081,17 +1625,14 @@ function _diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T}
                          diagonal_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
-  for batch in batches
-    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_diagonal = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_item_index in eachindex(batch.item_indices)
-      item = @inbounds items[batch.item_indices[batch_item_index]]
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_diagonal, zero(T))
 
-      for operator in operators
-        diagonal_hook(local_diagonal, operator, item)
-      end
-
+      _diagonal_operators!(local_diagonal, operators, item, diagonal_hook)
       _scatter_local_diagonal!(result, item, local_diagonal)
     end
   end
@@ -1104,14 +1645,14 @@ function _boundary_diagonal_pass!(scratch::_OperatorScratch{T}, result::Abstract
                                   operators) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_diagonal = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_face_index in eachindex(batch.item_indices)
-      face = @inbounds faces[batch.item_indices[batch_face_index]]
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
       fill!(local_diagonal, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         face_diagonal!(local_diagonal, wrapped.operator, face)
       end
@@ -1128,14 +1669,14 @@ function _surface_diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractV
                                  operators) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_diagonal = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_surface_index in eachindex(batch.item_indices)
-      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
       fill!(local_diagonal, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         surface_diagonal!(local_diagonal, wrapped.operator, surface)
       end
@@ -1153,17 +1694,14 @@ function _residual_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T}
                          residual_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_item_index in eachindex(batch.item_indices)
-      item = @inbounds items[batch.item_indices[batch_item_index]]
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       fill!(local_rhs, zero(T))
 
-      for operator in operators
-        residual_hook(local_rhs, operator, item, state)
-      end
-
+      _residual_operators!(local_rhs, operators, item, state, residual_hook)
       _scatter_local_vector!(result, item, local_rhs, fixed, blocked_rows)
     end
   end
@@ -1177,14 +1715,14 @@ function _boundary_residual_pass!(scratch::_OperatorScratch{T}, result::Abstract
                                   blocked_rows::BitVector) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_face_index in eachindex(batch.item_indices)
-      face = @inbounds faces[batch.item_indices[batch_face_index]]
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
       fill!(local_rhs, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         face_residual!(local_rhs, wrapped.operator, face, state)
       end
@@ -1202,14 +1740,14 @@ function _surface_residual_pass!(scratch::_OperatorScratch{T}, result::AbstractV
                                  blocked_rows::BitVector) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_rhs = view(scratch.rhs, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_rhs = view(scratch.rhs, 1:kernel_batch.local_dof_count)
 
-    for batch_surface_index in eachindex(batch.item_indices)
-      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
       fill!(local_rhs, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         surface_residual!(local_rhs, wrapped.operator, surface, state)
       end
@@ -1227,19 +1765,16 @@ function _tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
                               blocked_rows::BitVector, apply_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_item_index in eachindex(batch.item_indices)
-      item = @inbounds items[batch.item_indices[batch_item_index]]
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
       _gather_local_coefficients!(local_input, item, increment)
       fill!(local_output, zero(T))
 
-      for operator in operators
-        apply_hook(local_output, operator, item, state, local_input)
-      end
-
+      _tangent_apply_operators!(local_output, operators, item, state, local_input, apply_hook)
       _scatter_local_vector!(result, item, local_output, fixed, blocked_rows)
     end
   end
@@ -1254,16 +1789,16 @@ function _boundary_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::Abs
                                        blocked_rows::BitVector) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_face_index in eachindex(batch.item_indices)
-      face = @inbounds faces[batch.item_indices[batch_face_index]]
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
       _gather_local_coefficients!(local_input, face, increment)
       fill!(local_output, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         face_tangent_apply!(local_output, wrapped.operator, face, state, local_input)
       end
@@ -1282,16 +1817,16 @@ function _surface_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::Abst
                                       blocked_rows::BitVector) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
-  for batch in batches
-    local_input = view(scratch.input, 1:batch.local_dof_count)
-    local_output = view(scratch.output, 1:batch.local_dof_count)
+  for kernel_batch in batches
+    local_input = view(scratch.input, 1:kernel_batch.local_dof_count)
+    local_output = view(scratch.output, 1:kernel_batch.local_dof_count)
 
-    for batch_surface_index in eachindex(batch.item_indices)
-      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
       _gather_local_coefficients!(local_input, surface, increment)
       fill!(local_output, zero(T))
 
-      for operator_index in batch.operator_indices
+      for operator_index in kernel_batch.operator_indices
         wrapped = @inbounds operators[operator_index]
         surface_tangent_apply!(local_output, wrapped.operator, surface, state, local_input)
       end

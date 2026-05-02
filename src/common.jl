@@ -4,6 +4,29 @@
 # here avoids repeating the same defensive checks and tight inner-loop patterns
 # throughout topology, assembly, adaptivity, and post-processing code.
 
+macro _threaded_loop(expr)
+  # Polyester gives the low-overhead path we want on Linux. On Apple silicon,
+  # some user-kernel loops still hit Polyester's cfunction closure limitation,
+  # so we use Julia's static scheduler as a portable fallback there.
+  threaded_expr = @static if Sys.KERNEL === :Darwin && Sys.ARCH === :aarch64
+    quote
+      let
+        if Base.Threads.nthreads() == 1
+          $(expr)
+        else
+          Base.Threads.@threads :static $(expr)
+        end
+      end
+    end
+  else
+    quote
+      @batch per=thread $(expr)
+    end
+  end
+
+  return esc(threaded_expr)
+end
+
 # The checked-value helpers below normalize common integer preconditions at the
 # API boundary so the rest of the code can work with plain `Int` values and
 # assume non-negativity, positivity, or bounds validity without repeating the

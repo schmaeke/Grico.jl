@@ -378,6 +378,21 @@ repeating dot-product boilerplate.
   return sum(value[axis] * normal_value[axis] for axis in 1:D)
 end
 
+@inline normal_component(value::NTuple{1,<:Number}, normal_value::NTuple{1,<:Number}) = value[1] *
+                                                                                        normal_value[1]
+
+@inline normal_component(value::NTuple{2,<:Number}, normal_value::NTuple{2,<:Number}) = muladd(value[1],
+                                                                                               normal_value[1],
+                                                                                               value[2] *
+                                                                                               normal_value[2])
+
+@inline normal_component(value::NTuple{3,<:Number}, normal_value::NTuple{3,<:Number}) = muladd(value[1],
+                                                                                               normal_value[1],
+                                                                                               muladd(value[2],
+                                                                                                      normal_value[2],
+                                                                                                      value[3] *
+                                                                                                      normal_value[3]))
+
 function normal_component(value::NTuple{N,<:NTuple{D,<:Number}},
                           normal_value::NTuple{D,<:Number}) where {N,D}
   return ntuple(component -> normal_component(value[component], normal_value), N)
@@ -539,7 +554,7 @@ end
 
 # Resolve one field descriptor to the precomputed local basis tables and local-
 # to-global mapping data stored inside a cell/face/interface/surface item.
-function _field_values(values::_FieldEvaluationValues, field::AbstractField)
+@inline function _field_values(values::_FieldEvaluationValues, field::AbstractField)
   field_id = _field_id(field)
 
   for data in values.fields
@@ -636,7 +651,7 @@ This is the local analogue of [`field_dof_range`](@ref), but now
 for the flattened local vectors and matrices used during assembly on one cell,
 face, interface trace, or embedded surface.
 """
-function field_dof_range(values::_FieldEvaluationValues, field::AbstractField)
+@inline function field_dof_range(values::_FieldEvaluationValues, field::AbstractField)
   _field_values(values, field).block
 end
 
@@ -646,7 +661,7 @@ end
 Return the number of local degrees of freedom contributed by `field` on one
 compiled integration item.
 """
-function field_dof_count(values::_FieldEvaluationValues, field::AbstractField)
+@inline function field_dof_count(values::_FieldEvaluationValues, field::AbstractField)
   length(_field_values(values, field).block)
 end
 
@@ -659,7 +674,7 @@ integration item.
 For vector fields, this counts scalar modes per component, not the total field
 block size.
 """
-function local_mode_count(values::_FieldEvaluationValues, field::AbstractField)
+@inline function local_mode_count(values::_FieldEvaluationValues, field::AbstractField)
   _field_values(values, field).local_mode_count
 end
 
@@ -673,8 +688,8 @@ The returned index addresses the flattened local vector/matrix blocks used
 during assembly. Components are stored in component-major order, with one block
 of all local modes per field component.
 """
-function local_dof_index(values::_FieldEvaluationValues, field::AbstractField, component::Integer,
-                         mode_index::Integer)
+@inline function local_dof_index(values::_FieldEvaluationValues, field::AbstractField,
+                                 component::Integer, mode_index::Integer)
   data = _field_values(values, field)
   checked_component = _checked_field_component(data, component)
   checked_mode = _checked_field_mode(data, mode_index)
@@ -690,8 +705,8 @@ The shape functions are the compiled local basis functions after the
 space-compilation step has selected the active local tensor-product modes on the
 current cell or trace.
 """
-function shape_value(values::_FieldEvaluationValues, field::AbstractField, point_index::Integer,
-                     mode_index::Integer)
+@inline function shape_value(values::_FieldEvaluationValues, field::AbstractField,
+                             point_index::Integer, mode_index::Integer)
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   checked_mode = _checked_field_mode(data, mode_index)
@@ -706,7 +721,7 @@ Return the matrix of local shape-function values for `field`.
 The matrix entry `(i, q)` equals the value of the `i`-th active local mode at
 the `q`-th quadrature point.
 """
-function shape_values(values::_FieldEvaluationValues, field::AbstractField)
+@inline function shape_values(values::_FieldEvaluationValues, field::AbstractField)
   _field_values(values, field).values
 end
 
@@ -770,18 +785,18 @@ These helpers are intended for local assembly code. They translate from
 field-level semantics to the contiguous local block layout used by the compiled
 integration item.
 """
-function block(buffer::AbstractVector, values::_FieldEvaluationValues, field::AbstractField)
+@inline function block(buffer::AbstractVector, values::_FieldEvaluationValues, field::AbstractField)
   return view(buffer, field_dof_range(values, field))
 end
 
-function block(buffer::AbstractMatrix, values::_FieldEvaluationValues, test_field::AbstractField,
-               trial_field::AbstractField)
+@inline function block(buffer::AbstractMatrix, values::_FieldEvaluationValues,
+                       test_field::AbstractField, trial_field::AbstractField)
   return view(buffer, field_dof_range(values, test_field), field_dof_range(values, trial_field))
 end
 
-function block(buffer::AbstractMatrix, test_values::_FieldEvaluationValues,
-               test_field::AbstractField, trial_values::_FieldEvaluationValues,
-               trial_field::AbstractField)
+@inline function block(buffer::AbstractMatrix, test_values::_FieldEvaluationValues,
+                       test_field::AbstractField, trial_values::_FieldEvaluationValues,
+                       trial_field::AbstractField)
   return view(buffer, field_dof_range(test_values, test_field),
               field_dof_range(trial_values, trial_field))
 end
@@ -806,8 +821,8 @@ amplitudes induced by the global coefficient vector. Those amplitudes already
 include whatever space compilation has done: continuity substitutions on CG
 axes and direct leaf-local dofs on DG axes.
 """
-function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
-               point_index::Integer) where {T<:AbstractFloat}
+@inline function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
+                       point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   return _field_value(data, coefficients(state), checked_point)
@@ -817,8 +832,8 @@ end
 # the local amplitudes induced by the global state coefficients. The amplitude
 # lookup accounts for constrained modes whose local basis function expands into
 # several global scalar dofs.
-function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
-               component::Integer, point_index::Integer) where {T<:AbstractFloat}
+@inline function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
+                       component::Integer, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
@@ -836,16 +851,16 @@ operator kernel.
 same numbering passed to `cell_apply!`, `face_apply!`, `interface_apply!`, and
 `surface_apply!`.
 """
-function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
-               field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
+@inline function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+                       field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_point = _checked_point_index(values, point_index)
   return _local_field_value(data, local_coefficients, checked_point)
 end
 
-function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
-               field::AbstractField, component::Integer,
-               point_index::Integer) where {T<:AbstractFloat}
+@inline function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+                       field::AbstractField, component::Integer,
+                       point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
@@ -992,6 +1007,60 @@ end
                 Val(C))
 end
 
+@inline function _local_field_gradient(data::_FieldValues{1,T},
+                                       local_coefficients::AbstractVector{T}, component::Int,
+                                       point_index::Int) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  result1 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+  end
+
+  return (result1,)
+end
+
+@inline function _local_field_gradient(data::_FieldValues{2,T},
+                                       local_coefficients::AbstractVector{T}, component::Int,
+                                       point_index::Int) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  result1 = zero(T)
+  result2 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+    result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
+  end
+
+  return (result1, result2)
+end
+
+@inline function _local_field_gradient(data::_FieldValues{3,T},
+                                       local_coefficients::AbstractVector{T}, component::Int,
+                                       point_index::Int) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  result1 = zero(T)
+  result2 = zero(T)
+  result3 = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    result1 = muladd(gradients[1, mode_index, point_index], amplitude, result1)
+    result2 = muladd(gradients[2, mode_index, point_index], amplitude, result2)
+    result3 = muladd(gradients[3, mode_index, point_index], amplitude, result3)
+  end
+
+  return (result1, result2, result3)
+end
+
 """
     normal_gradient(values, state, field, point_index)
 
@@ -1054,6 +1123,69 @@ end
                                                                                 C}
   return ntuple(component -> _local_field_normal_gradient(data, local_coefficients, component,
                                                           point_index, normal_value), Val(C))
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{1,T},
+                                              local_coefficients::AbstractVector{T}, component::Int,
+                                              point_index::Int,
+                                              normal_value::NTuple{1,T}) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  normal1 = normal_value[1]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    directional = gradients[1, mode_index, point_index] * normal1
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{2,T},
+                                              local_coefficients::AbstractVector{T}, component::Int,
+                                              point_index::Int,
+                                              normal_value::NTuple{2,T}) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  normal1 = normal_value[1]
+  normal2 = normal_value[2]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    directional = muladd(gradients[1, mode_index, point_index], normal1,
+                         gradients[2, mode_index, point_index] * normal2)
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
+end
+
+@inline function _local_field_normal_gradient(data::_FieldValues{3,T},
+                                              local_coefficients::AbstractVector{T}, component::Int,
+                                              point_index::Int,
+                                              normal_value::NTuple{3,T}) where {T<:AbstractFloat}
+  gradients = data.gradients
+  offset = first(data.block) + _field_component_offset(data, component) - 1
+  normal1 = normal_value[1]
+  normal2 = normal_value[2]
+  normal3 = normal_value[3]
+  result = zero(T)
+
+  @inbounds for mode_index in 1:data.local_mode_count
+    amplitude = local_coefficients[offset+mode_index]
+    amplitude == zero(T) && continue
+    directional = muladd(gradients[1, mode_index, point_index], normal1,
+                         muladd(gradients[2, mode_index, point_index], normal2,
+                                gradients[3, mode_index, point_index] * normal3))
+    result = muladd(directional, amplitude, result)
+  end
+
+  return result
 end
 
 # Low-level gradient evaluator shared by the scalar and vector-field interfaces.
@@ -1155,13 +1287,13 @@ end
                                        point_index::Int) where {D,T<:AbstractFloat}
   gradients = data.gradients
   offset = first(data.block) + _field_component_offset(data, component) - 1
-  result = ntuple(_ -> zero(T), D)
+  result = ntuple(_ -> zero(T), Val(D))
 
   @inbounds for mode_index in 1:data.local_mode_count
     amplitude = local_coefficients[offset+mode_index]
     amplitude == zero(T) && continue
     result = ntuple(axis -> muladd(gradients[axis, mode_index, point_index], amplitude,
-                                   result[axis]), D)
+                                   result[axis]), Val(D))
   end
 
   return result
