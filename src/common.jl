@@ -42,8 +42,7 @@ function _require_length(buffer::AbstractVector, length_required::Int, name::Abs
 end
 
 function _require_square_matrix(matrix_data::AbstractMatrix, name::AbstractString)
-  size(matrix_data, 1) == size(matrix_data, 2) ||
-    throw(ArgumentError("$name must be square"))
+  size(matrix_data, 1) == size(matrix_data, 2) || throw(ArgumentError("$name must be square"))
   return size(matrix_data, 1)
 end
 
@@ -73,8 +72,10 @@ function _dense_lu_factor!(matrix_data::AbstractMatrix{T},
 
     if pivot_row != column
       for swap_column in 1:n
-        @inbounds matrix_data[column, swap_column], matrix_data[pivot_row, swap_column] =
-          matrix_data[pivot_row, swap_column], matrix_data[column, swap_column]
+        @inbounds matrix_data[column, swap_column], matrix_data[pivot_row, swap_column] = matrix_data[pivot_row,
+                                                                                                      swap_column],
+                                                                                          matrix_data[column,
+                                                                                                      swap_column]
       end
     end
 
@@ -85,8 +86,8 @@ function _dense_lu_factor!(matrix_data::AbstractMatrix{T},
       multiplier = @inbounds matrix_data[row, column]
 
       for trailing_column in (column+1):n
-        @inbounds matrix_data[row, trailing_column] -=
-          multiplier * matrix_data[column, trailing_column]
+        @inbounds matrix_data[row, trailing_column] -= multiplier *
+                                                       matrix_data[column, trailing_column]
       end
     end
   end
@@ -118,8 +119,8 @@ function _apply_lu_pivots!(rhs_data::AbstractMatrix{T}, pivots::AbstractVector{I
     pivot_row == row && continue
 
     for column in axes(rhs_data, 2)
-      @inbounds rhs_data[row, column], rhs_data[pivot_row, column] =
-        rhs_data[pivot_row, column], rhs_data[row, column]
+      @inbounds rhs_data[row, column], rhs_data[pivot_row, column] = rhs_data[pivot_row, column],
+                                                                     rhs_data[row, column]
     end
   end
 

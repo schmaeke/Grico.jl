@@ -3,7 +3,7 @@ using Printf
 using Grico
 using WriteVTK
 import OrdinaryDiffEq
-import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_residual!,
+import Grico: cell_apply!, cell_diagonal!, cell_residual!, cell_rhs!, face_residual!,
               interface_residual!
 
 # This example solves the compressible Euler equations
@@ -30,7 +30,7 @@ import Grico: cell_matrix!, cell_residual!, cell_rhs!, cell_tangent!, face_resid
 # - `driver.jl` loads the example environment and runs the time loop.
 # - `parameters.jl` selects physical, DG, adaptivity, and output parameters.
 # - `euler_physics.jl` defines conservative-variable helpers and the smooth blast profile.
-# - `projection.jl` assembles the DG mass matrix and projects the initial state.
+# - `projection.jl` applies the DG mass operator and projects the initial state.
 # - `dg_residual.jl` defines the semidiscrete volume, interface, and wall residuals.
 # - `runtime_context.jl` builds timestep estimates, mass inverses, contexts, adaptation, and ODE helpers.
 # - `output.jl` creates history entries, VTK data, and compact terminal summaries.

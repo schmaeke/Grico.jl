@@ -10,6 +10,12 @@
 
 # Matrix-free plan structure.
 
+# Algebraic map between the full field-layout coefficient vector and the reduced
+# vector seen by linear solves. The packed rows store
+#
+#   u_full = shift + P u_reduced,
+#
+# and the same coefficients are used for the adjoint projection `P' r_full`.
 struct _ReducedOperatorMap{T<:AbstractFloat}
   full_dof_count::Int
   solve_dofs::Vector{Int}
@@ -20,17 +26,20 @@ struct _ReducedOperatorMap{T<:AbstractFloat}
   row_coefficients::Vector{T}
 end
 
+# Plan-local runtime structure. `K` records whether the plan was compiled from
+# an affine or residual problem, and `reduced_map` stores the shared constraint
+# elimination map used by both solve paths.
 struct _MatrixFreeAssemblyStructure{K,T<:AbstractFloat,M}
   reduced_map::M
 end
 
 function _compile_assembly_structure(::Val{K}, layout, cell_operators, boundary_operators,
-                                     interface_operators, surface_operators, integration,
-                                     dirichlet, mean_constraints, constraint_masks) where {K}
+                                     interface_operators, surface_operators, integration, dirichlet,
+                                     mean_constraints, constraint_masks) where {K}
   T = eltype(origin(field_space(layout.slots[1].field)))
   reduced_map = (K === :affine || K === :residual) ?
-                _compile_reduced_operator_map(T, dof_count(layout), dirichlet,
-                                              mean_constraints, constraint_masks) : nothing
+                _compile_reduced_operator_map(T, dof_count(layout), dirichlet, mean_constraints,
+                                              constraint_masks) : nothing
   return _MatrixFreeAssemblyStructure{K,T,typeof(reduced_map)}(reduced_map)
 end
 
@@ -45,9 +54,7 @@ function _require_matrix_free_kind(plan::AssemblyPlan, expected::Symbol)
   return nothing
 end
 
-@inline function _reduced_map(plan::AssemblyPlan)
-  return plan.assembly_structure.reduced_map
-end
+@inline _reduced_map(plan::AssemblyPlan) = plan.assembly_structure.reduced_map
 
 reduced_dof_count(plan::AssemblyPlan) = length(_reduced_map(plan).solve_dofs)
 reduced_dof_count(map::_ReducedOperatorMap) = length(map.solve_dofs)
@@ -63,14 +70,13 @@ mutable struct _ReducedExpansion{T<:AbstractFloat}
   reduced::Dict{Int,T}
 end
 
-_BaseConstraintExpansion(::Type{T}) where {T<:AbstractFloat} =
+function _BaseConstraintExpansion(::Type{T}) where {T<:AbstractFloat}
   _BaseConstraintExpansion(zero(T), Dict{Int,T}(), Dict{Int,T}())
+end
 
-_ReducedExpansion(::Type{T}) where {T<:AbstractFloat} =
-  _ReducedExpansion(zero(T), Dict{Int,T}())
+_ReducedExpansion(::Type{T}) where {T<:AbstractFloat} = _ReducedExpansion(zero(T), Dict{Int,T}())
 
-@inline function _accumulate!(target::Dict{Int,T}, index::Int,
-                              value::T) where {T<:AbstractFloat}
+@inline function _accumulate!(target::Dict{Int,T}, index::Int, value::T) where {T<:AbstractFloat}
   iszero(value) && return target
   target[index] = get(target, index, zero(T)) + value
   return target
@@ -92,8 +98,7 @@ function _add_scaled_expansion!(target::_BaseConstraintExpansion{T},
   return target
 end
 
-function _add_scaled_expansion!(target::_ReducedExpansion{T},
-                                source::_ReducedExpansion{T},
+function _add_scaled_expansion!(target::_ReducedExpansion{T}, source::_ReducedExpansion{T},
                                 scale::T) where {T<:AbstractFloat}
   target.shift += scale * source.shift
 
@@ -104,8 +109,7 @@ function _add_scaled_expansion!(target::_ReducedExpansion{T},
   return target
 end
 
-function _compile_reduced_operator_map(::Type{T}, ndofs::Int,
-                                       dirichlet::_CompiledDirichlet{T},
+function _compile_reduced_operator_map(::Type{T}, ndofs::Int, dirichlet::_CompiledDirichlet{T},
                                        mean_constraints::Vector{_CompiledLinearConstraint{T}},
                                        masks::_ConstraintMasks{T}) where {T<:AbstractFloat}
   constrained = masks.fixed .| masks.eliminated .| masks.constraint_rows
@@ -135,18 +139,16 @@ function _compile_reduced_operator_map(::Type{T}, ndofs::Int,
 
   base_cache = Vector{Union{Nothing,_BaseConstraintExpansion{T}}}(nothing, ndofs)
   visiting = falses(ndofs)
-  base_expansion = dof -> _base_constraint_expansion!(base_cache, visiting, dof,
-                                                      reduced_index, masks.fixed,
-                                                      masks.fixed_values, mean_index,
+  base_expansion = dof -> _base_constraint_expansion!(base_cache, visiting, dof, reduced_index,
+                                                      masks.fixed, masks.fixed_values, mean_index,
                                                       dirichlet_rows, T)
   mean_shift, mean_reduced = _compile_mean_expansions(T, mean_constraints, mean_pivots,
                                                       base_expansion)
   final_cache = Vector{Union{Nothing,_ReducedExpansion{T}}}(nothing, ndofs)
   final_visiting = falses(ndofs)
   final_expansion = dof -> _final_reduced_expansion!(final_cache, final_visiting, dof,
-                                                     reduced_index, masks.fixed,
-                                                     masks.fixed_values, mean_index,
-                                                     mean_shift, mean_reduced,
+                                                     reduced_index, masks.fixed, masks.fixed_values,
+                                                     mean_index, mean_shift, mean_reduced,
                                                      dirichlet_rows, T)
   return _pack_reduced_operator_map(T, ndofs, solve_dofs, reduced_index, final_expansion)
 end
@@ -186,10 +188,8 @@ function _base_constraint_expansion!(cache, visiting::BitVector, dof::Int,
   return expansion
 end
 
-function _compile_mean_expansions(::Type{T},
-                                  mean_constraints::Vector{_CompiledLinearConstraint{T}},
-                                  mean_pivots::Vector{Int},
-                                  base_expansion) where {T<:AbstractFloat}
+function _compile_mean_expansions(::Type{T}, mean_constraints::Vector{_CompiledLinearConstraint{T}},
+                                  mean_pivots::Vector{Int}, base_expansion) where {T<:AbstractFloat}
   mean_count = length(mean_constraints)
   mean_shift = zeros(T, mean_count)
   mean_reduced = [Dict{Int,T}() for _ in 1:mean_count]
@@ -238,10 +238,9 @@ function _compile_mean_expansions(::Type{T},
   return mean_shift, mean_reduced
 end
 
-function _final_reduced_expansion!(cache, visiting::BitVector, dof::Int,
-                                   reduced_index::Vector{Int}, fixed::BitVector,
-                                   fixed_values::Vector{T}, mean_index::Vector{Int},
-                                   mean_shift::Vector{T}, mean_reduced,
+function _final_reduced_expansion!(cache, visiting::BitVector, dof::Int, reduced_index::Vector{Int},
+                                   fixed::BitVector, fixed_values::Vector{T},
+                                   mean_index::Vector{Int}, mean_shift::Vector{T}, mean_reduced,
                                    dirichlet_rows, ::Type{T}) where {T<:AbstractFloat}
   cached = cache[dof]
   cached === nothing || return cached
@@ -265,9 +264,9 @@ function _final_reduced_expansion!(cache, visiting::BitVector, dof::Int,
     expansion.shift = row.rhs
 
     for index in eachindex(row.indices)
-      source = _final_reduced_expansion!(cache, visiting, row.indices[index], reduced_index,
-                                         fixed, fixed_values, mean_index, mean_shift,
-                                         mean_reduced, dirichlet_rows, T)
+      source = _final_reduced_expansion!(cache, visiting, row.indices[index], reduced_index, fixed,
+                                         fixed_values, mean_index, mean_shift, mean_reduced,
+                                         dirichlet_rows, T)
       _add_scaled_expansion!(expansion, source, row.coefficients[index])
     end
 
@@ -405,16 +404,14 @@ function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}) where {D,T<:Ab
   fill!(result, zero(T))
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
-  _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
-             plan.cell_operators, masks.fixed, masks.blocked_rows, cell_rhs!)
-  _boundary_rhs_pass!(scratch, result, traversal.boundary_batches,
-                      plan.integration.boundary_faces, plan.boundary_operators, masks.fixed,
-                      masks.blocked_rows)
+  _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
+             masks.fixed, masks.blocked_rows, cell_rhs!)
+  _boundary_rhs_pass!(scratch, result, traversal.boundary_batches, plan.integration.boundary_faces,
+                      plan.boundary_operators, masks.fixed, masks.blocked_rows)
   _rhs_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
              plan.interface_operators, masks.fixed, masks.blocked_rows, interface_rhs!)
-  _surface_rhs_pass!(scratch, result, traversal.surface_batches,
-                     plan.integration.embedded_surfaces, plan.surface_operators, masks.fixed,
-                     masks.blocked_rows)
+  _surface_rhs_pass!(scratch, result, traversal.surface_batches, plan.integration.embedded_surfaces,
+                     plan.surface_operators, masks.fixed, masks.blocked_rows)
   _write_constraint_rhs!(result, plan)
   return result
 end
@@ -448,8 +445,8 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   fill!(result, zero(T))
   traversal = plan.traversal_plan
   masks = plan.constraint_masks
-  _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
-               plan.cell_operators, coefficients, masks.fixed, masks.blocked_rows, cell_apply!)
+  _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
+               coefficients, masks.fixed, masks.blocked_rows, cell_apply!)
   _boundary_apply_pass!(scratch, result, traversal.boundary_batches,
                         plan.integration.boundary_faces, plan.boundary_operators, coefficients,
                         masks.fixed, masks.blocked_rows)
@@ -463,17 +460,22 @@ function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return result
 end
 
-mutable struct _ReducedOperatorWorkspace{T<:AbstractFloat}
+# Reusable storage for reduced operator applications. `state` wraps
+# `full_state`, so updating the vector in place immediately updates the state
+# object passed to residual and tangent kernels without allocating a fresh
+# wrapper on every Newton step.
+mutable struct _ReducedOperatorWorkspace{T<:AbstractFloat,S<:State{T}}
   scratch::_OperatorScratch{T}
   full_input::Vector{T}
   full_output::Vector{T}
   full_state::Vector{T}
+  state::S
 end
 
 function _ReducedOperatorWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
-  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration),
-                                   zeros(T, dof_count(plan)), zeros(T, dof_count(plan)),
-                                   zeros(T, dof_count(plan)))
+  full_state = zeros(T, dof_count(plan))
+  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration), zeros(T, dof_count(plan)),
+                                   zeros(T, dof_count(plan)), full_state, State(plan, full_state))
 end
 
 function _rhs_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
@@ -482,16 +484,14 @@ function _rhs_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _require_length(result, dof_count(plan), "result")
   fill!(result, zero(T))
   traversal = plan.traversal_plan
-  _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
-             plan.cell_operators, nothing, nothing, cell_rhs!)
-  _boundary_rhs_pass!(scratch, result, traversal.boundary_batches,
-                      plan.integration.boundary_faces, plan.boundary_operators, nothing,
-                      nothing)
+  _rhs_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
+             nothing, nothing, cell_rhs!)
+  _boundary_rhs_pass!(scratch, result, traversal.boundary_batches, plan.integration.boundary_faces,
+                      plan.boundary_operators, nothing, nothing)
   _rhs_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
              plan.interface_operators, nothing, nothing, interface_rhs!)
-  _surface_rhs_pass!(scratch, result, traversal.surface_batches,
-                     plan.integration.embedded_surfaces, plan.surface_operators, nothing,
-                     nothing)
+  _surface_rhs_pass!(scratch, result, traversal.surface_batches, plan.integration.embedded_surfaces,
+                     plan.surface_operators, nothing, nothing)
   return result
 end
 
@@ -503,8 +503,8 @@ function _apply_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   _require_length(coefficients, dof_count(plan), "coefficient vector")
   fill!(result, zero(T))
   traversal = plan.traversal_plan
-  _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
-               plan.cell_operators, coefficients, nothing, nothing, cell_apply!)
+  _apply_pass!(scratch, result, traversal.cell_batches, plan.integration.cells, plan.cell_operators,
+               coefficients, nothing, nothing, cell_apply!)
   _boundary_apply_pass!(scratch, result, traversal.boundary_batches,
                         plan.integration.boundary_faces, plan.boundary_operators, coefficients,
                         nothing, nothing)
@@ -548,8 +548,7 @@ function _reduced_diagonal!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return true
 end
 
-function _copy_direct_reduced_diagonal!(result::AbstractVector{T},
-                                        map::_ReducedOperatorMap{T},
+function _copy_direct_reduced_diagonal!(result::AbstractVector{T}, map::_ReducedOperatorMap{T},
                                         physical_diagonal::AbstractVector{T}) where {T<:AbstractFloat}
   _require_length(result, reduced_dof_count(map), "reduced diagonal")
   _require_length(physical_diagonal, map.full_dof_count, "physical diagonal")
@@ -561,12 +560,9 @@ function _copy_direct_reduced_diagonal!(result::AbstractVector{T},
   return result
 end
 
-function _can_use_local_diagonal_kernels(plan::AssemblyPlan{D,T},
-                                         scratch::_OperatorScratch{T},
+function _can_use_local_diagonal_kernels(plan::AssemblyPlan{D,T}, scratch::_OperatorScratch{T},
                                          map::_ReducedOperatorMap{T}) where {D,T<:AbstractFloat}
-  return _has_direct_reduced_map(map) &&
-         _items_have_direct_diagonal_maps(plan) &&
-         _diagonal_kernels_available(plan, scratch)
+  return _has_direct_reduced_map(map) && _diagonal_kernel_requirements_satisfied(plan, scratch)
 end
 
 function _has_direct_reduced_map(map::_ReducedOperatorMap{T}) where {T<:AbstractFloat}
@@ -583,21 +579,6 @@ function _has_direct_reduced_map(map::_ReducedOperatorMap{T}) where {T<:Abstract
     elseif first_term <= last_term
       return false
     end
-  end
-
-  return true
-end
-
-function _items_have_direct_diagonal_maps(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
-  return _items_have_direct_diagonal_maps(plan.integration.cells, T) &&
-         _items_have_direct_diagonal_maps(plan.integration.boundary_faces, T) &&
-         _items_have_direct_diagonal_maps(plan.integration.interfaces, T) &&
-         _items_have_direct_diagonal_maps(plan.integration.embedded_surfaces, T)
-end
-
-function _items_have_direct_diagonal_maps(items, ::Type{T}) where {T<:AbstractFloat}
-  for item in items
-    _item_has_direct_diagonal_map(item, T) || return false
   end
 
   return true
@@ -622,34 +603,37 @@ function _item_has_direct_diagonal_map(item::_AssemblyValues, ::Type{T}) where {
   return true
 end
 
-function _diagonal_kernels_available(plan::AssemblyPlan, scratch::_OperatorScratch)
+# The diagonal scatter is only correct when every local dof maps directly to one
+# global dof. Check that condition only for batches whose operators actually
+# implement an affine action; pure right-hand-side operators do not affect the
+# operator diagonal and should not disable Jacobi data for unrelated cells.
+function _diagonal_kernel_requirements_satisfied(plan::AssemblyPlan, scratch::_OperatorScratch)
   traversal = plan.traversal_plan
-  return _diagonal_kernels_available(scratch, traversal.cell_batches, plan.integration.cells,
-                                     plan.cell_operators, cell_apply!, cell_diagonal!,
-                                     _DEFAULT_CELL_APPLY_METHOD,
-                                     _DEFAULT_CELL_DIAGONAL_METHOD) &&
-         _filtered_diagonal_kernels_available(scratch, traversal.boundary_batches,
-                                              plan.integration.boundary_faces,
-                                              plan.boundary_operators, face_apply!,
-                                              face_diagonal!, _DEFAULT_FACE_APPLY_METHOD,
-                                              _DEFAULT_FACE_DIAGONAL_METHOD) &&
-         _diagonal_kernels_available(scratch, traversal.interface_batches,
-                                     plan.integration.interfaces, plan.interface_operators,
-                                     interface_apply!, interface_diagonal!,
-                                     _DEFAULT_INTERFACE_APPLY_METHOD,
-                                     _DEFAULT_INTERFACE_DIAGONAL_METHOD) &&
-         _filtered_diagonal_kernels_available(scratch, traversal.surface_batches,
-                                              plan.integration.embedded_surfaces,
-                                              plan.surface_operators, surface_apply!,
-                                              surface_diagonal!,
-                                              _DEFAULT_SURFACE_APPLY_METHOD,
-                                              _DEFAULT_SURFACE_DIAGONAL_METHOD)
+  return _diagonal_requirements_satisfied(scratch, traversal.cell_batches, plan.integration.cells,
+                                          plan.cell_operators, cell_apply!, cell_diagonal!,
+                                          _DEFAULT_CELL_APPLY_METHOD,
+                                          _DEFAULT_CELL_DIAGONAL_METHOD) &&
+         _filtered_diagonal_requirements_satisfied(scratch, traversal.boundary_batches,
+                                                   plan.integration.boundary_faces,
+                                                   plan.boundary_operators, face_apply!,
+                                                   face_diagonal!, _DEFAULT_FACE_APPLY_METHOD,
+                                                   _DEFAULT_FACE_DIAGONAL_METHOD) &&
+         _diagonal_requirements_satisfied(scratch, traversal.interface_batches,
+                                          plan.integration.interfaces, plan.interface_operators,
+                                          interface_apply!, interface_diagonal!,
+                                          _DEFAULT_INTERFACE_APPLY_METHOD,
+                                          _DEFAULT_INTERFACE_DIAGONAL_METHOD) &&
+         _filtered_diagonal_requirements_satisfied(scratch, traversal.surface_batches,
+                                                   plan.integration.embedded_surfaces,
+                                                   plan.surface_operators, surface_apply!,
+                                                   surface_diagonal!, _DEFAULT_SURFACE_APPLY_METHOD,
+                                                   _DEFAULT_SURFACE_DIAGONAL_METHOD)
 end
 
-function _diagonal_kernels_available(scratch::_OperatorScratch{T},
-                                     batches::Vector{_KernelBatch}, items, operators,
-                                     apply_hook, diagonal_hook, default_apply_method,
-                                     default_diagonal_method) where {T<:AbstractFloat}
+function _diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
+                                          batches::Vector{_KernelBatch}, items, operators,
+                                          apply_hook, diagonal_hook, default_apply_method,
+                                          default_diagonal_method) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return true
 
   for batch in batches
@@ -658,22 +642,32 @@ function _diagonal_kernels_available(scratch::_OperatorScratch{T},
     local_output = view(scratch.output, 1:batch.local_dof_count)
     local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
 
+    has_action = false
+
     for operator in operators
       _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
                            local_input) && continue
+      has_action = true
       _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
                            item) && return false
+    end
+
+    has_action || continue
+
+    for item_index in batch.item_indices
+      item = @inbounds items[item_index]
+      _item_has_direct_diagonal_map(item, T) || return false
     end
   end
 
   return true
 end
 
-function _filtered_diagonal_kernels_available(scratch::_OperatorScratch{T},
-                                              batches::Vector{_FilteredKernelBatch}, items,
-                                              operators, apply_hook, diagonal_hook,
-                                              default_apply_method,
-                                              default_diagonal_method) where {T<:AbstractFloat}
+function _filtered_diagonal_requirements_satisfied(scratch::_OperatorScratch{T},
+                                                   batches::Vector{_FilteredKernelBatch}, items,
+                                                   operators, apply_hook, diagonal_hook,
+                                                   default_apply_method,
+                                                   default_diagonal_method) where {T<:AbstractFloat}
   isempty(batches) && return true
 
   for batch in batches
@@ -682,13 +676,23 @@ function _filtered_diagonal_kernels_available(scratch::_OperatorScratch{T},
     local_output = view(scratch.output, 1:batch.local_dof_count)
     local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
 
+    has_action = false
+
     for operator_index in batch.operator_indices
       wrapped = @inbounds operators[operator_index]
       operator = wrapped.operator
       _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
                            local_input) && continue
+      has_action = true
       _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
                            item) && return false
+    end
+
+    has_action || continue
+
+    for item_index in batch.item_indices
+      item = @inbounds items[item_index]
+      _item_has_direct_diagonal_map(item, T) || return false
     end
   end
 
@@ -786,15 +790,13 @@ end
 function _reduced_residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                             reduced_coefficients::AbstractVector{T},
                             workspace::_ReducedOperatorWorkspace{T},
-                            residual_workspace::ResidualWorkspace{T}) where {D,
-                                                                              T<:AbstractFloat}
+                            residual_workspace::ResidualWorkspace{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
   map = _reduced_map(plan)
   _require_length(result, reduced_dof_count(map), "reduced residual")
   _require_length(reduced_coefficients, reduced_dof_count(map), "reduced state")
   _expand_reduced!(workspace.full_state, map, reduced_coefficients; include_shift=true)
-  state = State(plan, workspace.full_state)
-  residual!(workspace.full_output, plan, state, residual_workspace)
+  residual!(workspace.full_output, plan, workspace.state, residual_workspace)
   _project_reduced!(result, map, workspace.full_output)
   return result
 end
@@ -803,21 +805,21 @@ function _reduced_tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D
                                  reduced_increment::AbstractVector{T},
                                  workspace::_ReducedOperatorWorkspace{T},
                                  residual_workspace::ResidualWorkspace{T}) where {D,
-                                                                                   T<:AbstractFloat}
+                                                                                  T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
   map = _reduced_map(plan)
   _require_length(result, reduced_dof_count(map), "reduced tangent result")
   _require_length(reduced_increment, reduced_dof_count(map), "reduced increment")
   _expand_reduced!(workspace.full_input, map, reduced_increment; include_shift=false)
-  state = State(plan, workspace.full_state)
-  tangent_apply!(workspace.full_output, plan, state, workspace.full_input, residual_workspace)
+  tangent_apply!(workspace.full_output, plan, workspace.state, workspace.full_input,
+                 residual_workspace)
   _project_reduced!(result, map, workspace.full_output)
   return result
 end
 
 function _reconstruct_reduced_solution!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                                         reduced_solution::AbstractVector{T}) where {D,
-                                                                                   T<:AbstractFloat}
+                                                                                    T<:AbstractFloat}
   map = _reduced_map(plan)
   return _expand_reduced!(result, map, reduced_solution; include_shift=true)
 end
@@ -911,9 +913,9 @@ function tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, stat
   _boundary_tangent_apply_pass!(scratch, result, traversal.boundary_batches,
                                 plan.integration.boundary_faces, plan.boundary_operators, state,
                                 increment, masks.fixed, masks.blocked_rows)
-  _tangent_apply_pass!(scratch, result, traversal.interface_batches,
-                       plan.integration.interfaces, plan.interface_operators, state, increment,
-                       masks.fixed, masks.blocked_rows, interface_tangent_apply!)
+  _tangent_apply_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
+                       plan.interface_operators, state, increment, masks.fixed, masks.blocked_rows,
+                       interface_tangent_apply!)
   _surface_tangent_apply_pass!(scratch, result, traversal.surface_batches,
                                plan.integration.embedded_surfaces, plan.surface_operators, state,
                                increment, masks.fixed, masks.blocked_rows)
@@ -924,8 +926,8 @@ end
 # Local traversal helpers.
 
 function _rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                    batches::Vector{_KernelBatch}, items, operators, fixed,
-                    blocked_rows, rhs_hook) where {T<:AbstractFloat}
+                    batches::Vector{_KernelBatch}, items, operators, fixed, blocked_rows,
+                    rhs_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
@@ -947,8 +949,8 @@ function _rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
 end
 
 function _boundary_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                             batches::Vector{_FilteredKernelBatch}, faces, operators,
-                             fixed, blocked_rows) where {T<:AbstractFloat}
+                             batches::Vector{_FilteredKernelBatch}, faces, operators, fixed,
+                             blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -971,8 +973,8 @@ function _boundary_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVecto
 end
 
 function _surface_rhs_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                            batches::Vector{_FilteredKernelBatch}, surfaces, operators,
-                            fixed, blocked_rows) where {T<:AbstractFloat}
+                            batches::Vector{_FilteredKernelBatch}, surfaces, operators, fixed,
+                            blocked_rows) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for batch in batches
@@ -1220,10 +1222,9 @@ function _surface_residual_pass!(scratch::_OperatorScratch{T}, result::AbstractV
 end
 
 function _tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                              batches::Vector{_KernelBatch}, items, operators,
-                              state::State{T}, increment::AbstractVector{T},
-                              fixed::BitVector, blocked_rows::BitVector,
-                              apply_hook) where {T<:AbstractFloat}
+                              batches::Vector{_KernelBatch}, items, operators, state::State{T},
+                              increment::AbstractVector{T}, fixed::BitVector,
+                              blocked_rows::BitVector, apply_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for batch in batches
@@ -1246,8 +1247,7 @@ function _tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
   return nothing
 end
 
-function _boundary_tangent_apply_pass!(scratch::_OperatorScratch{T},
-                                       result::AbstractVector{T},
+function _boundary_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                                        batches::Vector{_FilteredKernelBatch}, faces, operators,
                                        state::State{T}, increment::AbstractVector{T},
                                        fixed::BitVector,
@@ -1276,9 +1276,9 @@ function _boundary_tangent_apply_pass!(scratch::_OperatorScratch{T},
 end
 
 function _surface_tangent_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
-                                      batches::Vector{_FilteredKernelBatch}, surfaces,
-                                      operators, state::State{T},
-                                      increment::AbstractVector{T}, fixed::BitVector,
+                                      batches::Vector{_FilteredKernelBatch}, surfaces, operators,
+                                      state::State{T}, increment::AbstractVector{T},
+                                      fixed::BitVector,
                                       blocked_rows::BitVector) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
@@ -1317,8 +1317,7 @@ end
 @inline function _local_coefficient(item::_AssemblyValues, coefficients::AbstractVector{T},
                                     local_dof::Int) where {T<:AbstractFloat}
   single_index = item.single_term_indices[local_dof]
-  single_index != 0 &&
-    return item.single_term_coefficients[local_dof] * coefficients[single_index]
+  single_index != 0 && return item.single_term_coefficients[local_dof] * coefficients[single_index]
   value = zero(T)
 
   @inbounds for term_index in _local_term_range(item, local_dof)

@@ -14,7 +14,8 @@ function cell_apply!(local_result, op::Diffusion, values::CellValues, local_coef
   mode_count = local_mode_count(values, op.field)
 
   for q in 1:point_count(values)
-    weighted_gradient = op.kappa * gradient(values, local_coefficients, op.field, q)[1] *
+    weighted_gradient = op.kappa *
+                        gradient(values, local_coefficients, op.field, q)[1] *
                         weight(values, q)
 
     for i in 1:mode_count

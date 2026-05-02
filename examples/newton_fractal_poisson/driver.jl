@@ -1,7 +1,7 @@
 using Printf
 using Grico
 using WriteVTK
-import Grico: cell_matrix!, cell_rhs!
+import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 # This example solves a manufactured Poisson problem on the unit square,
 #

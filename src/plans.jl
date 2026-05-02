@@ -526,10 +526,8 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
   return dofs, slot_matrix[involved, involved], slot_rhs[involved]
 end
 
-function _assemble_boundary_projection!(slot_matrix::AbstractMatrix{T},
-                                        slot_rhs::AbstractVector{T},
-                                        slot_range::UnitRange{Int},
-                                        local_matrix::AbstractMatrix{T},
+function _assemble_boundary_projection!(slot_matrix::AbstractMatrix{T}, slot_rhs::AbstractVector{T},
+                                        slot_range::UnitRange{Int}, local_matrix::AbstractMatrix{T},
                                         local_rhs::AbstractVector{T},
                                         batches::Vector{_FilteredKernelBatch}, faces,
                                         operators) where {T<:AbstractFloat}
@@ -587,8 +585,7 @@ function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::Abstract
         for col_term in _local_term_range(item, local_col)
           col = _slot_index(slot_range, item.term_indices[col_term])
           col == 0 && continue
-          matrix_data[row, col] += row_coefficient * coefficient *
-                                   item.term_coefficients[col_term]
+          matrix_data[row, col] += row_coefficient * coefficient * item.term_coefficients[col_term]
         end
       end
     end

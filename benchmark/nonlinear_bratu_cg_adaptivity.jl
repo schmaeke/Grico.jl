@@ -106,8 +106,9 @@ function cell_tangent_apply!(local_result, operator::BratuSineSource, values::Ce
         stiffness += gradients[axis, row_mode, point_index] * increment_gradient[axis]
       end
 
-      local_block[row_mode] +=
-        (stiffness + reaction * shape_table[row_mode, point_index] * increment_value) * weighted
+      local_block[row_mode] += (stiffness +
+                                reaction * shape_table[row_mode, point_index] * increment_value) *
+                               weighted
     end
   end
 

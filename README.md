@@ -22,13 +22,12 @@ framework. Its core model is affine Cartesian geometry with anisotropic dyadic
   and mixed axiswise policies.
 - Scalar and vector fields, multi-field layouts, Dirichlet constraints, and
   mean-value constraints.
-- Operator-based assembly for cell, boundary, interface, and embedded-surface
-  contributions.
-- Affine and residual problems, including nonlinear residual and tangent
-  assembly.
-- Built-in solve support with sparse direct solves, Krylov methods,
-  smoothed-aggregation AMG, ILU, additive Schwarz, and field-split Schur
-  preconditioning.
+- Operator-based matrix-free evaluation for cell, boundary, interface, and
+  embedded-surface contributions.
+- Affine and residual problems, including nonlinear residual and tangent-action
+  evaluation.
+- Built-in reduced CG solves for affine matrix-free operators, with optional
+  diagonal Jacobi data supplied by local kernels.
 - State transfer across adaptive space changes.
 - Embedded geometry support through finite-cell quadrature, implicit surface
   quadrature, and explicit segment-mesh surfaces.
@@ -62,7 +61,7 @@ generated benchmark reports stay untracked.
 2. Compile an `HpSpace` from basis, degree, quadrature, and continuity choices.
 3. Define fields and add local operators to an `AffineProblem` or
    `ResidualProblem`.
-4. `compile`, `assemble`, and `solve`.
+4. `compile`, apply matrix-free operators directly, and `solve`.
 5. Optionally verify, sample/export, or build a new adaptive space with
    `adaptivity_plan`.
 
@@ -70,27 +69,40 @@ generated benchmark reports stay untracked.
 
 ```julia
 using Grico
-import Grico: cell_matrix!, cell_rhs!
+import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 struct Diffusion{F,T}
   field::F
   kappa::T
 end
 
-function cell_matrix!(local_matrix, op::Diffusion, values::CellValues)
-  A = block(local_matrix, values, op.field, op.field)
+function cell_apply!(local_result, op::Diffusion, values::CellValues, local_coefficients)
   mode_count = local_mode_count(values, op.field)
 
   for q in 1:point_count(values)
-    w = weight(values, q)
+    grad_u = gradient(values, local_coefficients, op.field, q)
+    w = op.kappa * weight(values, q)
 
     for i in 1:mode_count
       grad_i = shape_gradient(values, op.field, q, i)
+      row = local_dof_index(values, op.field, 1, i)
+      local_result[row] += sum(grad_i[a] * grad_u[a] for a in eachindex(grad_i)) * w
+    end
+  end
 
-      for j in 1:mode_count
-        grad_j = shape_gradient(values, op.field, q, j)
-        A[i, j] += op.kappa * sum(grad_i[a] * grad_j[a] for a in eachindex(grad_i)) * w
-      end
+  return nothing
+end
+
+function cell_diagonal!(local_diagonal, op::Diffusion, values::CellValues)
+  mode_count = local_mode_count(values, op.field)
+
+  for q in 1:point_count(values)
+    w = op.kappa * weight(values, q)
+
+    for i in 1:mode_count
+      grad_i = shape_gradient(values, op.field, q, i)
+      row = local_dof_index(values, op.field, 1, i)
+      local_diagonal[row] += sum(grad_i[a] * grad_i[a] for a in eachindex(grad_i)) * w
     end
   end
 
@@ -128,7 +140,7 @@ add_constraint!(problem, Dirichlet(u, BoundaryFace(1, LOWER), 0.0))
 add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 
 plan = compile(problem)
-state = State(plan, solve(assemble(plan)))
+state = solve(plan; preconditioner=JacobiPreconditioner())
 ```
 
 ## Scope Notes

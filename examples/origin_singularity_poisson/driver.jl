@@ -1,7 +1,7 @@
 using Printf
 using Grico
 using WriteVTK
-import Grico: cell_matrix!, cell_rhs!
+import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 # This example is meant to be the simplest "read it from top to bottom" tour of
 # adaptive finite elements in Grico.

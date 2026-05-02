@@ -3,9 +3,9 @@
 # ---------------------------------------------------------------------------
 
 # The initial condition is inserted into the DG space via an `L²` projection.
-# That means we assemble the element mass matrix
+# That means we apply the element mass operator
 #
-#   Mᵢⱼ = ∫_K φᵢ φⱼ dx,
+#   (M q)ᵢ = ∫_K φᵢ q dx,
 #
 # and the projected right-hand side
 #
@@ -16,8 +16,8 @@ struct MassMatrix{F}
   field::F
 end
 
-function _assemble_mass_block!(local_matrix, field, values)
-  local_block = block(local_matrix, values, field, field)
+function _apply_mass_block!(local_result, field, values, local_coefficients)
+  local_block = block(local_result, values, field)
   mode_count = local_mode_count(values, field)
   components = component_count(field)
   shape_table = shape_values(values, field)
@@ -25,18 +25,19 @@ function _assemble_mass_block!(local_matrix, field, values)
   for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
-    for row_mode in 1:mode_count
-      row_value = shape_table[row_mode, point_index]
+    for component in 1:components
+      trial_value = zero(eltype(local_result))
 
       for col_mode in 1:mode_count
-        contribution = row_value * shape_table[col_mode, point_index] * weighted
-        contribution == 0 && continue
+        col = component_local_index(mode_count, component, col_mode)
+        trial_value += shape_table[col_mode, point_index] * local_coefficients[col]
+      end
 
-        for component in 1:components
-          row = component_local_index(mode_count, component, row_mode)
-          col = component_local_index(mode_count, component, col_mode)
-          local_block[row, col] += contribution
-        end
+      trial_value == 0 && continue
+
+      for row_mode in 1:mode_count
+        row = component_local_index(mode_count, component, row_mode)
+        local_block[row] += shape_table[row_mode, point_index] * trial_value * weighted
       end
     end
   end
@@ -44,11 +45,31 @@ function _assemble_mass_block!(local_matrix, field, values)
   return nothing
 end
 
-function cell_matrix!(local_matrix, operator::MassMatrix, values::CellValues)
-  _assemble_mass_block!(local_matrix, operator.field, values)
+function cell_apply!(local_result, operator::MassMatrix, values::CellValues, local_coefficients)
+  _apply_mass_block!(local_result, operator.field, values, local_coefficients)
 end
-function cell_tangent!(local_matrix, operator::MassMatrix, values::CellValues, state::State)
-  _assemble_mass_block!(local_matrix, operator.field, values)
+
+function cell_diagonal!(local_diagonal, operator::MassMatrix, values::CellValues)
+  local_block = block(local_diagonal, values, operator.field)
+  mode_count = local_mode_count(values, operator.field)
+  components = component_count(operator.field)
+  shape_table = shape_values(values, operator.field)
+
+  for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+
+    for mode_index in 1:mode_count
+      shape = shape_table[mode_index, point_index]
+      contribution = shape * shape * weighted
+
+      for component in 1:components
+        row = component_local_index(mode_count, component, mode_index)
+        local_block[row] += contribution
+      end
+    end
+  end
+
+  return nothing
 end
 
 struct ProjectionSource{F,G}
@@ -82,13 +103,11 @@ function cell_rhs!(local_rhs, operator::ProjectionSource, values::CellValues)
   return nothing
 end
 
-direct_sparse_solve(matrix_data, rhs_data) = matrix_data \ rhs_data
-
 # Build the projected initial DG state `q_h(x, 0)`.
-function project_initial_condition(field, data; linear_solve=direct_sparse_solve)
+function project_initial_condition(field, data; linear_solve=Grico.default_linear_solve)
   problem = AffineProblem(field)
   add_cell!(problem, MassMatrix(field))
   add_cell!(problem, ProjectionSource(field, data))
-  system = assemble(compile(problem))
-  return State(system, Grico.solve(system; linear_solve=linear_solve))
+  plan = compile(problem)
+  return solve(plan; linear_solve=linear_solve, preconditioner=JacobiPreconditioner())
 end

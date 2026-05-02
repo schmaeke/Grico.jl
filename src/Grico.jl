@@ -145,12 +145,11 @@ export AbstractField, FieldLayout, ScalarField, State, VectorField, coefficients
 # mesh or degree changes.
 include("problem.jl")
 export AffineProblem, BoundaryFace, Dirichlet, MeanValue, ResidualProblem, add_boundary!, add_cell!,
-       add_constraint!, add_interface!, add_surface!, cell_apply!, cell_diagonal!,
-       cell_residual!, cell_rhs!, cell_tangent_apply!, constrain!, face_apply!,
-       face_diagonal!, face_residual!, face_rhs!, face_tangent_apply!, interface_apply!,
-       interface_diagonal!, interface_residual!, interface_rhs!, interface_tangent_apply!,
-       surface_apply!, surface_diagonal!, surface_residual!, surface_rhs!,
-       surface_tangent_apply!
+       add_constraint!, add_interface!, add_surface!, cell_apply!, cell_diagonal!, cell_residual!,
+       cell_rhs!, cell_tangent_apply!, constrain!, face_apply!, face_diagonal!, face_residual!,
+       face_rhs!, face_tangent_apply!, interface_apply!, interface_diagonal!, interface_residual!,
+       interface_rhs!, interface_tangent_apply!, surface_apply!, surface_diagonal!,
+       surface_residual!, surface_rhs!, surface_tangent_apply!
 
 include("embedded.jl")
 export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,

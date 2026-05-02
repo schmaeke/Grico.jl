@@ -164,7 +164,7 @@ end
 # Mesh adaptation is performed between fixed-mesh ODE segments. The current DG
 # state is used as an error indicator, then transferred to the adapted mesh.
 function adapt_blast_wave_context(context; tolerance=ADAPTIVITY_TOLERANCE, max_h_level=MAX_H_LEVEL,
-                                  linear_solve=direct_sparse_solve)
+                                  linear_solve=Grico.default_linear_solve)
   plan = blast_wave_adaptivity_plan(context; tolerance=tolerance, max_h_level=max_h_level)
 
   if isempty(plan)
@@ -198,7 +198,7 @@ function EulerSemidiscretization(plan, field, initial_state, mass_inverse)
                                  mass_inverse)
 end
 
-# Copy the ODE state into the reusable `State`, assemble the DG residual, and
+# Copy the ODE state into the reusable `State`, evaluate the DG residual, and
 # apply the cellwise inverse mass matrix.
 function euler_rhs!(du, u, semi::EulerSemidiscretization, t)
   semi.state.coefficients .= u

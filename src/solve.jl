@@ -9,10 +9,12 @@
 
 Configuration for generic diagonal Jacobi preconditioning.
 
-When all affine operators provide compatible local diagonal kernels, the
-preconditioner builds the reduced diagonal directly from those kernels. It
-uses identity preconditioning when the kernels are unavailable or incompatible
-with the reduced operator map.
+For affine solves, the preconditioner builds the reduced diagonal directly from
+local diagonal kernels when every operator contribution can be scattered
+safely. It uses identity preconditioning when those kernels are unavailable or
+incompatible with the reduced operator map. The default residual tangent solve
+does not implement tangent preconditioning; nonlinear users who need one should
+provide a custom `linear_solve`.
 """
 struct JacobiPreconditioner end
 
@@ -42,10 +44,13 @@ and must return a reduced coefficient vector. The returned vector is expanded
 back to a full-layout [`State`](@ref).
 
 For residual problems, the same keyword names configure a Newton solve. The
-default tangent correction uses matrix-free CG on `P' J(u) P`.
+default tangent correction uses matrix-free CG on `P' J(u) P` without
+preconditioning. Passing a non-`nothing` preconditioner to the default residual
+solve is rejected so nonlinear preconditioning remains an explicit custom
+`linear_solve` decision.
 """
-function solve(problem::AffineProblem; linear_solve=default_linear_solve,
-               preconditioner=nothing, kwargs...)
+function solve(problem::AffineProblem; linear_solve=default_linear_solve, preconditioner=nothing,
+               kwargs...)
   return solve(compile(problem); linear_solve=linear_solve, preconditioner=preconditioner,
                kwargs...)
 end
@@ -56,11 +61,10 @@ function solve(problem::ResidualProblem; linear_solve=default_tangent_linear_sol
                kwargs...)
 end
 
-function solve(plan::AssemblyPlan{D,T}; linear_solve=default_linear_solve,
-               preconditioner=nothing, kwargs...) where {D,T<:AbstractFloat}
+function solve(plan::AssemblyPlan{D,T}; linear_solve=default_linear_solve, preconditioner=nothing,
+               kwargs...) where {D,T<:AbstractFloat}
   kind = _matrix_free_kind(plan.assembly_structure)
-  kind === :affine &&
-    return _solve_affine(plan; linear_solve, preconditioner, kwargs...)
+  kind === :affine && return _solve_affine(plan; linear_solve, preconditioner, kwargs...)
   residual_linear_solve = linear_solve === default_linear_solve ? default_tangent_linear_solve :
                           linear_solve
   kind === :residual &&
@@ -87,11 +91,10 @@ end
 function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_linear_solve,
                          preconditioner=nothing, initial_state=nothing,
                          relative_tolerance=sqrt(eps(T)), absolute_tolerance=sqrt(eps(T)),
-                         maxiter::Int=20, damping=one(T),
-                         linear_relative_tolerance=sqrt(eps(T)),
+                         maxiter::Int=20, damping=one(T), linear_relative_tolerance=sqrt(eps(T)),
                          linear_absolute_tolerance=zero(T),
                          linear_maxiter=max(1_000, 2 * reduced_dof_count(plan))) where {D,
-                                                                                         T<:AbstractFloat}
+                                                                                        T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
   maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
   damping_value = T(damping)
@@ -108,7 +111,6 @@ function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_l
 
   reduced_residual = zeros(T, reduced_dof_count(map))
   correction_rhs = zeros(T, reduced_dof_count(map))
-  correction = zeros(T, reduced_dof_count(map))
   initial_residual_norm = nothing
 
   for _ in 1:maxiter
@@ -122,9 +124,8 @@ function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_l
       correction_rhs[index] = -reduced_residual[index]
     end
 
-    correction = linear_solve(plan, State(plan, workspace.full_state), correction_rhs;
-                              workspace, residual_workspace, preconditioner,
-                              relative_tolerance=T(linear_relative_tolerance),
+    correction = linear_solve(plan, workspace.state, correction_rhs; workspace, residual_workspace,
+                              preconditioner, relative_tolerance=T(linear_relative_tolerance),
                               absolute_tolerance=T(linear_absolute_tolerance),
                               maxiter=linear_maxiter)
     _require_length(correction, reduced_dof_count(map), "Newton correction")
@@ -153,11 +154,10 @@ end
 
 function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
                    workspace::_ReducedOperatorWorkspace{T}; relative_tolerance::T,
-                   absolute_tolerance::T, maxiter::Int,
-                   initial_solution, inverse_diagonal,
-                   operator_apply! = (target, vector) -> _reduced_apply!(target, plan, vector,
-                                                                         workspace)) where {D,
-                                                                                            T<:AbstractFloat}
+                   absolute_tolerance::T, maxiter::Int, initial_solution, inverse_diagonal,
+                   operator_apply=(target, vector) -> _reduced_apply!(target, plan, vector,
+                                                                      workspace)) where {D,
+                                                                                         T<:AbstractFloat}
   n = length(rhs_data)
   n == 0 && return T[]
   maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -174,7 +174,7 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
   operator_values = zeros(T, n)
 
   if initial_solution !== nothing
-    operator_apply!(operator_values, solution)
+    operator_apply(operator_values, solution)
     _axpy!(residual, -one(T), operator_values)
   end
 
@@ -188,7 +188,7 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
   residual_norm2 <= tolerance * tolerance && return solution
 
   for iteration in 1:maxiter
-    operator_apply!(operator_values, direction)
+    operator_apply(operator_values, direction)
     denominator = _dot(direction, operator_values)
     denominator > zero(T) ||
       throw(ArgumentError("CG encountered a non-positive operator direction; provide a different linear_solve for this problem"))
@@ -210,8 +210,7 @@ end
 
 _preconditioner_data(plan, workspace, ::Nothing) = nothing
 
-function _preconditioner_data(plan::AssemblyPlan{D,T},
-                              workspace::_ReducedOperatorWorkspace{T},
+function _preconditioner_data(plan::AssemblyPlan{D,T}, workspace::_ReducedOperatorWorkspace{T},
                               ::JacobiPreconditioner) where {D,T<:AbstractFloat}
   return _jacobi_inverse_diagonal(plan, workspace)
 end
@@ -224,20 +223,21 @@ function default_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T},
                                       reduced_rhs::AbstractVector{T};
                                       workspace=_ReducedOperatorWorkspace(plan),
                                       residual_workspace=ResidualWorkspace(plan),
-                                      preconditioner=nothing,
-                                      relative_tolerance=sqrt(eps(T)),
+                                      preconditioner=nothing, relative_tolerance=sqrt(eps(T)),
                                       absolute_tolerance=zero(T),
                                       maxiter=max(1_000, 2 * length(reduced_rhs)),
                                       initial_solution=nothing) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
   _check_state(plan, state)
   _require_length(reduced_rhs, reduced_dof_count(plan), "reduced rhs")
+  preconditioner === nothing ||
+    throw(ArgumentError("matrix-free tangent preconditioning is not implemented; pass preconditioner=nothing or a custom linear_solve"))
   copyto!(workspace.full_state, coefficients(state))
-  operator_apply! = (target, vector) ->
-    _reduced_tangent_apply!(target, plan, vector, workspace, residual_workspace)
+  operator_apply = (target, vector) -> _reduced_tangent_apply!(target, plan, vector, workspace,
+                                                               residual_workspace)
   return _cg_solve(plan, reduced_rhs, workspace; relative_tolerance=relative_tolerance,
                    absolute_tolerance=absolute_tolerance, maxiter=maxiter,
-                   initial_solution=initial_solution, inverse_diagonal=nothing, operator_apply!)
+                   initial_solution=initial_solution, inverse_diagonal=nothing, operator_apply)
 end
 
 function _jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},

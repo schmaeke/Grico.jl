@@ -8,8 +8,8 @@ struct _VerificationDiffusion{F,T}
   coefficient::T
 end
 
-function Grico.cell_apply!(local_result, operator::_VerificationDiffusion,
-                           values::Grico.CellValues, local_coefficients)
+function Grico.cell_apply!(local_result, operator::_VerificationDiffusion, values::Grico.CellValues,
+                           local_coefficients)
   mode_count = Grico.local_mode_count(values, operator.field)
 
   for point_index in 1:Grico.point_count(values)
@@ -18,10 +18,12 @@ function Grico.cell_apply!(local_result, operator::_VerificationDiffusion,
 
     for row_mode in 1:mode_count
       gradient_row = Grico.shape_gradient(values, operator.field, point_index, row_mode)
-      local_result[Grico.local_dof_index(values, operator.field, 1, row_mode)] +=
-        operator.coefficient *
-        sum(gradient_row[axis] * gradient_value[axis] for axis in eachindex(gradient_row)) *
-        weighted
+      local_result[Grico.local_dof_index(values, operator.field, 1, row_mode)] += operator.coefficient *
+                                                                                  sum(gradient_row[axis] *
+                                                                                      gradient_value[axis]
+                                                                                      for axis in
+                                                                                          eachindex(gradient_row)) *
+                                                                                  weighted
     end
   end
 
@@ -37,10 +39,12 @@ function Grico.cell_diagonal!(local_diagonal, operator::_VerificationDiffusion,
 
     for mode_index in 1:mode_count
       gradient_value = Grico.shape_gradient(values, operator.field, point_index, mode_index)
-      local_diagonal[Grico.local_dof_index(values, operator.field, 1, mode_index)] +=
-        operator.coefficient *
-        sum(value * value for value in gradient_value) *
-        weighted
+      local_diagonal[Grico.local_dof_index(values, operator.field, 1, mode_index)] += operator.coefficient *
+                                                                                      sum(value *
+                                                                                          value
+                                                                                          for value in
+                                                                                              gradient_value) *
+                                                                                      weighted
     end
   end
 

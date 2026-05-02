@@ -7,7 +7,7 @@
 
 include("adaptive_benchmark_common.jl")
 
-import Grico: cell_matrix!, surface_matrix!, surface_rhs!
+import Grico: cell_apply!, cell_diagonal!, surface_apply!, surface_diagonal!, surface_rhs!
 
 const ANNULAR_FCM_DEFAULTS = adaptive_benchmark_defaults(; cycles=6, root_cells=(16, 16), degree=2,
                                                          max_h_level=8, tolerance=1.0e-5,
@@ -155,8 +155,33 @@ function _annular_reference(options)
   return _annular_exact_solution(options["inner_radius"], options["outer_radius"])
 end
 
-function cell_matrix!(local_matrix, operator::AnnularDiffusion, values::CellValues)
-  local_block = block(local_matrix, values, operator.field, operator.field)
+function cell_apply!(local_result, operator::AnnularDiffusion, values::CellValues,
+                     local_coefficients)
+  local_block = block(local_result, values, operator.field)
+  gradients = shape_gradients(values, operator.field)
+  axis_count = size(gradients, 1)
+  mode_count = local_mode_count(values, operator.field)
+
+  @inbounds for point_index in 1:point_count(values)
+    trial_gradient = gradient(values, local_coefficients, operator.field, point_index)
+    weighted = weight(values, point_index)
+
+    for row_mode in 1:mode_count
+      contribution = zero(eltype(local_result))
+
+      for axis in 1:axis_count
+        contribution += gradients[axis, row_mode, point_index] * trial_gradient[axis]
+      end
+
+      local_block[row_mode] += contribution * weighted
+    end
+  end
+
+  return nothing
+end
+
+function cell_diagonal!(local_diagonal, operator::AnnularDiffusion, values::CellValues)
+  local_block = block(local_diagonal, values, operator.field)
   gradients = shape_gradients(values, operator.field)
   axis_count = size(gradients, 1)
   mode_count = local_mode_count(values, operator.field)
@@ -164,27 +189,51 @@ function cell_matrix!(local_matrix, operator::AnnularDiffusion, values::CellValu
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
-    for row_mode in 1:mode_count
-      for col_mode in 1:row_mode
-        contribution = zero(eltype(local_matrix))
+    for mode_index in 1:mode_count
+      contribution = zero(eltype(local_diagonal))
 
-        for axis in 1:axis_count
-          contribution += gradients[axis, row_mode, point_index] *
-                          gradients[axis, col_mode, point_index]
-        end
-
-        contribution *= weighted
-        local_block[row_mode, col_mode] += contribution
-        row_mode == col_mode || (local_block[col_mode, row_mode] += contribution)
+      for axis in 1:axis_count
+        gradient_value = gradients[axis, mode_index, point_index]
+        contribution += gradient_value * gradient_value
       end
+
+      local_block[mode_index] += contribution * weighted
     end
   end
 
   return nothing
 end
 
-function surface_matrix!(local_matrix, operator::AnnularNitscheDirichlet, values::SurfaceValues)
-  local_block = block(local_matrix, values, operator.field, operator.field)
+function surface_apply!(local_result, operator::AnnularNitscheDirichlet, values::SurfaceValues,
+                        local_coefficients)
+  local_block = block(local_result, values, operator.field)
+  shape_table = shape_values(values, operator.field)
+  mode_count = local_mode_count(values, operator.field)
+  domain_data = field_space(operator.field).domain
+  h = min(cell_size(domain_data, values.leaf, 1), cell_size(domain_data, values.leaf, 2))
+  penalty = operator.penalty / h
+
+  @inbounds for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+    normal_data = normal(values, point_index)
+    trial_value = value(values, local_coefficients, operator.field, point_index)
+    trial_gradient = gradient(values, local_coefficients, operator.field, point_index)
+    trial_flux = trial_gradient[1] * normal_data[1] + trial_gradient[2] * normal_data[2]
+
+    for row_mode in 1:mode_count
+      row_value = shape_table[row_mode, point_index]
+      row_gradient = shape_gradient(values, operator.field, point_index, row_mode)
+      row_flux = row_gradient[1] * normal_data[1] + row_gradient[2] * normal_data[2]
+      local_block[row_mode] += weighted * (-row_value * trial_flux - trial_value * row_flux +
+                                           penalty * row_value * trial_value)
+    end
+  end
+
+  return nothing
+end
+
+function surface_diagonal!(local_diagonal, operator::AnnularNitscheDirichlet, values::SurfaceValues)
+  local_block = block(local_diagonal, values, operator.field)
   shape_table = shape_values(values, operator.field)
   mode_count = local_mode_count(values, operator.field)
   domain_data = field_space(operator.field).domain
@@ -195,20 +244,11 @@ function surface_matrix!(local_matrix, operator::AnnularNitscheDirichlet, values
     weighted = weight(values, point_index)
     normal_data = normal(values, point_index)
 
-    for row_mode in 1:mode_count
-      row_value = shape_table[row_mode, point_index]
-      row_gradient = shape_gradient(values, operator.field, point_index, row_mode)
-      row_flux = row_gradient[1] * normal_data[1] + row_gradient[2] * normal_data[2]
-
-      for col_mode in 1:row_mode
-        col_value = shape_table[col_mode, point_index]
-        col_gradient = shape_gradient(values, operator.field, point_index, col_mode)
-        col_flux = col_gradient[1] * normal_data[1] + col_gradient[2] * normal_data[2]
-        contribution = weighted * (-row_value * col_flux - col_value * row_flux +
-                                   penalty * row_value * col_value)
-        local_block[row_mode, col_mode] += contribution
-        row_mode == col_mode || (local_block[col_mode, row_mode] += contribution)
-      end
+    for mode_index in 1:mode_count
+      shape = shape_table[mode_index, point_index]
+      gradient_value = shape_gradient(values, operator.field, point_index, mode_index)
+      flux = gradient_value[1] * normal_data[1] + gradient_value[2] * normal_data[2]
+      local_block[mode_index] += weighted * (penalty * shape * shape - 2 * shape * flux)
     end
   end
 

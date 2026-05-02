@@ -95,8 +95,7 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
   for iteration in 1:correction_count
     iteration_count = iteration
     residual_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_residual") do
-      Grico._reduced_residual!(residual_vector, plan, reduced_values, reduced_workspace,
-                               workspace)
+      Grico._reduced_residual!(residual_vector, plan, reduced_values, reduced_workspace, workspace)
     end
     final_residual_norm = Float64(norm(residual_vector))
 
@@ -117,10 +116,8 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
 
     linear_solve_timing = _timed_nonlinear_component!(component_rows, cycle,
                                                       "newton_linear_solve") do
-      current_state = State(plan, reduced_workspace.full_state)
-      Grico.default_tangent_linear_solve(plan, current_state, correction_rhs;
-                                         workspace=reduced_workspace,
-                                         residual_workspace=workspace)
+      Grico.default_tangent_linear_solve(plan, reduced_workspace.state, correction_rhs;
+                                         workspace=reduced_workspace, residual_workspace=workspace)
     end
     correction = linear_solve_timing.value
     update_norm = Float64(norm(correction))
@@ -149,8 +146,8 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
   return (; state, iteration_count, correction_count, residual_norm=final_residual_norm, converged)
 end
 
-function _nonlinear_cycle_summary(cycle::Int, field, plan, solution_l2::Float64,
-                                  adaptivity, target_field, newton_result)
+function _nonlinear_cycle_summary(cycle::Int, field, plan, solution_l2::Float64, adaptivity,
+                                  target_field, newton_result)
   space = field_space(field)
   target_space_value = field_space(target_field)
   summary = adaptivity === nothing ? nothing : adaptivity_summary(adaptivity)
@@ -161,8 +158,8 @@ function _nonlinear_cycle_summary(cycle::Int, field, plan, solution_l2::Float64,
   return (; cycle, active_leaves=active_leaf_count(space),
           stored_cells=Grico.stored_cell_count(grid(space)), max_h_level=_max_h_level(space),
           min_p_degree, max_p_degree, dofs=scalar_dof_count(space),
-          reduced_dofs=Grico.reduced_dof_count(plan),
-          solution_l2, newton_iterations=newton_result.iteration_count,
+          reduced_dofs=Grico.reduced_dof_count(plan), solution_l2,
+          newton_iterations=newton_result.iteration_count,
           newton_corrections=newton_result.correction_count,
           final_residual_norm=newton_result.residual_norm, converged=newton_result.converged,
           marked_leaf_count=summary === nothing ? 0 : summary.marked_leaf_count,
@@ -230,8 +227,8 @@ function run_nonlinear_adaptive_cycles(options; build_initial_field, build_probl
 
     _push_total_row!(component_rows, cycle, first_component_row, time() - cycle_start)
     push!(cycle_rows,
-          _nonlinear_cycle_summary(cycle, field, plan, solution_l2,
-                                   adaptivity, target_field, newton_result))
+          _nonlinear_cycle_summary(cycle, field, plan, solution_l2, adaptivity, target_field,
+                                   newton_result))
     print_progress && _print_nonlinear_cycle_row(last(cycle_rows))
     field = target_field
     isempty(adaptivity) && break

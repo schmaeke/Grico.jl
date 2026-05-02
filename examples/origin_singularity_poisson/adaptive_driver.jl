@@ -23,7 +23,7 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
   for step in 0:adaptive_steps
     problem = build_origin_singularity_problem(u, context)
     plan = compile(problem)
-    state = State(plan, solve(assemble(plan)))
+    state = solve(plan; preconditioner=JacobiPreconditioner())
     error_value = relative_l2_error(state, u, context.exact_solution; plan=plan,
                                     extra_points=VERIFICATION_EXTRA_POINTS)
 

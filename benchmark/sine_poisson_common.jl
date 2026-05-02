@@ -43,16 +43,14 @@ function cell_apply!(local_result, operator::SineInterfacePoissonDiffusion, valu
         contribution += gradients[axis, row_mode, point_index] * field_gradient_value[axis]
       end
 
-      local_result[local_dof_index(values, operator.field, 1, row_mode)] +=
-        contribution * weighted
+      local_result[local_dof_index(values, operator.field, 1, row_mode)] += contribution * weighted
     end
   end
 
   return nothing
 end
 
-function cell_diagonal!(local_diagonal, operator::SineInterfacePoissonDiffusion,
-                        values::CellValues)
+function cell_diagonal!(local_diagonal, operator::SineInterfacePoissonDiffusion, values::CellValues)
   gradients = shape_gradients(values, operator.field)
   axis_count = size(gradients, 1)
   mode_count = local_mode_count(values, operator.field)
@@ -68,8 +66,8 @@ function cell_diagonal!(local_diagonal, operator::SineInterfacePoissonDiffusion,
         contribution += gradient_value * gradient_value
       end
 
-      local_diagonal[local_dof_index(values, operator.field, 1, mode_index)] +=
-        contribution * weighted
+      local_diagonal[local_dof_index(values, operator.field, 1, mode_index)] += contribution *
+                                                                                weighted
     end
   end
 

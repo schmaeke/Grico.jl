@@ -70,7 +70,8 @@ function Grico.cell_apply!(local_result, operator::_MatrixFreeMassAction, values
 
     for mode_index in 1:local_mode_count(values, field)
       row = local_dof_index(values, field, 1, mode_index)
-      local_result[row] += shape_value(values, field, point_index, mode_index) * weighted *
+      local_result[row] += shape_value(values, field, point_index, mode_index) *
+                           weighted *
                            field_value
     end
   end
@@ -94,8 +95,7 @@ function Grico.cell_diagonal!(local_diagonal, operator::_MatrixFreeMassAction, v
   return nothing
 end
 
-function Grico.cell_apply!(local_result, operator::_MatrixFreeDiffusion, values,
-                           local_coefficients)
+function Grico.cell_apply!(local_result, operator::_MatrixFreeDiffusion, values, local_coefficients)
   field = operator.field
   mode_count = local_mode_count(values, field)
 
@@ -140,7 +140,8 @@ function Grico.face_apply!(local_result, operator::_MatrixFreeBoundaryMass, valu
 
     for mode_index in 1:local_mode_count(values, field)
       row = local_dof_index(values, field, 1, mode_index)
-      local_result[row] += shape_value(values, field, point_index, mode_index) * field_value *
+      local_result[row] += shape_value(values, field, point_index, mode_index) *
+                           field_value *
                            weighted
     end
   end
@@ -179,12 +180,14 @@ function Grico.interface_apply!(local_result, operator::_MatrixFreeInterfaceJump
 
     for mode_index in 1:local_mode_count(minus_values, field)
       minus_block[mode_index] -= shape_value(minus_values, field, point_index, mode_index) *
-                                 jump_value * weighted
+                                 jump_value *
+                                 weighted
     end
 
     for mode_index in 1:local_mode_count(plus_values, field)
       plus_block[mode_index] += shape_value(plus_values, field, point_index, mode_index) *
-                                jump_value * weighted
+                                jump_value *
+                                weighted
     end
   end
 
@@ -225,7 +228,8 @@ function Grico.surface_apply!(local_result, operator::_MatrixFreeSurfaceMass, va
 
     for mode_index in 1:local_mode_count(values, field)
       row = local_dof_index(values, field, 1, mode_index)
-      local_result[row] += shape_value(values, field, point_index, mode_index) * field_value *
+      local_result[row] += shape_value(values, field, point_index, mode_index) *
+                           field_value *
                            weighted
     end
   end
@@ -249,8 +253,7 @@ function Grico.surface_diagonal!(local_diagonal, operator::_MatrixFreeSurfaceMas
   return nothing
 end
 
-function Grico.cell_residual!(local_residual, operator::_MatrixFreeQuadraticReaction, values,
-                              state)
+function Grico.cell_residual!(local_residual, operator::_MatrixFreeQuadraticReaction, values, state)
   field = operator.field
 
   for point_index in 1:point_count(values)
@@ -284,7 +287,9 @@ function Grico.cell_tangent_apply!(local_result, operator::_MatrixFreeQuadraticR
   return nothing
 end
 
-_tuple_dot(first::Tuple, second::Tuple) = sum(first[index] * second[index] for index in eachindex(first))
+function _tuple_dot(first::Tuple, second::Tuple)
+  sum(first[index] * second[index] for index in eachindex(first))
+end
 
 function _local_reference_mass!(local_matrix, field, values)
   block_data = block(local_matrix, values, field, field)
@@ -421,11 +426,9 @@ end
   add_cell!(mass_problem, _MatrixFreeMassAction(dg_field))
   mass_plan = compile(mass_problem)
   @test apply(mass_plan, ones(2)) ≈ [0.5, 0.5]
-  @test apply(mass_plan, [0.25, -0.5]) ≈
-        _reference_cell_action(mass_plan, [0.25, -0.5],
-                               (local_matrix, values) -> _local_reference_mass!(local_matrix,
-                                                                                 dg_field,
-                                                                                 values))
+  @test apply(mass_plan, [0.25, -0.5]) ≈ _reference_cell_action(mass_plan, [0.25, -0.5],
+                                                                (local_matrix, values) -> _local_reference_mass!(local_matrix,
+                                                                                                                 dg_field, values))
   mass_diagonal_selected, mass_diagonal = _kernel_reduced_diagonal(mass_plan)
   @test mass_diagonal_selected
   @test mass_diagonal ≈ _reference_reduced_diagonal(mass_plan)
@@ -438,8 +441,7 @@ end
         _reference_cell_action(diffusion_plan, diffusion_coefficients,
                                (local_matrix, values) -> _local_reference_diffusion!(local_matrix,
                                                                                      dg_field,
-                                                                                     values,
-                                                                                     2.0))
+                                                                                     values, 2.0))
   diffusion_diagonal_selected, diffusion_diagonal = _kernel_reduced_diagonal(diffusion_plan)
   @test diffusion_diagonal_selected
   @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
@@ -453,8 +455,7 @@ end
   @test apply(boundary_plan, [0.25, -0.5]) ≈ [0.0, -1.5]
 
   interface_domain = Domain((0.0,), (1.0,), (2,))
-  interface_space = HpSpace(interface_domain, SpaceOptions(degree=UniformDegree(1),
-                                                           continuity=:dg))
+  interface_space = HpSpace(interface_domain, SpaceOptions(degree=UniformDegree(1), continuity=:dg))
   interface_field = ScalarField(interface_space; name=:u)
   interface_problem = AffineProblem(interface_field)
   add_interface!(interface_problem, _MatrixFreeInterfaceJump(interface_field, 2.0))
@@ -479,8 +480,7 @@ end
   add_constraint!(dirichlet_problem, Dirichlet(cg_field, BoundaryFace(1, LOWER), 2.0))
   dirichlet_state = solve(dirichlet_problem)
   @test coefficients(dirichlet_state) ≈ [2.0, 1.0]
-  dirichlet_diagonal_selected, dirichlet_diagonal =
-    _kernel_reduced_diagonal(compile(dirichlet_problem))
+  dirichlet_diagonal_selected, dirichlet_diagonal = _kernel_reduced_diagonal(compile(dirichlet_problem))
   @test dirichlet_diagonal_selected
   @test dirichlet_diagonal ≈ [1.0]
   jacobi_dirichlet_state = solve(dirichlet_problem; preconditioner=JacobiPreconditioner())

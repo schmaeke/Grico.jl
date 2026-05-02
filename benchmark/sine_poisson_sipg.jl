@@ -1,6 +1,6 @@
 # Symmetric interior-penalty DG operator for the sine-interface Poisson case.
 
-import Grico: face_matrix!, interface_matrix!
+import Grico: face_apply!, face_diagonal!, interface_apply!, interface_diagonal!
 
 struct SineInterfaceSIPGPoisson{F,T}
   field::F
@@ -45,57 +45,74 @@ end
   return (degree_value + 1)^2 / h
 end
 
-# Assemble the SIPG interior-face contribution
+# Apply the SIPG interior-face contribution
 #
 #   - {∂ₙu} [v] - {∂ₙv} [u] + σ [u] [v],
 #
-# where σ = penalty * (p + 1)^2 / h. The side loops keep matching and hanging
-# interfaces in one path because the plus and minus traces may have different
-# local mode counts.
-function interface_matrix!(local_matrix, operator::SineInterfaceSIPGPoisson,
-                           values::InterfaceValues)
+# where σ = penalty * (p + 1)^2 / h. The action is evaluated directly against
+# the local coefficient vector instead of materializing the face matrix.
+function interface_apply!(local_result, operator::SineInterfaceSIPGPoisson, values::InterfaceValues,
+                          local_coefficients)
   field = operator.field
   minus_values = minus(values)
   plus_values = plus(values)
   minus_modes = local_mode_count(minus_values, field)
   plus_modes = local_mode_count(plus_values, field)
-  blocks = ((block(local_matrix, minus_values, field, minus_values, field),
-             block(local_matrix, minus_values, field, plus_values, field)),
-            (block(local_matrix, plus_values, field, minus_values, field),
-             block(local_matrix, plus_values, field, plus_values, field)))
+  blocks = (block(local_result, minus_values, field), block(local_result, plus_values, field))
   penalty = operator.penalty *
             _interface_penalty_scale(field, values.minus_leaf, values.plus_leaf, values.axis)
 
   @inbounds for point_index in 1:point_count(values)
+    minus_value = value(minus_values, local_coefficients, field, point_index)
+    plus_value = value(plus_values, local_coefficients, field, point_index)
+    trial_jump = minus_value - plus_value
+    trial_average_flux = 0.5 *
+                         (normal_gradient(minus_values, local_coefficients, field, point_index) +
+                          normal_gradient(plus_values, local_coefficients, field, point_index))
     weighted = weight(values, point_index)
 
     for row_side in 1:2
       row_values = row_side == 1 ? minus_values : plus_values
       row_modes = row_side == 1 ? minus_modes : plus_modes
       row_sign = _trace_jump_sign(row_side == 2)
+      local_block = blocks[row_side]
 
       for row_mode in 1:row_modes
         row_shape = shape_value(row_values, field, point_index, row_mode)
         row_normal_gradient = shape_normal_gradient(row_values, field, point_index, row_mode)
         row_jump = row_sign * row_shape
         row_average_flux = 0.5 * row_normal_gradient
+        contribution = -row_jump * trial_average_flux - row_average_flux * trial_jump +
+                       penalty * row_jump * trial_jump
+        local_block[row_mode] += contribution * weighted
+      end
+    end
+  end
 
-        for col_side in 1:2
-          col_values = col_side == 1 ? minus_values : plus_values
-          col_modes = col_side == 1 ? minus_modes : plus_modes
-          col_sign = _trace_jump_sign(col_side == 2)
-          local_block = blocks[row_side][col_side]
+  return nothing
+end
 
-          for col_mode in 1:col_modes
-            col_shape = shape_value(col_values, field, point_index, col_mode)
-            col_normal_gradient = shape_normal_gradient(col_values, field, point_index, col_mode)
-            col_jump = col_sign * col_shape
-            col_average_flux = 0.5 * col_normal_gradient
-            contribution = -row_jump * col_average_flux - row_average_flux * col_jump +
-                           penalty * row_jump * col_jump
-            local_block[row_mode, col_mode] += contribution * weighted
-          end
-        end
+function interface_diagonal!(local_diagonal, operator::SineInterfaceSIPGPoisson,
+                             values::InterfaceValues)
+  field = operator.field
+  minus_values = minus(values)
+  plus_values = plus(values)
+  blocks = (block(local_diagonal, minus_values, field), block(local_diagonal, plus_values, field))
+  penalty = operator.penalty *
+            _interface_penalty_scale(field, values.minus_leaf, values.plus_leaf, values.axis)
+
+  @inbounds for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+
+    for side in 1:2
+      side_values = side == 1 ? minus_values : plus_values
+      sign = _trace_jump_sign(side == 2)
+      local_block = blocks[side]
+
+      for mode_index in 1:local_mode_count(side_values, field)
+        shape = shape_value(side_values, field, point_index, mode_index)
+        flux = shape_normal_gradient(side_values, field, point_index, mode_index)
+        local_block[mode_index] += (penalty * shape * shape - sign * shape * flux) * weighted
       end
     end
   end
@@ -104,27 +121,44 @@ function interface_matrix!(local_matrix, operator::SineInterfaceSIPGPoisson,
 end
 
 # Homogeneous Dirichlet data are imposed weakly by the boundary analogue of the
-# SIPG form. Since g = 0, only the matrix contribution remains.
-function face_matrix!(local_matrix, operator::SineInterfaceSIPGPoisson, values::FaceValues)
+# SIPG form. Since g = 0, only the operator action remains.
+function face_apply!(local_result, operator::SineInterfaceSIPGPoisson, values::FaceValues,
+                     local_coefficients)
   field = operator.field
-  local_block = block(local_matrix, values, field, field)
+  local_block = block(local_result, values, field)
+  mode_count = local_mode_count(values, field)
+  penalty = operator.penalty * _boundary_penalty_scale(field, values.leaf, values.axis)
+
+  @inbounds for point_index in 1:point_count(values)
+    trial_value = value(values, local_coefficients, field, point_index)
+    trial_normal_gradient = normal_gradient(values, local_coefficients, field, point_index)
+    weighted = weight(values, point_index)
+
+    for row_mode in 1:mode_count
+      row_shape = shape_value(values, field, point_index, row_mode)
+      row_normal_gradient = shape_normal_gradient(values, field, point_index, row_mode)
+      contribution = -row_shape * trial_normal_gradient - row_normal_gradient * trial_value +
+                     penalty * row_shape * trial_value
+      local_block[row_mode] += contribution * weighted
+    end
+  end
+
+  return nothing
+end
+
+function face_diagonal!(local_diagonal, operator::SineInterfaceSIPGPoisson, values::FaceValues)
+  field = operator.field
+  local_block = block(local_diagonal, values, field)
   mode_count = local_mode_count(values, field)
   penalty = operator.penalty * _boundary_penalty_scale(field, values.leaf, values.axis)
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
 
-    for row_mode in 1:mode_count
-      row_shape = shape_value(values, field, point_index, row_mode)
-      row_normal_gradient = shape_normal_gradient(values, field, point_index, row_mode)
-
-      for col_mode in 1:mode_count
-        col_shape = shape_value(values, field, point_index, col_mode)
-        col_normal_gradient = shape_normal_gradient(values, field, point_index, col_mode)
-        contribution = -row_shape * col_normal_gradient - row_normal_gradient * col_shape +
-                       penalty * row_shape * col_shape
-        local_block[row_mode, col_mode] += contribution * weighted
-      end
+    for mode_index in 1:mode_count
+      shape = shape_value(values, field, point_index, mode_index)
+      flux = shape_normal_gradient(values, field, point_index, mode_index)
+      local_block[mode_index] += (penalty * shape * shape - 2 * shape * flux) * weighted
     end
   end
 

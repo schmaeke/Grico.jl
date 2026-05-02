@@ -1349,8 +1349,8 @@ function _SnapshotNeighborLookup(snapshot::GridSnapshot{D}) where {D}
   return _SnapshotNeighborLookup{D,typeof(tree_lookup)}(current, tree_lookup)
 end
 
-function _opposite_active_leaves(lookup::_SnapshotNeighborLookup, cell::Integer,
-                                 axis::Integer, side::Integer)
+function _opposite_active_leaves(lookup::_SnapshotNeighborLookup, cell::Integer, axis::Integer,
+                                 side::Integer)
   snapshot = lookup.snapshot
   grid_data = grid(snapshot)
   checked_cell = _checked_cell(grid_data, cell)
