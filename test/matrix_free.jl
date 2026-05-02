@@ -18,6 +18,19 @@ function Grico.cell_rhs!(local_rhs, ::_MatrixFreeIdentity, values)
   return nothing
 end
 
+struct _MatrixFreeNoDiagonalIdentity end
+
+function Grico.cell_apply!(local_result, ::_MatrixFreeNoDiagonalIdentity, values,
+                           local_coefficients)
+  local_result .+= local_coefficients
+  return nothing
+end
+
+function Grico.cell_rhs!(local_rhs, ::_MatrixFreeNoDiagonalIdentity, values)
+  local_rhs .+= 1
+  return nothing
+end
+
 struct _MatrixFreeMassAction{F}
   field::F
 end
@@ -220,6 +233,15 @@ end
   add_cell!(identity_problem, _MatrixFreeIdentity())
   identity_state = solve(identity_problem)
   @test coefficients(identity_state) ≈ [1.0, 1.0]
+
+  no_diagonal_problem = AffineProblem(dg_field)
+  add_cell!(no_diagonal_problem, _MatrixFreeNoDiagonalIdentity())
+  no_diagonal_plan = compile(no_diagonal_problem)
+  no_diagonal_workspace = Grico._ReducedOperatorWorkspace(no_diagonal_plan)
+  @test Grico._preconditioner_data(no_diagonal_plan, no_diagonal_workspace,
+                                   JacobiPreconditioner()) === nothing
+  no_diagonal_state = solve(no_diagonal_plan; preconditioner=JacobiPreconditioner())
+  @test coefficients(no_diagonal_state) ≈ [1.0, 1.0]
 
   mass_problem = AffineProblem(dg_field)
   add_cell!(mass_problem, _MatrixFreeMassAction(dg_field))

@@ -11,8 +11,8 @@ Configuration for generic diagonal Jacobi preconditioning.
 
 When all affine operators provide compatible local diagonal kernels, the
 preconditioner builds the reduced diagonal directly from those kernels. It
-falls back to exact reduced-operator probing for constraint maps or operator
-sets that need the more general path.
+uses identity preconditioning when the kernels are unavailable or incompatible
+with the reduced operator map.
 """
 struct JacobiPreconditioner end
 
@@ -133,31 +133,8 @@ end
 function _jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
                                   workspace::_ReducedOperatorWorkspace{T}) where {D,
                                                                                   T<:AbstractFloat}
-  n = reduced_dof_count(plan)
-  inverse_diagonal = zeros(T, n)
-
-  if _reduced_diagonal!(inverse_diagonal, plan, workspace)
-    return _invert_jacobi_diagonal!(inverse_diagonal)
-  end
-
-  return _probe_jacobi_inverse_diagonal(plan, workspace)
-end
-
-function _probe_jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
-                                        workspace::_ReducedOperatorWorkspace{T}) where {D,
-                                                                                        T<:AbstractFloat}
-  n = reduced_dof_count(plan)
-  inverse_diagonal = Vector{T}(undef, n)
-  basis = zeros(T, n)
-  response = zeros(T, n)
-
-  for index in 1:n
-    basis[index] = one(T)
-    _reduced_apply!(response, plan, basis, workspace)
-    inverse_diagonal[index] = response[index]
-    basis[index] = zero(T)
-  end
-
+  inverse_diagonal = zeros(T, reduced_dof_count(plan))
+  _reduced_diagonal!(inverse_diagonal, plan, workspace) || return nothing
   return _invert_jacobi_diagonal!(inverse_diagonal)
 end
 
