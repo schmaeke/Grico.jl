@@ -1,4 +1,4 @@
-# This file contains the setup side of the assembly layer:
+# This file contains the setup side of the operator-evaluation layer:
 # 1. immutable compiled plan data,
 # 2. compilation from editable problem descriptions to `AssemblyPlan`, and
 # 3. compilation of Dirichlet and mean-value constraints.
@@ -12,13 +12,13 @@
 #
 # The job of this file is to freeze all of that into one immutable
 # `AssemblyPlan`. The plan is the exact algebraic snapshot on which runtime
-# assembly and nonlinear evaluations operate. It records not only operators and
-# integration data, but also the compiled form of strong Dirichlet constraints
-# and mean-value constraints.
+# matrix-free applications and nonlinear evaluations operate. It records not
+# only operators and integration data, but also the compiled form of strong
+# Dirichlet constraints and mean-value constraints.
 #
-# In that sense, `problem.jl` describes what should be assembled, whereas this
-# file determines how those declarations are translated into algebraic rows and
-# eliminated degrees of freedom.
+# In that sense, `problem.jl` describes which local operators should be applied,
+# whereas this file determines how those declarations are translated into
+# algebraic rows and eliminated degrees of freedom.
 #
 # Two global algebraic transformations dominate that translation.
 #
@@ -29,7 +29,7 @@
 # affine functions of remaining free dofs.
 #
 # Second, mean-value constraints are turned into explicit global linear
-# functionals assembled against the already compiled basis. Those rows survive
+# functionals integrated against the already compiled basis. Those rows survive
 # into the later nonlinear residual/tangent path as ordinary algebraic
 # equations.
 #
@@ -43,7 +43,7 @@
 #
 #   u[pivot] = rhs - Σᵢ coefficients[i] * u[indices[i]]
 #
-# or, equivalently for residual/tangent assembly,
+# or, equivalently for residual/tangent evaluation,
 #
 #   Σᵢ coefficients[i] * u[indices[i]] - rhs = 0
 #
@@ -84,7 +84,7 @@ struct _ConstraintMasks{T<:AbstractFloat}
   blocked_rows::BitVector
 end
 
-# Batched traversal metadata used by runtime assembly and nonlinear evaluation.
+# Batched traversal metadata used by runtime operator and nonlinear evaluation.
 # Items that share the same local kernel signature are grouped together so the
 # runtime passes can reuse the same local buffer shape and avoid repeated
 # selector/filter work inside the hottest loops.
@@ -111,17 +111,16 @@ end
 """
     AssemblyPlan
 
-Compiled assembly data for a problem on a fixed field layout and mesh state.
+Compiled operator data for a problem on a fixed field layout and mesh state.
 
 An `AssemblyPlan` stores the validated [`FieldLayout`](@ref), the compiled local
 integration data, the operator collections, and the compiled Dirichlet and
 mean-value constraints. It is the reusable object that separates the expensive
-setup phase from repeated assembly or nonlinear evaluations.
+setup phase from repeated matrix-free applications or nonlinear evaluations.
 
-For affine problems, `assemble(plan)` turns the plan into an [`AffineSystem`](@ref).
-For nonlinear problems, the plan initially stores only the residual traversal
-data; tangent structures are compiled on first use by [`tangent`](@ref) or
-[`tangent!`](@ref).
+For affine problems, [`apply!`](@ref) applies the compiled operator action
+directly to coefficient vectors. For nonlinear problems, [`residual!`](@ref)
+evaluates the compiled residual equations directly on the full field layout.
 
 The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
@@ -155,14 +154,14 @@ for efficient later traversal.
 
 For Dirichlet data, "projected to trace dofs" means that the prescribed
 boundary values are matched in the `L²` sense on the active trace basis of the
-selected field. This is what allows the later assembly layer to eliminate
+selected field. This is what allows the later operator layer to eliminate
 strong boundary data in a basis-agnostic way, even on hanging interfaces and
 high-order trace spaces.
 
 The returned plan is immutable in the sense that its mesh, fields, operators,
 constraints, and traversal data are fixed. Some operation-specific symbolic
 runtime structures may be compiled lazily and cached inside the plan when an
-operation such as tangent assembly is first requested.
+operation such as tangent application is first requested.
 """
 compile(problem::AffineProblem) = _compile_problem_description(problem, Val(:affine))
 
@@ -180,7 +179,7 @@ end
 # Main compilation pipeline from problem description to immutable plan.
 
 # After geometric compilation, surface selectors can be validated against the
-# actual embedded-surface quadratures that will participate in assembly. This
+# actual embedded-surface quadratures that will participate in evaluation. This
 # catches misspelled or otherwise dead symbolic tags at `compile` time.
 function _validate_surface_operators(surface_operators, surfaces)
   available_tags = Set{Symbol}()
@@ -200,7 +199,7 @@ function _validate_surface_operators(surface_operators, surfaces)
 end
 
 # Shared compilation path for affine and residual problems. The resulting plan
-# is structurally the same; later assembly/evaluation decides which operator
+# is structurally the same; later operator evaluation decides which operator
 # callbacks are used.
 function _compile_problem(fields, cell_operators, boundary_operators, interface_operators,
                           surface_operators, cell_quadratures, embedded_surfaces,
@@ -227,7 +226,7 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                       constraint_masks, traversal_plan, assembly_structure)
 end
 
-# Compile serial traversal metadata for assembly and nonlinear evaluation.
+# Compile serial traversal metadata for operator and nonlinear evaluation.
 function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegration,
                                  boundary_operators, interface_operators, surface_operators)
   boundary_lookup = _boundary_operator_lookup(dimension, boundary_operators)
@@ -452,6 +451,10 @@ end
 # Find the Dirichlet constraints that apply on one boundary face for one already
 # field-filtered constraint set. Multiple constraints are allowed on the same
 # face only when they target disjoint component subsets.
+@inline function _matches(face::FaceValues, boundary::BoundaryFace)
+  return face.axis == boundary.axis && face.side == boundary.side
+end
+
 function _matching_dirichlets(constraints, face::FaceValues, component_total::Int)
   matched = Int[]
   covered = falses(component_total)
@@ -498,38 +501,100 @@ function _boundary_projection_system(layout::FieldLayout{D,T}, slot::_FieldSlot{
 
   all(constraint_matches) ||
     throw(ArgumentError("Dirichlet constraint does not match any boundary face for field $(field_name(slot.field))"))
-  isempty(selected_face_indices) && return Int[], spzeros(T, 0, 0), T[]
+  isempty(selected_face_indices) && return Int[], zeros(T, 0, 0), T[]
   selected_faces = boundary_faces[selected_face_indices]
   operators = [_BoundaryContribution(constraint.boundary,
                                      _DirichletProjection(slot.field, constraint.components,
                                                           constraint.data))
                for constraint in constraints]
-  ndofs = dof_count(layout)
   max_local_dofs = maximum(face.local_dof_count for face in selected_faces)
-  scratch = _AssemblyScratch(T, max_local_dofs)
-  fixed = falses(ndofs)
-  fixed_values = zeros(T, ndofs)
-  pivot_rows = falses(ndofs)
   boundary_lookup = _boundary_operator_lookup(dimension(layout), operators)
   boundary_batches = _compile_filtered_batches(selected_faces, _face_kernel_signature,
                                                face -> boundary_lookup[_boundary_lookup_slot(face.axis,
                                                                                              face.side)])
-  matrix_template = _compile_boundary_projection_template(T, ndofs, selected_faces, operators)
-  full_matrix = _instantiate_sparse(T, matrix_template)
-  rhs_data = zeros(T, ndofs)
-  matrix_accumulator = _SparseAccumulator(matrix_template.pattern, full_matrix.nzval)
-  rhs_accumulator = _VectorAccumulator(rhs_data)
-  _assemble_boundary_pass!(scratch, matrix_accumulator, rhs_accumulator, boundary_batches,
-                           selected_faces, operators, fixed, fixed_values, pivot_rows)
-
   slot_range = field_dof_range(layout, slot.field)
-  slot_matrix = full_matrix[slot_range, slot_range]
-  slot_rhs = rhs_data[slot_range]
+  slot_matrix = zeros(T, length(slot_range), length(slot_range))
+  slot_rhs = zeros(T, length(slot_range))
+  local_matrix = zeros(T, max_local_dofs, max_local_dofs)
+  local_rhs = zeros(T, max_local_dofs)
+  _assemble_boundary_projection!(slot_matrix, slot_rhs, slot_range, local_matrix, local_rhs,
+                                 boundary_batches, selected_faces, operators)
   involved = _active_projection_dofs(slot_matrix, slot_rhs)
   isempty(involved) &&
     throw(ArgumentError("Dirichlet projection found no active trace dofs for field $(field_name(slot.field))"))
   dofs = [first(slot_range) + local_dof - 1 for local_dof in involved]
   return dofs, slot_matrix[involved, involved], slot_rhs[involved]
+end
+
+function _assemble_boundary_projection!(slot_matrix::AbstractMatrix{T},
+                                        slot_rhs::AbstractVector{T},
+                                        slot_range::UnitRange{Int},
+                                        local_matrix::AbstractMatrix{T},
+                                        local_rhs::AbstractVector{T},
+                                        batches::Vector{_FilteredKernelBatch}, faces,
+                                        operators) where {T<:AbstractFloat}
+  for batch in batches
+    matrix_view = view(local_matrix, 1:batch.local_dof_count, 1:batch.local_dof_count)
+    rhs_view = view(local_rhs, 1:batch.local_dof_count)
+
+    for batch_face_index in eachindex(batch.item_indices)
+      face = @inbounds faces[batch.item_indices[batch_face_index]]
+      fill!(matrix_view, zero(T))
+      fill!(rhs_view, zero(T))
+
+      for operator_index in batch.operator_indices
+        wrapped = @inbounds operators[operator_index]
+        _face_projection_matrix!(matrix_view, wrapped.operator, face)
+        _face_projection_rhs!(rhs_view, wrapped.operator, face)
+      end
+
+      _scatter_projection!(slot_matrix, slot_rhs, slot_range, face, matrix_view, rhs_view)
+    end
+  end
+
+  return nothing
+end
+
+@inline function _local_term_range(item::_AssemblyValues, local_dof::Int)
+  return item.term_offsets[local_dof]:(item.term_offsets[local_dof+1]-1)
+end
+
+@inline function _slot_index(slot_range::UnitRange{Int}, global_dof::Int)
+  first_dof = first(slot_range)
+  last_dof = last(slot_range)
+  return first_dof <= global_dof <= last_dof ? global_dof - first_dof + 1 : 0
+end
+
+function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::AbstractVector{T},
+                              slot_range::UnitRange{Int}, item::_AssemblyValues,
+                              local_matrix::AbstractMatrix{T},
+                              local_rhs::AbstractVector{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for local_row in 1:item.local_dof_count
+    rhs_value = local_rhs[local_row]
+
+    for row_term in _local_term_range(item, local_row)
+      row = _slot_index(slot_range, item.term_indices[row_term])
+      row == 0 && continue
+      row_coefficient = item.term_coefficients[row_term]
+      abs(rhs_value) > tolerance && (rhs_data[row] += row_coefficient * rhs_value)
+
+      for local_col in 1:item.local_dof_count
+        coefficient = local_matrix[local_row, local_col]
+        abs(coefficient) > tolerance || continue
+
+        for col_term in _local_term_range(item, local_col)
+          col = _slot_index(slot_range, item.term_indices[col_term])
+          col == 0 && continue
+          matrix_data[row, col] += row_coefficient * coefficient *
+                                   item.term_coefficients[col_term]
+        end
+      end
+    end
+  end
+
+  return nothing
 end
 
 # Interpret user-supplied Dirichlet data as either scalar or vector-valued
@@ -634,7 +699,7 @@ function _cell_integration_measure(cells, ::Type{T}) where {T<:AbstractFloat}
   return measure
 end
 
-# Auxiliary operator used to assemble the boundary L² projection system for
+# Auxiliary operator used to build the boundary L² projection system for
 # Dirichlet data.
 struct _DirichletProjection{F,C,G}
   field::F
@@ -643,7 +708,7 @@ struct _DirichletProjection{F,C,G}
 end
 
 # Boundary mass matrix on the active trace space of one field.
-function face_matrix!(local_matrix, operator::_DirichletProjection, values::FaceValues)
+function _face_projection_matrix!(local_matrix, operator::_DirichletProjection, values::FaceValues)
   block_data = block(local_matrix, values, operator.field, operator.field)
   data = _field_values(values, operator.field)
   mode_count = data.local_mode_count
@@ -671,8 +736,8 @@ end
 
 # Right-hand side of the boundary projection system against the prescribed
 # Dirichlet data.
-function face_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
-                   values::FaceValues) where {F,C,G}
+function _face_projection_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
+                               values::FaceValues) where {F,C,G}
   block_data = block(local_rhs, values, operator.field)
   data = _field_values(values, operator.field)
   mode_count = data.local_mode_count
@@ -697,16 +762,15 @@ function face_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
 end
 
 # Identify the trace dofs that are actually active in the projection system.
-function _active_projection_dofs(matrix_data::SparseMatrixCSC{T,Int},
+function _active_projection_dofs(matrix_data::AbstractMatrix{T},
                                  rhs_data::AbstractVector{T}) where {T<:AbstractFloat}
   active = falses(size(matrix_data, 1))
-  rows, cols, values = findnz(matrix_data)
   tolerance = 1000 * eps(T)
 
-  for index in eachindex(values)
-    abs(values[index]) > tolerance || continue
-    active[rows[index]] = true
-    active[cols[index]] = true
+  for col in axes(matrix_data, 2), row in axes(matrix_data, 1)
+    abs(matrix_data[row, col]) > tolerance || continue
+    active[row] = true
+    active[col] = true
   end
 
   for index in eachindex(rhs_data)
@@ -726,7 +790,7 @@ end
 
 # Convert the projected boundary system to either explicitly fixed dofs or affine
 # relations between trace dofs. The goal is to move from the abstract boundary
-# coefficient vector `α` to row-wise elimination formulas that later assembly
+# coefficient vector `α` to row-wise elimination formulas that later evaluation
 # can apply directly.
 function _dirichlet_relations(dofs::Vector{Int}, matrix_data::AbstractMatrix{T},
                               rhs_data::AbstractVector{T},

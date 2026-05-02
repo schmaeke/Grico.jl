@@ -13,7 +13,7 @@ is deliberately organized as a small stack of layers:
 2. Cartesian refinement topology and affine geometry,
 3. admissible local bases and inter-element continuity compilation,
 4. fields, local integration data, and operator descriptions,
-5. assembly, linear/nonlinear solves, adaptivity, verification, and output.
+5. matrix-free operator evaluation, solves, adaptivity, verification, and output.
 
 This file is the architectural introduction to that stack. Its `include` order
 is intentionally both the dependency order of the implementation and the
@@ -21,14 +21,14 @@ recommended reading order for a new contributor. Reading the files from top to
 bottom should therefore mirror the mathematical construction of the library:
 start with one-dimensional ingredients, build a dyadic mesh and a physical
 domain, compile an hp space on the active leaves with the requested
-inter-element continuity, attach fields and operators, then assemble, solve,
+inter-element continuity, attach fields and operators, then apply, solve,
 adapt, and postprocess.
 
 Two complementary viewpoints are useful while reading the package. One is
 local: on each active leaf, the code builds tensor-product polynomial modes,
 quadrature rules, and local weak-form contributions. The other is global: those
 leaf-local quantities are then tied together by topology, continuity policy,
-and sparse global degree-of-freedom numbering. Much of the architecture exists
+and global degree-of-freedom numbering. Much of the architecture exists
 to keep those two viewpoints separate and explicit.
 
 # Reading Guide
@@ -53,8 +53,8 @@ The source tree is easiest to understand in the following conceptual blocks:
 5. `problem.jl`, `embedded.jl`, `integration.jl`, `plans.jl`, `assembly.jl`,
    `solve.jl`, `adaptivity.jl`
    The execution layer. It describes weak-form operators, specialized
-   quadrature constructions, compiled local evaluation data, assembly plans,
-   global systems, built-in solve support, and space transitions under
+   quadrature constructions, compiled local evaluation data, operator plans,
+   solve support, and space transitions under
    adaptivity.
 6. `verification.jl`, `postprocess.jl`
    Postprocessing helpers for error measurement and backend-neutral sampling.
@@ -71,7 +71,7 @@ A typical user-facing workflow follows the same structure:
 3. define fields and a `FieldLayout`,
 4. describe a problem through local cell, face, interface, or surface
    operators,
-5. `compile`, `assemble`, and `solve`,
+5. `compile`, `apply!` or `solve`,
 6. optionally verify, export, or adapt and transfer the resulting state.
 
 The exports grouped below follow these same layers. Internal helper code is
@@ -81,11 +81,6 @@ tracks the main abstractions rather than every implementation detail.
 module Grico
 
 using LinearAlgebra
-using SparseArrays
-using AlgebraicMultigrid: aspreconditioner, smoothed_aggregation
-using IncompleteLU: ilu
-using Krylov: cg, gmres
-using SymRCM: symrcm
 
 # Part I. Internal utilities shared throughout the implementation. This file is
 # intentionally included first because nearly every later layer depends on its
@@ -146,14 +141,15 @@ export AbstractField, FieldLayout, ScalarField, State, VectorField, coefficients
 
 # Part V. Problem definition and execution. Once a space and fields exist, these
 # files describe weak-form operators, compile reusable local evaluation data,
-# assemble global systems, solve them, and transition states across adaptive
+# apply matrix-free operators, solve them, and transition states across adaptive
 # mesh or degree changes.
 include("problem.jl")
 export AffineProblem, BoundaryFace, Dirichlet, MeanValue, ResidualProblem, add_boundary!, add_cell!,
-       add_constraint!, add_interface!, add_surface!, cell_matrix!, cell_residual!, cell_rhs!,
-       cell_tangent!, constrain!, face_matrix!, face_residual!, face_rhs!, face_tangent!,
-       interface_matrix!, interface_residual!, interface_rhs!, interface_tangent!, surface_matrix!,
-       surface_residual!, surface_rhs!, surface_tangent!
+       add_constraint!, add_interface!, add_surface!, cell_apply!, cell_residual!, cell_rhs!,
+       cell_tangent_apply!, constrain!, face_apply!, face_residual!, face_rhs!,
+       face_tangent_apply!, interface_apply!, interface_residual!, interface_rhs!,
+       interface_tangent_apply!, surface_apply!, surface_residual!, surface_rhs!,
+       surface_tangent_apply!
 
 include("embedded.jl")
 export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
@@ -169,12 +165,11 @@ include("plans.jl")
 export AssemblyPlan, compile
 
 include("assembly.jl")
-export AffineSystem, ResidualWorkspace, assemble, matrix, residual, residual!, rhs, tangent,
-       tangent!
+export ResidualWorkspace, apply, apply!, residual, residual!, rhs, rhs!, tangent_apply,
+       tangent_apply!
 
 include("solve.jl")
-export AdditiveSchwarzPreconditioner, FieldSplitSchurPreconditioner, ILUPreconditioner,
-       SmoothedAggregationAMGPreconditioner, solve
+export JacobiPreconditioner, solve
 
 include("adaptivity.jl")
 export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, adapted_field, adapted_fields,

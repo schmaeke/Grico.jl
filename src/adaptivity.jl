@@ -1379,8 +1379,33 @@ function _assemble_transfer_mass!(local_matrix, values::CellValues, field::Abstr
   return local_matrix
 end
 
-function cell_matrix!(local_matrix, operator::_TransferMass, values::CellValues)
-  _assemble_transfer_mass!(local_matrix, values, operator.field)
+function cell_apply!(local_result, operator::_TransferMass, values::CellValues, local_coefficients)
+  field = operator.field
+  mode_count = local_mode_count(values, field)
+  components = component_count(field)
+
+  for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+
+    for component in 1:components
+      trial_value = zero(eltype(local_result))
+
+      for col_mode in 1:mode_count
+        col = local_dof_index(values, field, component, col_mode)
+        trial_value += shape_value(values, field, point_index, col_mode) *
+                       local_coefficients[col]
+      end
+
+      trial_value == 0 && continue
+
+      for row_mode in 1:mode_count
+        row = local_dof_index(values, field, component, row_mode)
+        local_result[row] += shape_value(values, field, point_index, row_mode) * weighted *
+                             trial_value
+      end
+    end
+  end
+
   return nothing
 end
 
@@ -1655,7 +1680,9 @@ the source/target spaces, and the chosen linear solve path, but not on any
 specific PDE operator. On fully discontinuous target spaces, the transfer
 recognizes that the projection system is cellwise block diagonal and solves one
 local dense system per target cell instead of assembling a global sparse
-problem.
+problem. On coupled target spaces, the transfer now uses the matrix-free solve
+API and therefore requires a `linear_solve` implementation until the package
+default solver is added.
 """
 function transfer_state(transition::SpaceTransition, state::State, old_fields::Tuple,
                         new_fields::Tuple; linear_solve=default_linear_solve)
@@ -1677,7 +1704,7 @@ function transfer_state(transition::SpaceTransition, state::State, old_fields::T
   end
 
   plan = compile(problem)
-  return State(plan, solve(assemble(plan); linear_solve=linear_solve))
+  return solve(plan; linear_solve=linear_solve)
 end
 
 function transfer_state(transition::SpaceTransition, state::State, old_field::AbstractField,

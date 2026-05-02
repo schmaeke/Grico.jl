@@ -86,7 +86,7 @@ may be a constant or a callable of the physical point.
 This constraint prescribes the trace of `field` on the selected physical
 boundary face. During compilation, the library projects the prescribed boundary
 data onto the active trace degrees of freedom and then eliminates those dofs
-from the assembled linear system or residual problem.
+from the global affine or residual problem.
 
 When the component selector is omitted, the constraint applies to every
 component of `field`. When one component index or a tuple of indices is given,
@@ -185,7 +185,7 @@ end
 
 # Shared mutable storage behind the public affine and residual problem wrappers.
 # The two problem kinds expose the same editable collections and differ only in
-# which operator callbacks later assembly/evaluation routines use.
+# which operator callbacks later evaluation routines use.
 mutable struct _ProblemData
   fields::Vector{AbstractField}
   cell_operators::Vector{Any}
@@ -262,11 +262,11 @@ problem in this library. It stores
 - and global constraints such as Dirichlet and mean-value conditions.
 
 The operators themselves are plain Julia objects. Their meaning is determined by
-the callback methods they implement, such as [`cell_matrix!`](@ref),
-[`cell_rhs!`](@ref), [`face_matrix!`](@ref), or [`interface_matrix!`](@ref).
+the callback methods they implement, such as [`cell_apply!`](@ref),
+[`cell_rhs!`](@ref), [`face_apply!`](@ref), or [`interface_apply!`](@ref).
 
-The problem object itself does not assemble anything yet. It is purely a
-mutable declaration of what should later be compiled and traversed by assembly
+The problem object itself does not evaluate anything yet. It is purely a
+mutable declaration of what should later be compiled and traversed by operator
 plans.
 """
 mutable struct AffineProblem <: _AbstractProblem
@@ -314,12 +314,12 @@ Container for nonlinear residual/tangent operators and constraints.
 `ResidualProblem` plays the same organizational role as [`AffineProblem`](@ref),
 but for nonlinear problems. Its operators contribute through residual and
 tangent callbacks such as [`cell_residual!`](@ref) and
-[`cell_tangent!`](@ref), and the assembled system is interpreted as a nonlinear
+[`cell_tangent_apply!`](@ref), and the operator is interpreted as a nonlinear
 residual equation together with its local linearizations.
 
 The internal storage layout is intentionally the same as for
 [`AffineProblem`](@ref). The distinction between the two problem types only
-appears later when assembly/evaluation dispatches to affine versus nonlinear
+appears later when operator evaluation dispatches to affine versus nonlinear
 operator callbacks.
 """
 mutable struct ResidualProblem <: _AbstractProblem
@@ -462,9 +462,9 @@ end
 Add a cell operator to `problem`.
 
 For an [`AffineProblem`](@ref), cell operators contribute through callbacks such
-as [`cell_matrix!`](@ref) and [`cell_rhs!`](@ref). For a
+as [`cell_apply!`](@ref) and [`cell_rhs!`](@ref). For a
 [`ResidualProblem`](@ref), they contribute through [`cell_residual!`](@ref) and
-[`cell_tangent!`](@ref). The function returns `problem`, so calls can be
+[`cell_tangent_apply!`](@ref). The function returns `problem`, so calls can be
 chained.
 """
 function add_cell!(problem::_AbstractProblem, operator)
@@ -480,7 +480,7 @@ Add a boundary operator on the physical boundary face `boundary`.
 Boundary operators act on [`FaceValues`](@ref) items and are validated
 immediately against the problem dimension and periodic topology. In particular,
 this function rejects boundaries that lie on periodic axes. The boundary
-selector is stored alongside the operator so later compilation/assembly stages
+selector is stored alongside the operator so later compilation/evaluation stages
 can route the operator only to matching physical faces.
 """
 function add_boundary!(problem::_AbstractProblem, boundary::BoundaryFace, operator)
@@ -559,15 +559,16 @@ end
 # embedded surfaces.
 
 """
-    cell_matrix!(local_matrix, operator, values)
+    cell_apply!(local_result, operator, values, local_coefficients)
 
-Accumulate the affine cell-matrix contribution of `operator` on one
-[`CellValues`](@ref) item into `local_matrix`.
+Accumulate the matrix-free affine cell action of `operator` on one
+[`CellValues`](@ref) item into `local_result`.
 
-The default method does nothing. Custom affine cell operators should overload
-this function when they contribute a bilinear volume term.
+`local_coefficients` and `local_result` use the local coefficient numbering of
+`values`. The default method does nothing. Custom affine cell operators should
+overload this function when they contribute a bilinear volume term.
 """
-cell_matrix!(local_matrix, operator, values) = nothing
+cell_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
     cell_rhs!(local_rhs, operator, values)
@@ -581,12 +582,12 @@ this function when they contribute a linear volume term.
 cell_rhs!(local_rhs, operator, values) = nothing
 
 """
-    face_matrix!(local_matrix, operator, values)
+    face_apply!(local_result, operator, values, local_coefficients)
 
-Accumulate the affine boundary-face matrix contribution of `operator` on one
-[`FaceValues`](@ref) item into `local_matrix`.
+Accumulate the matrix-free affine boundary-face action of `operator` on one
+[`FaceValues`](@ref) item into `local_result`.
 """
-face_matrix!(local_matrix, operator, values) = nothing
+face_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
     face_rhs!(local_rhs, operator, values)
@@ -597,12 +598,12 @@ on one [`FaceValues`](@ref) item into `local_rhs`.
 face_rhs!(local_rhs, operator, values) = nothing
 
 """
-    surface_matrix!(local_matrix, operator, values)
+    surface_apply!(local_result, operator, values, local_coefficients)
 
-Accumulate the affine embedded-surface matrix contribution of `operator` on one
-[`SurfaceValues`](@ref) item into `local_matrix`.
+Accumulate the matrix-free affine embedded-surface action of `operator` on one
+[`SurfaceValues`](@ref) item into `local_result`.
 """
-surface_matrix!(local_matrix, operator, values) = nothing
+surface_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
     surface_rhs!(local_rhs, operator, values)
@@ -613,12 +614,12 @@ Accumulate the affine embedded-surface right-hand-side contribution of
 surface_rhs!(local_rhs, operator, values) = nothing
 
 """
-    interface_matrix!(local_matrix, operator, values)
+    interface_apply!(local_result, operator, values, local_coefficients)
 
-Accumulate the affine interface matrix contribution of `operator` on one
-[`InterfaceValues`](@ref) item into `local_matrix`.
+Accumulate the matrix-free affine interface action of `operator` on one
+[`InterfaceValues`](@ref) item into `local_result`.
 """
-interface_matrix!(local_matrix, operator, values) = nothing
+interface_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
     interface_rhs!(local_rhs, operator, values)
@@ -640,15 +641,15 @@ nothing.
 cell_residual!(local_residual, operator, values, state) = nothing
 
 """
-    cell_tangent!(local_tangent, operator, values, state)
+    cell_tangent_apply!(local_result, operator, values, state, local_increment)
 
-Accumulate the cell tangent contribution of `operator` on one [`CellValues`](@ref)
-item into `local_tangent`.
+Accumulate the matrix-free cell tangent action of `operator` on one
+[`CellValues`](@ref) item into `local_result`.
 
 This is the local linearization of the residual contribution with respect to the
-current `state`. The default method does nothing.
+current `state`, applied to `local_increment`. The default method does nothing.
 """
-cell_tangent!(local_tangent, operator, values, state) = nothing
+cell_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
 """
     face_residual!(local_residual, operator, values, state)
@@ -659,12 +660,12 @@ one [`FaceValues`](@ref) item into `local_residual`.
 face_residual!(local_residual, operator, values, state) = nothing
 
 """
-    face_tangent!(local_tangent, operator, values, state)
+    face_tangent_apply!(local_result, operator, values, state, local_increment)
 
-Accumulate the boundary-face tangent contribution of `operator` on one
-[`FaceValues`](@ref) item into `local_tangent`.
+Accumulate the matrix-free boundary-face tangent action of `operator` on one
+[`FaceValues`](@ref) item into `local_result`.
 """
-face_tangent!(local_tangent, operator, values, state) = nothing
+face_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
 """
     surface_residual!(local_residual, operator, values, state)
@@ -675,12 +676,12 @@ on one [`SurfaceValues`](@ref) item into `local_residual`.
 surface_residual!(local_residual, operator, values, state) = nothing
 
 """
-    surface_tangent!(local_tangent, operator, values, state)
+    surface_tangent_apply!(local_result, operator, values, state, local_increment)
 
-Accumulate the embedded-surface tangent contribution of `operator` on one
-[`SurfaceValues`](@ref) item into `local_tangent`.
+Accumulate the matrix-free embedded-surface tangent action of `operator` on one
+[`SurfaceValues`](@ref) item into `local_result`.
 """
-surface_tangent!(local_tangent, operator, values, state) = nothing
+surface_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
 
 """
     interface_residual!(local_residual, operator, values, state)
@@ -691,9 +692,9 @@ Accumulate the nonlinear interface residual contribution of `operator` on one
 interface_residual!(local_residual, operator, values, state) = nothing
 
 """
-    interface_tangent!(local_tangent, operator, values, state)
+    interface_tangent_apply!(local_result, operator, values, state, local_increment)
 
-Accumulate the interface tangent contribution of `operator` on one
-[`InterfaceValues`](@ref) item into `local_tangent`.
+Accumulate the matrix-free interface tangent action of `operator` on one
+[`InterfaceValues`](@ref) item into `local_result`.
 """
-interface_tangent!(local_tangent, operator, values, state) = nothing
+interface_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
