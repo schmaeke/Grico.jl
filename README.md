@@ -146,7 +146,7 @@ state = solve(plan; preconditioner=JacobiPreconditioner())
 ## Scope Notes
 
 - Grico is currently built around axis-aligned affine Cartesian geometry.
-- Continuity policies are currently package-level `:cg` and `:dg`.
+- Continuity policies may be full `:cg`, full `:dg`, or mixed per axis.
 - Postprocessing samples and VTK export are intended for 1D, 2D, and 3D output.
 - VTK/PVD output is provided by an optional package extension; add `WriteVTK`
   to the active environment and load it before calling `write_vtk` or
@@ -157,3 +157,23 @@ state = solve(plan; preconditioner=JacobiPreconditioner())
 - Output backends share the same postprocessing inputs: a state or geometric
   reference, optional point/cell/field datasets, and the sampling controls
   `subdivisions` and `sample_degree`.
+
+## First Release Scope
+
+The first mature release keeps the public API focused on single-node,
+matrix-free CPU finite elements on adaptive Cartesian grids. The stable surface
+covers domain construction, hp spaces, fields and states, local operator
+callbacks, affine and residual matrix-free assembly plans, reduced affine CG
+solves, manual adaptivity, state transfer, verification helpers, and
+backend-neutral postprocessing inputs.
+
+Advanced features are exposed where the design is useful but intentionally
+narrow: automatic adaptivity indicators, finite-cell and implicit-surface
+quadrature, explicit segment-mesh surfaces, and low-level topology or space
+inspection APIs should be treated as specialized building blocks.
+
+Distributed memory, MPI, GPU execution, unstructured meshes, curved geometry,
+and sparse global matrix assembly are outside the scope of this release. Makie
+figure output is currently limited to 1D and 2D views, and tangent
+preconditioning for nonlinear reduced solves is not implemented by the default
+solver.

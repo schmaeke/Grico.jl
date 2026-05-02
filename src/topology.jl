@@ -1160,14 +1160,29 @@ function opposite_active_leaves(snapshot::GridSnapshot, cell::Integer, axis::Int
   return _opposite_active_leaves(_SnapshotNeighborLookup(snapshot), cell, axis, side)
 end
 
+"""
+    boundary_face_count(snapshot)
+
+Return the number of boundary face records stored in `snapshot`.
+"""
 function boundary_face_count(snapshot::GridSnapshot)
   return length(_require_current_snapshot(snapshot).boundary_leaf)
 end
 
+"""
+    interface_count(snapshot)
+
+Return the number of non-periodic interface records stored in `snapshot`.
+"""
 function interface_count(snapshot::GridSnapshot)
   return length(_require_current_snapshot(snapshot).interface_minus)
 end
 
+"""
+    boundary_face_spec(snapshot, index)
+
+Return the indexed [`GridBoundaryFace`](@ref) descriptor from `snapshot`.
+"""
 function boundary_face_spec(snapshot::GridSnapshot, index::Integer)
   _require_current_snapshot(snapshot)
   count = boundary_face_count(snapshot)
@@ -1178,6 +1193,11 @@ function boundary_face_spec(snapshot::GridSnapshot, index::Integer)
                           Int(@inbounds(snapshot.boundary_side[checked_index])))
 end
 
+"""
+    interface_spec(snapshot, index)
+
+Return the indexed [`GridInterface`](@ref) descriptor from `snapshot`.
+"""
 function interface_spec(snapshot::GridSnapshot, index::Integer)
   _require_current_snapshot(snapshot)
   count = interface_count(snapshot)
@@ -1214,9 +1234,6 @@ cells have unique logical signatures.
 It is mainly a debugging, testing, and constructor-validation tool. Public
 constructors and topology copies already call it automatically.
 """
-# Internal consistency check for the complete topological state. Constructors and
-# tests use this to ensure that the refinement arrays, active-leaf list, and
-# logical tree structure are internally consistent.
 function check_topology(grid::CartesianGrid)
   stored = stored_cell_count(grid)
   all(count >= 1 for count in grid.root_counts) ||

@@ -498,6 +498,12 @@ function rhs(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
   return result
 end
 
+"""
+    rhs!(result, plan)
+    rhs!(result, plan, workspace)
+
+Store the affine right-hand side of `plan` in `result`.
+"""
 function rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
   return rhs!(result, plan, OperatorWorkspace(plan))
 end
@@ -544,6 +550,12 @@ function apply(plan::AssemblyPlan{D,T}, coefficients::AbstractVector{T}) where {
   return result
 end
 
+"""
+    apply!(result, plan, coefficients)
+    apply!(result, plan, coefficients, workspace)
+
+Store the affine matrix-free operator action `plan * coefficients` in `result`.
+"""
 function apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                 coefficients::AbstractVector{T}) where {D,T<:AbstractFloat}
   return apply!(result, plan, coefficients, OperatorWorkspace(plan))
@@ -987,6 +999,12 @@ function residual(plan::AssemblyPlan{D,T}, state::State{T}) where {D,T<:Abstract
   return result
 end
 
+"""
+    residual!(result, plan, state)
+    residual!(result, plan, state, workspace)
+
+Store the nonlinear residual of `plan` at `state` in `result`.
+"""
 function residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                    state::State{T}) where {D,T<:AbstractFloat}
   return residual!(result, plan, state, ResidualWorkspace(plan))
@@ -1034,6 +1052,12 @@ function tangent_apply(plan::AssemblyPlan{D,T}, state::State{T},
   return result
 end
 
+"""
+    tangent_apply!(result, plan, state, increment)
+    tangent_apply!(result, plan, state, increment, workspace)
+
+Store the matrix-free tangent action at `state` applied to `increment` in `result`.
+"""
 function tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T}, state::State{T},
                         increment::AbstractVector{T}) where {D,T<:AbstractFloat}
   return tangent_apply!(result, plan, state, increment, ResidualWorkspace(plan))

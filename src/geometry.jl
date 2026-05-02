@@ -81,6 +81,14 @@ struct Geometry{D,T<:AbstractFloat}
 end
 
 """
+    AbstractDomain{D,T}
+
+Abstract supertype for affine Cartesian domain containers with dimension `D`
+and coordinate scalar type `T`.
+"""
+abstract type AbstractDomain{D,T<:AbstractFloat} end
+
+"""
     Domain(origin, extent, root_counts)
     Domain(grid, geometry)
 
@@ -103,8 +111,6 @@ Higher layers may then wrap that background domain, for example in
 lower-level `Geometry` plus `CartesianGrid` methods remain available because the
 assembly and integration layers sometimes operate on those components directly.
 """
-abstract type AbstractDomain{D,T<:AbstractFloat} end
-
 struct Domain{D,T<:AbstractFloat} <: AbstractDomain{D,T}
   grid::CartesianGrid{D}
   geometry::Geometry{D,T}
