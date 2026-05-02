@@ -8,6 +8,11 @@ function Grico.cell_apply!(local_result, ::_MatrixFreeIdentity, values, local_co
   return nothing
 end
 
+function Grico.cell_diagonal!(local_diagonal, ::_MatrixFreeIdentity, values)
+  local_diagonal .+= 1
+  return nothing
+end
+
 function Grico.cell_rhs!(local_rhs, ::_MatrixFreeIdentity, values)
   local_rhs .+= 1
   return nothing
@@ -40,6 +45,22 @@ function Grico.cell_apply!(local_result, operator::_MatrixFreeMassAction, values
   return nothing
 end
 
+function Grico.cell_diagonal!(local_diagonal, operator::_MatrixFreeMassAction, values)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      shape = shape_value(values, field, point_index, mode_index)
+      local_diagonal[row] += shape * shape * weighted
+    end
+  end
+
+  return nothing
+end
+
 function Grico.cell_apply!(local_result, operator::_MatrixFreeDiffusion, values,
                            local_coefficients)
   field = operator.field
@@ -53,6 +74,23 @@ function Grico.cell_apply!(local_result, operator::_MatrixFreeDiffusion, values,
       row = local_dof_index(values, field, 1, mode_index)
       test_gradient = shape_gradient(values, field, point_index, mode_index)
       local_result[row] += _tuple_dot(field_gradient_value, test_gradient) * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.cell_diagonal!(local_diagonal, operator::_MatrixFreeDiffusion, values)
+  field = operator.field
+  mode_count = local_mode_count(values, field)
+
+  for point_index in 1:point_count(values)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:mode_count
+      row = local_dof_index(values, field, 1, mode_index)
+      test_gradient = shape_gradient(values, field, point_index, mode_index)
+      local_diagonal[row] += _tuple_dot(test_gradient, test_gradient) * weighted
     end
   end
 
@@ -150,6 +188,29 @@ function _reference_scatter!(result, item, local_row, value)
   return result
 end
 
+function _reference_reduced_diagonal(plan)
+  workspace = Grico._ReducedOperatorWorkspace(plan)
+  count = Grico.reduced_dof_count(plan)
+  basis = zeros(count)
+  response = zeros(count)
+  diagonal = zeros(count)
+
+  for index in 1:count
+    basis[index] = 1.0
+    Grico._reduced_apply!(response, plan, basis, workspace)
+    diagonal[index] = response[index]
+    basis[index] = 0.0
+  end
+
+  return diagonal
+end
+
+function _kernel_reduced_diagonal(plan)
+  diagonal = zeros(Grico.reduced_dof_count(plan))
+  selected = Grico._reduced_diagonal!(diagonal, plan, Grico._ReducedOperatorWorkspace(plan))
+  return selected, diagonal
+end
+
 @testset "Matrix-free affine operators" begin
   domain = Domain((0.0,), (1.0,), (1,))
   dg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1), continuity=:dg))
@@ -169,6 +230,9 @@ end
                                (local_matrix, values) -> _local_reference_mass!(local_matrix,
                                                                                  dg_field,
                                                                                  values))
+  mass_diagonal_selected, mass_diagonal = _kernel_reduced_diagonal(mass_plan)
+  @test mass_diagonal_selected
+  @test mass_diagonal ≈ _reference_reduced_diagonal(mass_plan)
 
   diffusion_problem = AffineProblem(dg_field)
   add_cell!(diffusion_problem, _MatrixFreeDiffusion(dg_field, 2.0))
@@ -180,6 +244,9 @@ end
                                                                                      dg_field,
                                                                                      values,
                                                                                      2.0))
+  diffusion_diagonal_selected, diffusion_diagonal = _kernel_reduced_diagonal(diffusion_plan)
+  @test diffusion_diagonal_selected
+  @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
 
   cg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
   cg_field = ScalarField(cg_space; name=:u)
@@ -188,6 +255,10 @@ end
   add_constraint!(dirichlet_problem, Dirichlet(cg_field, BoundaryFace(1, LOWER), 2.0))
   dirichlet_state = solve(dirichlet_problem)
   @test coefficients(dirichlet_state) ≈ [2.0, 1.0]
+  dirichlet_diagonal_selected, dirichlet_diagonal =
+    _kernel_reduced_diagonal(compile(dirichlet_problem))
+  @test dirichlet_diagonal_selected
+  @test dirichlet_diagonal ≈ [1.0]
   jacobi_dirichlet_state = solve(dirichlet_problem; preconditioner=JacobiPreconditioner())
   @test coefficients(jacobi_dirichlet_state) ≈ [2.0, 1.0]
 

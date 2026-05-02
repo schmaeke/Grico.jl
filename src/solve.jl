@@ -9,9 +9,10 @@
 
 Configuration for generic diagonal Jacobi preconditioning.
 
-The current implementation builds the reduced diagonal by probing the
-matrix-free reduced operator. This is intentionally simple and robust; operator
-specific diagonal kernels can replace it later when setup cost matters.
+When all affine operators provide compatible local diagonal kernels, the
+preconditioner builds the reduced diagonal directly from those kernels. It
+falls back to exact reduced-operator probing for constraint maps or operator
+sets that need the more general path.
 """
 struct JacobiPreconditioner end
 
@@ -133,22 +134,44 @@ function _jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
                                   workspace::_ReducedOperatorWorkspace{T}) where {D,
                                                                                   T<:AbstractFloat}
   n = reduced_dof_count(plan)
+  inverse_diagonal = zeros(T, n)
+
+  if _reduced_diagonal!(inverse_diagonal, plan, workspace)
+    return _invert_jacobi_diagonal!(inverse_diagonal)
+  end
+
+  return _probe_jacobi_inverse_diagonal(plan, workspace)
+end
+
+function _probe_jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
+                                        workspace::_ReducedOperatorWorkspace{T}) where {D,
+                                                                                        T<:AbstractFloat}
+  n = reduced_dof_count(plan)
   inverse_diagonal = Vector{T}(undef, n)
   basis = zeros(T, n)
   response = zeros(T, n)
-  tolerance = 1000 * eps(T)
 
   for index in 1:n
     basis[index] = one(T)
     _reduced_apply!(response, plan, basis, workspace)
-    diagonal = response[index]
-    abs(diagonal) > tolerance ||
-      throw(ArgumentError("Jacobi preconditioner found a near-zero diagonal entry at reduced dof $index"))
-    inverse_diagonal[index] = inv(diagonal)
+    inverse_diagonal[index] = response[index]
     basis[index] = zero(T)
   end
 
-  return inverse_diagonal
+  return _invert_jacobi_diagonal!(inverse_diagonal)
+end
+
+function _invert_jacobi_diagonal!(diagonal::AbstractVector{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for index in eachindex(diagonal)
+    value = diagonal[index]
+    abs(value) > tolerance ||
+      throw(ArgumentError("Jacobi preconditioner found a near-zero diagonal entry at reduced dof $index"))
+    diagonal[index] = inv(value)
+  end
+
+  return diagonal
 end
 
 function _apply_preconditioner!(result::AbstractVector{T}, residual::AbstractVector{T},

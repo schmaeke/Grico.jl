@@ -514,6 +514,189 @@ function _apply_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return result
 end
 
+function _diagonal_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                             scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  _require_length(result, dof_count(plan), "result")
+  fill!(result, zero(T))
+  traversal = plan.traversal_plan
+  _diagonal_pass!(scratch, result, traversal.cell_batches, plan.integration.cells,
+                  plan.cell_operators, cell_diagonal!)
+  _boundary_diagonal_pass!(scratch, result, traversal.boundary_batches,
+                           plan.integration.boundary_faces, plan.boundary_operators)
+  _diagonal_pass!(scratch, result, traversal.interface_batches, plan.integration.interfaces,
+                  plan.interface_operators, interface_diagonal!)
+  _surface_diagonal_pass!(scratch, result, traversal.surface_batches,
+                          plan.integration.embedded_surfaces, plan.surface_operators)
+  return result
+end
+
+function _reduced_diagonal!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                            workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
+  map = _reduced_map(plan)
+  _require_length(result, reduced_dof_count(map), "reduced diagonal")
+
+  if !_can_use_local_diagonal_kernels(plan, workspace.scratch, map)
+    fill!(result, zero(T))
+    return false
+  end
+
+  _diagonal_physical!(workspace.full_output, plan, workspace.scratch)
+  _copy_direct_reduced_diagonal!(result, map, workspace.full_output)
+  return true
+end
+
+function _copy_direct_reduced_diagonal!(result::AbstractVector{T},
+                                        map::_ReducedOperatorMap{T},
+                                        physical_diagonal::AbstractVector{T}) where {T<:AbstractFloat}
+  _require_length(result, reduced_dof_count(map), "reduced diagonal")
+  _require_length(physical_diagonal, map.full_dof_count, "physical diagonal")
+
+  @inbounds for index in eachindex(map.solve_dofs)
+    result[index] = physical_diagonal[map.solve_dofs[index]]
+  end
+
+  return result
+end
+
+function _can_use_local_diagonal_kernels(plan::AssemblyPlan{D,T},
+                                         scratch::_OperatorScratch{T},
+                                         map::_ReducedOperatorMap{T}) where {D,T<:AbstractFloat}
+  return _has_direct_reduced_map(map) &&
+         _items_have_direct_diagonal_maps(plan) &&
+         _diagonal_kernels_available(plan, scratch)
+end
+
+function _has_direct_reduced_map(map::_ReducedOperatorMap{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for dof in 1:map.full_dof_count
+    first_term = map.row_offsets[dof]
+    last_term = map.row_offsets[dof+1] - 1
+
+    if map.reduced_index[dof] != 0
+      first_term == last_term || return false
+      map.row_indices[first_term] == map.reduced_index[dof] || return false
+      abs(map.row_coefficients[first_term] - one(T)) <= tolerance || return false
+    elseif first_term <= last_term
+      return false
+    end
+  end
+
+  return true
+end
+
+function _items_have_direct_diagonal_maps(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
+  return _items_have_direct_diagonal_maps(plan.integration.cells, T) &&
+         _items_have_direct_diagonal_maps(plan.integration.boundary_faces, T) &&
+         _items_have_direct_diagonal_maps(plan.integration.interfaces, T) &&
+         _items_have_direct_diagonal_maps(plan.integration.embedded_surfaces, T)
+end
+
+function _items_have_direct_diagonal_maps(items, ::Type{T}) where {T<:AbstractFloat}
+  for item in items
+    _item_has_direct_diagonal_map(item, T) || return false
+  end
+
+  return true
+end
+
+function _item_has_direct_diagonal_map(item::_AssemblyValues, ::Type{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for local_dof in 1:item.local_dof_count
+    first_term = item.term_offsets[local_dof]
+    last_term = item.term_offsets[local_dof+1] - 1
+    first_term == last_term || return false
+    global_dof = item.single_term_indices[local_dof]
+    global_dof != 0 || return false
+    abs(item.single_term_coefficients[local_dof]) > tolerance || return false
+
+    for previous_dof in 1:(local_dof-1)
+      item.single_term_indices[previous_dof] == global_dof && return false
+    end
+  end
+
+  return true
+end
+
+function _diagonal_kernels_available(plan::AssemblyPlan, scratch::_OperatorScratch)
+  traversal = plan.traversal_plan
+  return _diagonal_kernels_available(scratch, traversal.cell_batches, plan.integration.cells,
+                                     plan.cell_operators, cell_apply!, cell_diagonal!,
+                                     _DEFAULT_CELL_APPLY_METHOD,
+                                     _DEFAULT_CELL_DIAGONAL_METHOD) &&
+         _filtered_diagonal_kernels_available(scratch, traversal.boundary_batches,
+                                              plan.integration.boundary_faces,
+                                              plan.boundary_operators, face_apply!,
+                                              face_diagonal!, _DEFAULT_FACE_APPLY_METHOD,
+                                              _DEFAULT_FACE_DIAGONAL_METHOD) &&
+         _diagonal_kernels_available(scratch, traversal.interface_batches,
+                                     plan.integration.interfaces, plan.interface_operators,
+                                     interface_apply!, interface_diagonal!,
+                                     _DEFAULT_INTERFACE_APPLY_METHOD,
+                                     _DEFAULT_INTERFACE_DIAGONAL_METHOD) &&
+         _filtered_diagonal_kernels_available(scratch, traversal.surface_batches,
+                                              plan.integration.embedded_surfaces,
+                                              plan.surface_operators, surface_apply!,
+                                              surface_diagonal!,
+                                              _DEFAULT_SURFACE_APPLY_METHOD,
+                                              _DEFAULT_SURFACE_DIAGONAL_METHOD)
+end
+
+function _diagonal_kernels_available(scratch::_OperatorScratch{T},
+                                     batches::Vector{_KernelBatch}, items, operators,
+                                     apply_hook, diagonal_hook, default_apply_method,
+                                     default_diagonal_method) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return true
+
+  for batch in batches
+    item = @inbounds items[first(batch.item_indices)]
+    local_input = view(scratch.input, 1:batch.local_dof_count)
+    local_output = view(scratch.output, 1:batch.local_dof_count)
+    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+
+    for operator in operators
+      _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
+                           local_input) && continue
+      _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
+                           item) && return false
+    end
+  end
+
+  return true
+end
+
+function _filtered_diagonal_kernels_available(scratch::_OperatorScratch{T},
+                                              batches::Vector{_FilteredKernelBatch}, items,
+                                              operators, apply_hook, diagonal_hook,
+                                              default_apply_method,
+                                              default_diagonal_method) where {T<:AbstractFloat}
+  isempty(batches) && return true
+
+  for batch in batches
+    item = @inbounds items[first(batch.item_indices)]
+    local_input = view(scratch.input, 1:batch.local_dof_count)
+    local_output = view(scratch.output, 1:batch.local_dof_count)
+    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+
+    for operator_index in batch.operator_indices
+      wrapped = @inbounds operators[operator_index]
+      operator = wrapped.operator
+      _uses_default_method(apply_hook, default_apply_method, local_output, operator, item,
+                           local_input) && continue
+      _uses_default_method(diagonal_hook, default_diagonal_method, local_diagonal, operator,
+                           item) && return false
+    end
+  end
+
+  return true
+end
+
+function _uses_default_method(hook, default_method, arguments...)
+  return which(hook, Base.typesof(arguments...)) === default_method
+end
+
 function _expand_reduced!(full_values::AbstractVector{T}, map::_ReducedOperatorMap{T},
                           reduced_values::AbstractVector{T};
                           include_shift::Bool=true) where {T<:AbstractFloat}
@@ -845,6 +1028,77 @@ function _surface_apply_pass!(scratch::_OperatorScratch{T}, result::AbstractVect
   return nothing
 end
 
+function _diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
+                         batches::Vector{_KernelBatch}, items, operators,
+                         diagonal_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+
+  for batch in batches
+    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+
+    for batch_item_index in eachindex(batch.item_indices)
+      item = @inbounds items[batch.item_indices[batch_item_index]]
+      fill!(local_diagonal, zero(T))
+
+      for operator in operators
+        diagonal_hook(local_diagonal, operator, item)
+      end
+
+      _scatter_local_diagonal!(result, item, local_diagonal)
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
+                                  batches::Vector{_FilteredKernelBatch}, faces,
+                                  operators) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+
+  for batch in batches
+    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+
+    for batch_face_index in eachindex(batch.item_indices)
+      face = @inbounds faces[batch.item_indices[batch_face_index]]
+      fill!(local_diagonal, zero(T))
+
+      for operator_index in batch.operator_indices
+        wrapped = @inbounds operators[operator_index]
+        face_diagonal!(local_diagonal, wrapped.operator, face)
+      end
+
+      _scatter_local_diagonal!(result, face, local_diagonal)
+    end
+  end
+
+  return nothing
+end
+
+function _surface_diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
+                                 batches::Vector{_FilteredKernelBatch}, surfaces,
+                                 operators) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+
+  for batch in batches
+    local_diagonal = view(scratch.rhs, 1:batch.local_dof_count)
+
+    for batch_surface_index in eachindex(batch.item_indices)
+      surface = @inbounds surfaces[batch.item_indices[batch_surface_index]]
+      fill!(local_diagonal, zero(T))
+
+      for operator_index in batch.operator_indices
+        wrapped = @inbounds operators[operator_index]
+        surface_diagonal!(local_diagonal, wrapped.operator, surface)
+      end
+
+      _scatter_local_diagonal!(result, surface, local_diagonal)
+    end
+  end
+
+  return nothing
+end
+
 function _residual_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                          batches::Vector{_KernelBatch}, items, operators, state::State{T},
                          fixed::BitVector, blocked_rows::BitVector,
@@ -1068,6 +1322,24 @@ function _scatter_local_vector!(result::AbstractVector{T}, item::_AssemblyValues
                                 local_vector::AbstractVector{T}, ::Nothing,
                                 ::Nothing) where {T<:AbstractFloat}
   return _scatter_local_vector!(result, item, local_vector)
+end
+
+function _scatter_local_diagonal!(result::AbstractVector{T}, item::_AssemblyValues,
+                                  local_diagonal::AbstractVector{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for local_dof in 1:item.local_dof_count
+    value = local_diagonal[local_dof]
+    abs(value) > tolerance || continue
+
+    @inbounds for term_index in _local_term_range(item, local_dof)
+      global_dof = item.term_indices[term_index]
+      coefficient = item.term_coefficients[term_index]
+      result[global_dof] += coefficient * coefficient * value
+    end
+  end
+
+  return nothing
 end
 
 # Constraint rows.

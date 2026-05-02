@@ -1,6 +1,6 @@
 # Shared sine-interface Poisson ingredients used by the CG and DG benchmarks.
 
-import Grico: cell_apply!, cell_rhs!
+import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 struct SineInterfacePoissonDiffusion{F}
   field::F
@@ -44,6 +44,31 @@ function cell_apply!(local_result, operator::SineInterfacePoissonDiffusion, valu
       end
 
       local_result[local_dof_index(values, operator.field, 1, row_mode)] +=
+        contribution * weighted
+    end
+  end
+
+  return nothing
+end
+
+function cell_diagonal!(local_diagonal, operator::SineInterfacePoissonDiffusion,
+                        values::CellValues)
+  gradients = shape_gradients(values, operator.field)
+  axis_count = size(gradients, 1)
+  mode_count = local_mode_count(values, operator.field)
+
+  @inbounds for point_index in 1:point_count(values)
+    weighted = weight(values, point_index)
+
+    for mode_index in 1:mode_count
+      contribution = zero(eltype(local_diagonal))
+
+      for axis in 1:axis_count
+        gradient_value = gradients[axis, mode_index, point_index]
+        contribution += gradient_value * gradient_value
+      end
+
+      local_diagonal[local_dof_index(values, operator.field, 1, mode_index)] +=
         contribution * weighted
     end
   end

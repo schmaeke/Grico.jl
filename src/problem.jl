@@ -571,6 +571,18 @@ overload this function when they contribute a bilinear volume term.
 cell_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
+    cell_diagonal!(local_diagonal, operator, values)
+
+Accumulate the local diagonal of an affine cell operator into
+`local_diagonal`.
+
+This callback is used by matrix-free preconditioners. It should add the
+diagonal entries of the local bilinear cell contribution in the same local
+numbering used by [`cell_apply!`](@ref). The default method does nothing.
+"""
+cell_diagonal!(local_diagonal, operator, values) = nothing
+
+"""
     cell_rhs!(local_rhs, operator, values)
 
 Accumulate the affine cell right-hand-side contribution of `operator` on one
@@ -590,6 +602,14 @@ Accumulate the matrix-free affine boundary-face action of `operator` on one
 face_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
+    face_diagonal!(local_diagonal, operator, values)
+
+Accumulate the local diagonal of an affine boundary-face operator into
+`local_diagonal`.
+"""
+face_diagonal!(local_diagonal, operator, values) = nothing
+
+"""
     face_rhs!(local_rhs, operator, values)
 
 Accumulate the affine boundary-face right-hand-side contribution of `operator`
@@ -606,6 +626,14 @@ Accumulate the matrix-free affine embedded-surface action of `operator` on one
 surface_apply!(local_result, operator, values, local_coefficients) = nothing
 
 """
+    surface_diagonal!(local_diagonal, operator, values)
+
+Accumulate the local diagonal of an affine embedded-surface operator into
+`local_diagonal`.
+"""
+surface_diagonal!(local_diagonal, operator, values) = nothing
+
+"""
     surface_rhs!(local_rhs, operator, values)
 
 Accumulate the affine embedded-surface right-hand-side contribution of
@@ -620,6 +648,14 @@ Accumulate the matrix-free affine interface action of `operator` on one
 [`InterfaceValues`](@ref) item into `local_result`.
 """
 interface_apply!(local_result, operator, values, local_coefficients) = nothing
+
+"""
+    interface_diagonal!(local_diagonal, operator, values)
+
+Accumulate the local diagonal of an affine interface operator into
+`local_diagonal`.
+"""
+interface_diagonal!(local_diagonal, operator, values) = nothing
 
 """
     interface_rhs!(local_rhs, operator, values)
@@ -698,3 +734,12 @@ Accumulate the matrix-free interface tangent action of `operator` on one
 [`InterfaceValues`](@ref) item into `local_result`.
 """
 interface_tangent_apply!(local_result, operator, values, state, local_increment) = nothing
+
+const _DEFAULT_CELL_DIAGONAL_METHOD = which(cell_diagonal!, Tuple{Any,Any,Any})
+const _DEFAULT_FACE_DIAGONAL_METHOD = which(face_diagonal!, Tuple{Any,Any,Any})
+const _DEFAULT_SURFACE_DIAGONAL_METHOD = which(surface_diagonal!, Tuple{Any,Any,Any})
+const _DEFAULT_INTERFACE_DIAGONAL_METHOD = which(interface_diagonal!, Tuple{Any,Any,Any})
+const _DEFAULT_CELL_APPLY_METHOD = which(cell_apply!, Tuple{Any,Any,Any,Any})
+const _DEFAULT_FACE_APPLY_METHOD = which(face_apply!, Tuple{Any,Any,Any,Any})
+const _DEFAULT_SURFACE_APPLY_METHOD = which(surface_apply!, Tuple{Any,Any,Any,Any})
+const _DEFAULT_INTERFACE_APPLY_METHOD = which(interface_apply!, Tuple{Any,Any,Any,Any})

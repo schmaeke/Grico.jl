@@ -1,6 +1,6 @@
 using Grico
 using CairoMakie
-import Grico: cell_apply!, cell_rhs!
+import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 # This example is intentionally close to the README problem: solve
 # -u'' = cos(2 π x) on [0, 1] with homogeneous Dirichlet data and render the sampled
@@ -21,6 +21,22 @@ function cell_apply!(local_result, op::Diffusion, values::CellValues, local_coef
       grad_i = shape_gradient(values, op.field, q, i)
       row = local_dof_index(values, op.field, 1, i)
       local_result[row] += grad_i[1] * weighted_gradient
+    end
+  end
+
+  return nothing
+end
+
+function cell_diagonal!(local_diagonal, op::Diffusion, values::CellValues)
+  mode_count = local_mode_count(values, op.field)
+
+  for q in 1:point_count(values)
+    weighted = op.kappa * weight(values, q)
+
+    for i in 1:mode_count
+      grad_i = shape_gradient(values, op.field, q, i)
+      row = local_dof_index(values, op.field, 1, i)
+      local_diagonal[row] += grad_i[1] * grad_i[1] * weighted
     end
   end
 
