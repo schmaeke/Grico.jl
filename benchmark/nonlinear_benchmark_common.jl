@@ -83,8 +83,11 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
   damping = eltype(coefficients(state))(options["newton_damping"])
   correction_count = Int(options["newton_iterations"])
   workspace = ResidualWorkspace(plan)
-  residual_vector = zeros(eltype(coefficients(state)), Grico.dof_count(plan))
-  tangent_matrix = nothing
+  reduced_workspace = Grico._ReducedOperatorWorkspace(plan)
+  reduced_values = zeros(eltype(coefficients(state)), Grico.reduced_dof_count(plan))
+  Grico._compress_reduced!(reduced_values, Grico._reduced_map(plan), coefficients(state))
+  residual_vector = zeros(eltype(coefficients(state)), length(reduced_values))
+  correction_rhs = similar(residual_vector)
   final_residual_norm = Inf
   converged = false
   iteration_count = 0
@@ -92,49 +95,48 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
   for iteration in 1:correction_count
     iteration_count = iteration
     residual_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_residual") do
-      residual!(residual_vector, plan, state, workspace)
+      Grico._reduced_residual!(residual_vector, plan, reduced_values, reduced_workspace,
+                               workspace)
     end
     final_residual_norm = Float64(norm(residual_vector))
 
     if final_residual_norm <= tolerance
       converged = true
-      if tangent_matrix === nothing
-        tangent_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_tangent") do
-          tangent(plan, state)
-        end
-        tangent_matrix = tangent_timing.value
-      end
       push!(iteration_rows,
             _iteration_row(cycle, iteration, final_residual_norm, 0.0, residual_timing.time, 0.0,
                            0.0, 0.0, true))
-      return (; state, tangent_matrix, iteration_count, correction_count=iteration - 1,
+      final_state = Grico._state_from_reduced!(plan, reduced_workspace, reduced_values)
+      copyto!(coefficients(state), coefficients(final_state))
+      return (; state, iteration_count, correction_count=iteration - 1,
               residual_norm=final_residual_norm, converged)
     end
 
-    tangent_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_tangent") do
-      tangent_matrix === nothing ? tangent(plan, state) : tangent!(tangent_matrix, plan, state)
+    @inbounds for index in eachindex(residual_vector)
+      correction_rhs[index] = -residual_vector[index]
     end
-    tangent_matrix = tangent_timing.value
 
     linear_solve_timing = _timed_nonlinear_component!(component_rows, cycle,
                                                       "newton_linear_solve") do
-      tangent_matrix \ (-residual_vector)
+      current_state = State(plan, reduced_workspace.full_state)
+      Grico.default_tangent_linear_solve(plan, current_state, correction_rhs;
+                                         workspace=reduced_workspace,
+                                         residual_workspace=workspace)
     end
     correction = linear_solve_timing.value
     update_norm = Float64(norm(correction))
     update_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_state_update") do
-      coefficients(state) .+= damping .* correction
+      reduced_values .+= damping .* correction
       nothing
     end
 
     push!(iteration_rows,
           _iteration_row(cycle, iteration, final_residual_norm, update_norm, residual_timing.time,
-                         tangent_timing.time, linear_solve_timing.time, update_timing.time, false))
+                         0.0, linear_solve_timing.time, update_timing.time, false))
   end
 
   iteration_count = correction_count + 1
   residual_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_residual") do
-    residual!(residual_vector, plan, state, workspace)
+    Grico._reduced_residual!(residual_vector, plan, reduced_values, reduced_workspace, workspace)
   end
   final_residual_norm = Float64(norm(residual_vector))
   converged = final_residual_norm <= tolerance
@@ -142,18 +144,12 @@ function _newton_solve!(component_rows, iteration_rows, cycle::Int, plan, state,
         _iteration_row(cycle, iteration_count, final_residual_norm, 0.0, residual_timing.time, 0.0,
                        0.0, 0.0, converged))
 
-  if tangent_matrix === nothing
-    tangent_timing = _timed_nonlinear_component!(component_rows, cycle, "newton_tangent") do
-      tangent(plan, state)
-    end
-    tangent_matrix = tangent_timing.value
-  end
-
-  return (; state, tangent_matrix, iteration_count, correction_count,
-          residual_norm=final_residual_norm, converged)
+  final_state = Grico._state_from_reduced!(plan, reduced_workspace, reduced_values)
+  copyto!(coefficients(state), coefficients(final_state))
+  return (; state, iteration_count, correction_count, residual_norm=final_residual_norm, converged)
 end
 
-function _nonlinear_cycle_summary(cycle::Int, field, tangent_matrix, solution_l2::Float64,
+function _nonlinear_cycle_summary(cycle::Int, field, plan, solution_l2::Float64,
                                   adaptivity, target_field, newton_result)
   space = field_space(field)
   target_space_value = field_space(target_field)
@@ -164,7 +160,8 @@ function _nonlinear_cycle_summary(cycle::Int, field, tangent_matrix, solution_l2
 
   return (; cycle, active_leaves=active_leaf_count(space),
           stored_cells=Grico.stored_cell_count(grid(space)), max_h_level=_max_h_level(space),
-          min_p_degree, max_p_degree, dofs=scalar_dof_count(space), nnz=nnz(tangent_matrix),
+          min_p_degree, max_p_degree, dofs=scalar_dof_count(space),
+          reduced_dofs=Grico.reduced_dof_count(plan),
           solution_l2, newton_iterations=newton_result.iteration_count,
           newton_corrections=newton_result.correction_count,
           final_residual_norm=newton_result.residual_norm, converged=newton_result.converged,
@@ -178,9 +175,9 @@ function _nonlinear_cycle_summary(cycle::Int, field, tangent_matrix, solution_l2
 end
 
 function _print_nonlinear_cycle_row(row)
-  @printf("  %3d leaves=%6d dofs=%7d nnz=%9d p=%d:%d l2=%10.3e newton=%2d residual=%9.2e h=%5d p+=%5d target=%6d target_p=%d:%d\n",
-          row.cycle, row.active_leaves, row.dofs, row.nnz, row.min_p_degree, row.max_p_degree,
-          row.solution_l2, row.newton_corrections, row.final_residual_norm,
+  @printf("  %3d leaves=%6d dofs=%7d reduced=%7d p=%d:%d l2=%10.3e newton=%2d residual=%9.2e h=%5d p+=%5d target=%6d target_p=%d:%d\n",
+          row.cycle, row.active_leaves, row.dofs, row.reduced_dofs, row.min_p_degree,
+          row.max_p_degree, row.solution_l2, row.newton_corrections, row.final_residual_norm,
           row.h_refinement_leaf_count, row.p_refinement_leaf_count, row.target_active_leaves,
           row.target_min_p_degree, row.target_max_p_degree)
   return nothing
@@ -233,7 +230,7 @@ function run_nonlinear_adaptive_cycles(options; build_initial_field, build_probl
 
     _push_total_row!(component_rows, cycle, first_component_row, time() - cycle_start)
     push!(cycle_rows,
-          _nonlinear_cycle_summary(cycle, field, newton_result.tangent_matrix, solution_l2,
+          _nonlinear_cycle_summary(cycle, field, plan, solution_l2,
                                    adaptivity, target_field, newton_result))
     print_progress && _print_nonlinear_cycle_row(last(cycle_rows))
     field = target_field

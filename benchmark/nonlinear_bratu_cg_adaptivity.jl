@@ -9,7 +9,7 @@ include("adaptive_benchmark_common.jl")
 include("nonlinear_benchmark_common.jl")
 include("sine_poisson_common.jl")
 
-import Grico: cell_residual!, cell_tangent!
+import Grico: cell_residual!, cell_tangent_apply!
 
 const BRATU_CG_DEFAULTS = nonlinear_benchmark_defaults(; cycles=5, root_cells=(12, 12), degree=2,
                                                        max_h_level=8, tolerance=1.0e-5,
@@ -83,10 +83,11 @@ function cell_residual!(local_residual, operator::BratuSineSource, values::CellV
   return nothing
 end
 
-# The tangent is the Newton linearization ∫Ω ∇v · ∇δu + λ exp(u) v δu dΩ. The
-# scalar operator is symmetric, so only the lower triangle is evaluated directly.
-function cell_tangent!(local_tangent, operator::BratuSineSource, values::CellValues, state)
-  local_block = block(local_tangent, values, operator.field, operator.field)
+# The tangent action is the Newton linearization
+# ∫Ω ∇v · ∇δu + λ exp(u) v δu dΩ applied directly to the local increment.
+function cell_tangent_apply!(local_result, operator::BratuSineSource, values::CellValues, state,
+                             local_increment)
+  local_block = block(local_result, values, operator.field)
   shape_table = shape_values(values, operator.field)
   gradients = shape_gradients(values, operator.field)
   axis_count = size(gradients, 1)
@@ -94,24 +95,19 @@ function cell_tangent!(local_tangent, operator::BratuSineSource, values::CellVal
 
   @inbounds for point_index in 1:point_count(values)
     reaction = operator.lambda * exp(value(values, state, operator.field, point_index))
+    increment_value = value(values, local_increment, operator.field, point_index)
+    increment_gradient = gradient(values, local_increment, operator.field, point_index)
     weighted = weight(values, point_index)
 
     for row_mode in 1:mode_count
-      row_shape = shape_table[row_mode, point_index]
+      stiffness = zero(eltype(local_result))
 
-      for col_mode in 1:row_mode
-        stiffness = zero(eltype(local_tangent))
-
-        for axis in 1:axis_count
-          stiffness += gradients[axis, row_mode, point_index] *
-                       gradients[axis, col_mode, point_index]
-        end
-
-        contribution = (stiffness + reaction * row_shape * shape_table[col_mode, point_index]) *
-                       weighted
-        local_block[row_mode, col_mode] += contribution
-        row_mode == col_mode || (local_block[col_mode, row_mode] += contribution)
+      for axis in 1:axis_count
+        stiffness += gradients[axis, row_mode, point_index] * increment_gradient[axis]
       end
+
+      local_block[row_mode] +=
+        (stiffness + reaction * shape_table[row_mode, point_index] * increment_value) * weighted
     end
   end
 

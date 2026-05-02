@@ -204,8 +204,11 @@ end
   new_u = adapted_field(space_transition, u)
   calls = Ref(0)
   transferred = transfer_state(space_transition, state, u, new_u;
-                               linear_solve=(A, b) -> begin
+                               linear_solve=(A, b; kwargs...) -> begin
                                  calls[] += 1
+                                 if A isa Grico.AssemblyPlan
+                                   return Grico.default_linear_solve(A, b; kwargs...)
+                                 end
                                  return A \ b
                                end)
 
@@ -355,7 +358,7 @@ end
             for leaf in active_leaves(target_space(space_transition)))
 
   for x in ((0.0, 0.0), (0.2, 0.3), (0.5, 0.5), (0.8, 0.1), (1.0, 1.0))
-    @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = 5.0e-8
+    @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = 1.0e-7
   end
 end
 

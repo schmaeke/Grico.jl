@@ -14,8 +14,8 @@ using Grico
     include("space.jl")
   end
 
-  @testset verbose = true "Problems, Assembly, And Embedded" begin
-    include("assembly.jl")
+  @testset verbose = true "Matrix-Free Problems" begin
+    include("matrix_free.jl")
   end
 
   @testset verbose = true "Adaptivity" begin

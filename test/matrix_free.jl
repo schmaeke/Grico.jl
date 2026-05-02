@@ -40,6 +40,26 @@ struct _MatrixFreeDiffusion{F,T}
   coefficient::T
 end
 
+struct _MatrixFreeBoundaryMass{F,T}
+  field::F
+  coefficient::T
+end
+
+struct _MatrixFreeInterfaceJump{F,T}
+  field::F
+  coefficient::T
+end
+
+struct _MatrixFreeSurfaceMass{F,T}
+  field::F
+  coefficient::T
+end
+
+struct _MatrixFreeQuadraticReaction{F,T}
+  field::F
+  target::T
+end
+
 function Grico.cell_apply!(local_result, operator::_MatrixFreeMassAction, values,
                            local_coefficients)
   field = operator.field
@@ -104,6 +124,160 @@ function Grico.cell_diagonal!(local_diagonal, operator::_MatrixFreeDiffusion, va
       row = local_dof_index(values, field, 1, mode_index)
       test_gradient = shape_gradient(values, field, point_index, mode_index)
       local_diagonal[row] += _tuple_dot(test_gradient, test_gradient) * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.face_apply!(local_result, operator::_MatrixFreeBoundaryMass, values,
+                           local_coefficients)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    field_value = value(values, local_coefficients, field, point_index)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      local_result[row] += shape_value(values, field, point_index, mode_index) * field_value *
+                           weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.face_diagonal!(local_diagonal, operator::_MatrixFreeBoundaryMass, values)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      shape = shape_value(values, field, point_index, mode_index)
+      local_diagonal[row] += shape * shape * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.interface_apply!(local_result, operator::_MatrixFreeInterfaceJump, values,
+                                local_coefficients)
+  field = operator.field
+  minus_values = minus(values)
+  plus_values = plus(values)
+  minus_block = block(local_result, minus_values, field)
+  plus_block = block(local_result, plus_values, field)
+
+  for point_index in 1:point_count(values)
+    jump_value = jump(value(minus_values, local_coefficients, field, point_index),
+                      value(plus_values, local_coefficients, field, point_index))
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(minus_values, field)
+      minus_block[mode_index] -= shape_value(minus_values, field, point_index, mode_index) *
+                                 jump_value * weighted
+    end
+
+    for mode_index in 1:local_mode_count(plus_values, field)
+      plus_block[mode_index] += shape_value(plus_values, field, point_index, mode_index) *
+                                jump_value * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.interface_diagonal!(local_diagonal, operator::_MatrixFreeInterfaceJump, values)
+  field = operator.field
+  minus_values = minus(values)
+  plus_values = plus(values)
+  minus_block = block(local_diagonal, minus_values, field)
+  plus_block = block(local_diagonal, plus_values, field)
+
+  for point_index in 1:point_count(values)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(minus_values, field)
+      shape = shape_value(minus_values, field, point_index, mode_index)
+      minus_block[mode_index] += shape * shape * weighted
+    end
+
+    for mode_index in 1:local_mode_count(plus_values, field)
+      shape = shape_value(plus_values, field, point_index, mode_index)
+      plus_block[mode_index] += shape * shape * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.surface_apply!(local_result, operator::_MatrixFreeSurfaceMass, values,
+                              local_coefficients)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    field_value = value(values, local_coefficients, field, point_index)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      local_result[row] += shape_value(values, field, point_index, mode_index) * field_value *
+                           weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.surface_diagonal!(local_diagonal, operator::_MatrixFreeSurfaceMass, values)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    weighted = operator.coefficient * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      shape = shape_value(values, field, point_index, mode_index)
+      local_diagonal[row] += shape * shape * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.cell_residual!(local_residual, operator::_MatrixFreeQuadraticReaction, values,
+                              state)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    field_value = value(values, state, field, point_index)
+    weighted = (field_value * field_value - operator.target) * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      local_residual[row] += shape_value(values, field, point_index, mode_index) * weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.cell_tangent_apply!(local_result, operator::_MatrixFreeQuadraticReaction, values,
+                                   state, local_increment)
+  field = operator.field
+
+  for point_index in 1:point_count(values)
+    field_value = value(values, state, field, point_index)
+    increment_value = value(values, local_increment, field, point_index)
+    weighted = 2 * field_value * increment_value * weight(values, point_index)
+
+    for mode_index in 1:local_mode_count(values, field)
+      row = local_dof_index(values, field, 1, mode_index)
+      local_result[row] += shape_value(values, field, point_index, mode_index) * weighted
     end
   end
 
@@ -270,6 +444,34 @@ end
   @test diffusion_diagonal_selected
   @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
 
+  boundary_problem = AffineProblem(dg_field)
+  add_boundary!(boundary_problem, BoundaryFace(1, UPPER), _MatrixFreeBoundaryMass(dg_field, 3.0))
+  boundary_plan = compile(boundary_problem)
+  boundary_diagonal_selected, boundary_diagonal = _kernel_reduced_diagonal(boundary_plan)
+  @test boundary_diagonal_selected
+  @test boundary_diagonal ≈ _reference_reduced_diagonal(boundary_plan)
+  @test apply(boundary_plan, [0.25, -0.5]) ≈ [0.0, -1.5]
+
+  interface_domain = Domain((0.0,), (1.0,), (2,))
+  interface_space = HpSpace(interface_domain, SpaceOptions(degree=UniformDegree(1),
+                                                           continuity=:dg))
+  interface_field = ScalarField(interface_space; name=:u)
+  interface_problem = AffineProblem(interface_field)
+  add_interface!(interface_problem, _MatrixFreeInterfaceJump(interface_field, 2.0))
+  interface_plan = compile(interface_problem)
+  interface_diagonal_selected, interface_diagonal = _kernel_reduced_diagonal(interface_plan)
+  @test interface_diagonal_selected
+  @test interface_diagonal ≈ _reference_reduced_diagonal(interface_plan)
+
+  surface_problem = AffineProblem(dg_field)
+  surface_quadrature = PointQuadrature([(0.0,)], [1.0])
+  add_surface_quadrature!(surface_problem, SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
+  add_surface!(surface_problem, _MatrixFreeSurfaceMass(dg_field, 5.0))
+  surface_plan = compile(surface_problem)
+  surface_diagonal_selected, surface_diagonal = _kernel_reduced_diagonal(surface_plan)
+  @test surface_diagonal_selected
+  @test surface_diagonal ≈ _reference_reduced_diagonal(surface_plan)
+
   cg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
   cg_field = ScalarField(cg_space; name=:u)
   dirichlet_problem = AffineProblem(cg_field)
@@ -291,4 +493,12 @@ end
   add_constraint!(mean_problem, MeanValue(constant_field, 2.0))
   mean_state = solve(mean_problem)
   @test coefficients(mean_state) ≈ [2.0]
+
+  nonlinear_problem = ResidualProblem(constant_field)
+  add_cell!(nonlinear_problem, _MatrixFreeQuadraticReaction(constant_field, 4.0))
+  nonlinear_plan = compile(nonlinear_problem)
+  nonlinear_initial = State(nonlinear_plan, [1.0])
+  nonlinear_state = solve(nonlinear_plan; initial_state=nonlinear_initial,
+                          relative_tolerance=1.0e-12, absolute_tolerance=1.0e-12)
+  @test coefficients(nonlinear_state) ≈ [2.0] atol = 1.0e-10
 end

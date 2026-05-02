@@ -8,24 +8,39 @@ struct _VerificationDiffusion{F,T}
   coefficient::T
 end
 
-function Grico.cell_matrix!(local_matrix, operator::_VerificationDiffusion,
-                            values::Grico.CellValues)
-  local_block = Grico.block(local_matrix, values, operator.field, operator.field)
+function Grico.cell_apply!(local_result, operator::_VerificationDiffusion,
+                           values::Grico.CellValues, local_coefficients)
+  mode_count = Grico.local_mode_count(values, operator.field)
+
+  for point_index in 1:Grico.point_count(values)
+    weighted = Grico.weight(values, point_index)
+    gradient_value = Grico.gradient(values, local_coefficients, operator.field, point_index)
+
+    for row_mode in 1:mode_count
+      gradient_row = Grico.shape_gradient(values, operator.field, point_index, row_mode)
+      local_result[Grico.local_dof_index(values, operator.field, 1, row_mode)] +=
+        operator.coefficient *
+        sum(gradient_row[axis] * gradient_value[axis] for axis in eachindex(gradient_row)) *
+        weighted
+    end
+  end
+
+  return nothing
+end
+
+function Grico.cell_diagonal!(local_diagonal, operator::_VerificationDiffusion,
+                              values::Grico.CellValues)
   mode_count = Grico.local_mode_count(values, operator.field)
 
   for point_index in 1:Grico.point_count(values)
     weighted = Grico.weight(values, point_index)
 
-    for row_mode in 1:mode_count
-      gradient_row = Grico.shape_gradient(values, operator.field, point_index, row_mode)
-
-      for col_mode in 1:mode_count
-        gradient_col = Grico.shape_gradient(values, operator.field, point_index, col_mode)
-        local_block[row_mode, col_mode] += operator.coefficient *
-                                           sum(gradient_row[axis] * gradient_col[axis]
-                                               for axis in eachindex(gradient_row)) *
-                                           weighted
-      end
+    for mode_index in 1:mode_count
+      gradient_value = Grico.shape_gradient(values, operator.field, point_index, mode_index)
+      local_diagonal[Grico.local_dof_index(values, operator.field, 1, mode_index)] +=
+        operator.coefficient *
+        sum(value * value for value in gradient_value) *
+        weighted
     end
   end
 
@@ -78,7 +93,7 @@ end
   Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.UPPER), 1.0))
 
   plan = Grico.compile(problem)
-  state = Grico.State(plan, Grico.solve(Grico.assemble(plan)))
+  state = Grico.solve(plan; preconditioner=Grico.JacobiPreconditioner())
   exact(x) = x[1] * (1.0 - x[1]) + 1.0
 
   @test Grico.l2_error(state, u, exact; plan=plan) <= VERIFICATION_TOL

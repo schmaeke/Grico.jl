@@ -28,9 +28,9 @@ function _compile_assembly_structure(::Val{K}, layout, cell_operators, boundary_
                                      interface_operators, surface_operators, integration,
                                      dirichlet, mean_constraints, constraint_masks) where {K}
   T = eltype(origin(field_space(layout.slots[1].field)))
-  reduced_map = K === :affine ? _compile_reduced_operator_map(T, dof_count(layout),
-                                                              dirichlet, mean_constraints,
-                                                              constraint_masks) : nothing
+  reduced_map = (K === :affine || K === :residual) ?
+                _compile_reduced_operator_map(T, dof_count(layout), dirichlet,
+                                              mean_constraints, constraint_masks) : nothing
   return _MatrixFreeAssemblyStructure{K,T,typeof(reduced_map)}(reduced_map)
 end
 
@@ -467,10 +467,12 @@ mutable struct _ReducedOperatorWorkspace{T<:AbstractFloat}
   scratch::_OperatorScratch{T}
   full_input::Vector{T}
   full_output::Vector{T}
+  full_state::Vector{T}
 end
 
 function _ReducedOperatorWorkspace(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
-  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration), zeros(T, dof_count(plan)),
+  return _ReducedOperatorWorkspace(_scratch_buffer(T, plan.integration),
+                                   zeros(T, dof_count(plan)), zeros(T, dof_count(plan)),
                                    zeros(T, dof_count(plan)))
 end
 
@@ -739,6 +741,18 @@ function _project_reduced!(reduced_values::AbstractVector{T}, map::_ReducedOpera
   return reduced_values
 end
 
+function _compress_reduced!(reduced_values::AbstractVector{T}, map::_ReducedOperatorMap{T},
+                            full_values::AbstractVector{T}) where {T<:AbstractFloat}
+  _require_length(reduced_values, reduced_dof_count(map), "reduced vector")
+  _require_length(full_values, map.full_dof_count, "full vector")
+
+  @inbounds for index in eachindex(map.solve_dofs)
+    reduced_values[index] = full_values[map.solve_dofs[index]]
+  end
+
+  return reduced_values
+end
+
 function _reduced_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                          reduced_coefficients::AbstractVector{T},
                          workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
@@ -765,6 +779,38 @@ function _reduced_rhs!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
     end
   end
 
+  _project_reduced!(result, map, workspace.full_output)
+  return result
+end
+
+function _reduced_residual!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                            reduced_coefficients::AbstractVector{T},
+                            workspace::_ReducedOperatorWorkspace{T},
+                            residual_workspace::ResidualWorkspace{T}) where {D,
+                                                                              T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :residual)
+  map = _reduced_map(plan)
+  _require_length(result, reduced_dof_count(map), "reduced residual")
+  _require_length(reduced_coefficients, reduced_dof_count(map), "reduced state")
+  _expand_reduced!(workspace.full_state, map, reduced_coefficients; include_shift=true)
+  state = State(plan, workspace.full_state)
+  residual!(workspace.full_output, plan, state, residual_workspace)
+  _project_reduced!(result, map, workspace.full_output)
+  return result
+end
+
+function _reduced_tangent_apply!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                                 reduced_increment::AbstractVector{T},
+                                 workspace::_ReducedOperatorWorkspace{T},
+                                 residual_workspace::ResidualWorkspace{T}) where {D,
+                                                                                   T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :residual)
+  map = _reduced_map(plan)
+  _require_length(result, reduced_dof_count(map), "reduced tangent result")
+  _require_length(reduced_increment, reduced_dof_count(map), "reduced increment")
+  _expand_reduced!(workspace.full_input, map, reduced_increment; include_shift=false)
+  state = State(plan, workspace.full_state)
+  tangent_apply!(workspace.full_output, plan, state, workspace.full_input, residual_workspace)
   _project_reduced!(result, map, workspace.full_output)
   return result
 end
