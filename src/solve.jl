@@ -7,11 +7,11 @@
 """
     JacobiPreconditioner()
 
-Placeholder configuration for the first matrix-free preconditioner.
+Configuration for generic diagonal Jacobi preconditioning.
 
-The implementation is not wired yet; the type exists so solver experiments can
-settle on a public keyword/API without reintroducing the old sparse
-preconditioner hierarchy.
+The current implementation builds the reduced diagonal by probing the
+matrix-free reduced operator. This is intentionally simple and robust; operator
+specific diagonal kernels can replace it later when setup cost matters.
 """
 struct JacobiPreconditioner end
 
@@ -20,11 +20,10 @@ function default_linear_solve(plan::AssemblyPlan{D,T}, reduced_rhs::AbstractVect
                               relative_tolerance=sqrt(eps(T)), absolute_tolerance=zero(T),
                               maxiter=max(1_000, 2 * length(reduced_rhs)),
                               initial_solution=nothing) where {D,T<:AbstractFloat}
-  preconditioner === nothing ||
-    throw(ArgumentError("matrix-free preconditioner $(typeof(preconditioner)) is not implemented yet"))
+  inverse_diagonal = _preconditioner_data(plan, workspace, preconditioner)
   return _cg_solve(plan, reduced_rhs, workspace; relative_tolerance=relative_tolerance,
                    absolute_tolerance=absolute_tolerance, maxiter=maxiter,
-                   initial_solution=initial_solution)
+                   initial_solution=initial_solution, inverse_diagonal=inverse_diagonal)
 end
 
 """
@@ -67,7 +66,7 @@ end
 function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
                    workspace::_ReducedOperatorWorkspace{T}; relative_tolerance::T,
                    absolute_tolerance::T, maxiter::Int,
-                   initial_solution) where {D,T<:AbstractFloat}
+                   initial_solution, inverse_diagonal) where {D,T<:AbstractFloat}
   n = length(rhs_data)
   n == 0 && return T[]
   maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -88,10 +87,13 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
     _axpy!(residual, -one(T), operator_values)
   end
 
-  direction = copy(residual)
-  residual_norm2 = _dot_self(residual)
+  preconditioned_residual = similar(residual)
+  _apply_preconditioner!(preconditioned_residual, residual, inverse_diagonal)
+  direction = copy(preconditioned_residual)
+  residual_inner = _dot(residual, preconditioned_residual)
   rhs_norm = sqrt(_dot_self(rhs_data))
   tolerance = max(absolute_tolerance, relative_tolerance * max(rhs_norm, one(T)))
+  residual_norm2 = _dot_self(residual)
   residual_norm2 <= tolerance * tolerance && return solution
 
   for iteration in 1:maxiter
@@ -99,17 +101,73 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
     denominator = _dot(direction, operator_values)
     denominator > zero(T) ||
       throw(ArgumentError("CG encountered a non-positive operator direction; provide a different linear_solve for this problem"))
-    alpha = residual_norm2 / denominator
+    alpha = residual_inner / denominator
     _axpy!(solution, alpha, direction)
     _axpy!(residual, -alpha, operator_values)
     next_residual_norm2 = _dot_self(residual)
     next_residual_norm2 <= tolerance * tolerance && return solution
-    beta = next_residual_norm2 / residual_norm2
-    _update_direction!(direction, residual, beta)
+    _apply_preconditioner!(preconditioned_residual, residual, inverse_diagonal)
+    next_residual_inner = _dot(residual, preconditioned_residual)
+    beta = next_residual_inner / residual_inner
+    _update_direction!(direction, preconditioned_residual, beta)
     residual_norm2 = next_residual_norm2
+    residual_inner = next_residual_inner
   end
 
   throw(ArgumentError("CG did not converge in $maxiter iterations"))
+end
+
+_preconditioner_data(plan, workspace, ::Nothing) = nothing
+
+function _preconditioner_data(plan::AssemblyPlan{D,T},
+                              workspace::_ReducedOperatorWorkspace{T},
+                              ::JacobiPreconditioner) where {D,T<:AbstractFloat}
+  return _jacobi_inverse_diagonal(plan, workspace)
+end
+
+function _preconditioner_data(plan, workspace, preconditioner)
+  throw(ArgumentError("unsupported matrix-free preconditioner $(typeof(preconditioner))"))
+end
+
+function _jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
+                                  workspace::_ReducedOperatorWorkspace{T}) where {D,
+                                                                                  T<:AbstractFloat}
+  n = reduced_dof_count(plan)
+  inverse_diagonal = Vector{T}(undef, n)
+  basis = zeros(T, n)
+  response = zeros(T, n)
+  tolerance = 1000 * eps(T)
+
+  for index in 1:n
+    basis[index] = one(T)
+    _reduced_apply!(response, plan, basis, workspace)
+    diagonal = response[index]
+    abs(diagonal) > tolerance ||
+      throw(ArgumentError("Jacobi preconditioner found a near-zero diagonal entry at reduced dof $index"))
+    inverse_diagonal[index] = inv(diagonal)
+    basis[index] = zero(T)
+  end
+
+  return inverse_diagonal
+end
+
+function _apply_preconditioner!(result::AbstractVector{T}, residual::AbstractVector{T},
+                                ::Nothing) where {T<:AbstractFloat}
+  _require_length(result, length(residual), "preconditioned residual")
+  copyto!(result, residual)
+  return result
+end
+
+function _apply_preconditioner!(result::AbstractVector{T}, residual::AbstractVector{T},
+                                inverse_diagonal::AbstractVector{T}) where {T<:AbstractFloat}
+  _require_length(result, length(residual), "preconditioned residual")
+  _require_length(inverse_diagonal, length(residual), "inverse diagonal")
+
+  @inbounds for index in eachindex(residual)
+    result[index] = inverse_diagonal[index] * residual[index]
+  end
+
+  return result
 end
 
 function _dot(first::AbstractVector{T}, second::AbstractVector{T}) where {T<:AbstractFloat}

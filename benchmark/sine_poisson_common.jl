@@ -1,6 +1,6 @@
 # Shared sine-interface Poisson ingredients used by the CG and DG benchmarks.
 
-import Grico: cell_matrix!, cell_rhs!
+import Grico: cell_apply!, cell_rhs!
 
 struct SineInterfacePoissonDiffusion{F}
   field::F
@@ -25,30 +25,26 @@ function add_sine_interface_poisson_cells!(problem, field)
   return problem
 end
 
-# Assemble the scalar Poisson stiffness block ∫Ω ∇u · ∇v dΩ. The local matrix is
-# filled symmetrically because the operator is self-adjoint and scalar.
-function cell_matrix!(local_matrix, operator::SineInterfacePoissonDiffusion, values::CellValues)
-  local_block = block(local_matrix, values, operator.field, operator.field)
+# Apply the scalar Poisson stiffness block ∫Ω ∇u · ∇v dΩ.
+function cell_apply!(local_result, operator::SineInterfacePoissonDiffusion, values::CellValues,
+                     local_coefficients)
   gradients = shape_gradients(values, operator.field)
   axis_count = size(gradients, 1)
   mode_count = local_mode_count(values, operator.field)
 
   @inbounds for point_index in 1:point_count(values)
     weighted = weight(values, point_index)
+    field_gradient_value = gradient(values, local_coefficients, operator.field, point_index)
 
     for row_mode in 1:mode_count
-      for col_mode in 1:row_mode
-        contribution = zero(eltype(local_matrix))
+      contribution = zero(eltype(local_result))
 
-        for axis in 1:axis_count
-          contribution += gradients[axis, row_mode, point_index] *
-                          gradients[axis, col_mode, point_index]
-        end
-
-        contribution *= weighted
-        local_block[row_mode, col_mode] += contribution
-        row_mode == col_mode || (local_block[col_mode, row_mode] += contribution)
+      for axis in 1:axis_count
+        contribution += gradients[axis, row_mode, point_index] * field_gradient_value[axis]
       end
+
+      local_result[local_dof_index(values, operator.field, 1, row_mode)] +=
+        contribution * weighted
     end
   end
 

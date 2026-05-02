@@ -1,6 +1,6 @@
 using Grico
 using CairoMakie
-import Grico: cell_matrix!, cell_rhs!
+import Grico: cell_apply!, cell_rhs!
 
 # This example is intentionally close to the README problem: solve
 # -u'' = cos(2 π x) on [0, 1] with homogeneous Dirichlet data and render the sampled
@@ -10,20 +10,17 @@ struct Diffusion{F,T}
   kappa::T
 end
 
-function cell_matrix!(local_matrix, op::Diffusion, values::CellValues)
-  A = block(local_matrix, values, op.field, op.field)
+function cell_apply!(local_result, op::Diffusion, values::CellValues, local_coefficients)
   mode_count = local_mode_count(values, op.field)
 
   for q in 1:point_count(values)
-    w = weight(values, q)
+    weighted_gradient = op.kappa * gradient(values, local_coefficients, op.field, q)[1] *
+                        weight(values, q)
 
     for i in 1:mode_count
       grad_i = shape_gradient(values, op.field, q, i)
-
-      for j in 1:mode_count
-        grad_j = shape_gradient(values, op.field, q, j)
-        A[i, j] += op.kappa * grad_i[1] * grad_j[1] * w
-      end
+      row = local_dof_index(values, op.field, 1, i)
+      local_result[row] += grad_i[1] * weighted_gradient
     end
   end
 
@@ -64,7 +61,7 @@ function run_poisson_1d_makie_example(; cell_count=2, degree=8, sample_subdivisi
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 
   plan = compile(problem)
-  state = State(plan, solve(assemble(plan)))
+  state = solve(plan; preconditioner=JacobiPreconditioner())
   figure = poisson_figure(state, u; sample_subdivisions, sample_degree)
 
   mkpath(output_directory)

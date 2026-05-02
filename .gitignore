@@ -18,6 +18,7 @@ Manifest.toml
 
 # Generated output directories.
 /benchmark/output/
+/benchmark/output_*/
 /examples/output/
 /examples/*/output/
 

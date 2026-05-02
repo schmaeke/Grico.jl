@@ -10,7 +10,6 @@ GRICO_BENCHMARK_ROOT in LOAD_PATH || pushfirst!(LOAD_PATH, GRICO_BENCHMARK_ROOT)
 using Grico
 using LinearAlgebra
 using Printf
-using SparseArrays
 
 function adaptive_benchmark_defaults(; cycles=8, root_cells=(20, 20), degree=1,
                                      quadrature_extra_points=2, max_h_level=12, tolerance=1.0e-5,
@@ -244,7 +243,7 @@ function _solution_l2_norm(state::State, field, plan, reference)
   return l2_error(state, field, reference; plan=plan, extra_points=1)
 end
 
-function _cycle_summary(cycle::Int, field, system, solution_l2::Float64, adaptivity, target_field)
+function _cycle_summary(cycle::Int, field, plan, solution_l2::Float64, adaptivity, target_field)
   space = field_space(field)
   target_space_value = field_space(target_field)
   summary = adaptivity === nothing ? nothing : adaptivity_summary(adaptivity)
@@ -254,7 +253,8 @@ function _cycle_summary(cycle::Int, field, system, solution_l2::Float64, adaptiv
 
   return (; cycle, active_leaves=active_leaf_count(space),
           stored_cells=Grico.stored_cell_count(grid(space)), max_h_level=_max_h_level(space),
-          min_p_degree, max_p_degree, dofs=scalar_dof_count(space), nnz=nnz(matrix(system)),
+          min_p_degree, max_p_degree, dofs=scalar_dof_count(space),
+          reduced_dofs=Grico.reduced_dof_count(plan),
           solution_l2, marked_leaf_count=summary === nothing ? 0 : summary.marked_leaf_count,
           h_refinement_leaf_count=summary === nothing ? 0 : summary.h_refinement_leaf_count,
           h_derefinement_cell_count=summary === nothing ? 0 : summary.h_derefinement_cell_count,
@@ -275,10 +275,11 @@ function _push_total_row!(component_rows, cycle::Int, first_row::Int, total_time
 end
 
 function _print_cycle_row(row)
-  @printf("  %3d leaves=%6d dofs=%7d nnz=%9d p=%d:%d l2=%10.3e h=%5d p+=%5d target=%6d target_p=%d:%d\n",
-          row.cycle, row.active_leaves, row.dofs, row.nnz, row.min_p_degree, row.max_p_degree,
-          row.solution_l2, row.h_refinement_leaf_count, row.p_refinement_leaf_count,
-          row.target_active_leaves, row.target_min_p_degree, row.target_max_p_degree)
+  @printf("  %3d leaves=%6d dofs=%7d reduced=%7d p=%d:%d l2=%10.3e h=%5d p+=%5d target=%6d target_p=%d:%d\n",
+          row.cycle, row.active_leaves, row.dofs, row.reduced_dofs, row.min_p_degree,
+          row.max_p_degree, row.solution_l2, row.h_refinement_leaf_count,
+          row.p_refinement_leaf_count, row.target_active_leaves, row.target_min_p_degree,
+          row.target_max_p_degree)
   return nothing
 end
 
@@ -304,7 +305,7 @@ function _write_csv(path::AbstractString, rows::Vector{NamedTuple})
 end
 
 function _component_order(rows)
-  preferred = ("problem_setup", "compile", "assemble", "solve", "newton_residual", "newton_tangent",
+  preferred = ("problem_setup", "compile", "solve", "newton_residual", "newton_tangent",
                "newton_linear_solve", "newton_state_update", "solution_norm", "adaptivity_plan",
                "transition", "adapted_field", "transfer_state")
   present = Set(row.component for row in rows if row.component != "total")
@@ -413,11 +414,8 @@ function run_adaptive_cycles(options; build_initial_field, build_problem, output
     plan = _timed!(component_rows, cycle, "compile") do
       compile(problem)
     end
-    system = _timed!(component_rows, cycle, "assemble") do
-      assemble(plan)
-    end
     state = _timed!(component_rows, cycle, "solve") do
-      State(plan, solve(system; linear_solve=(A, b) -> A \ b))
+      solve(plan; preconditioner=JacobiPreconditioner())
     end
     solution_l2 = _timed!(component_rows, cycle, "solution_norm") do
       _solution_l2_norm(state, field, plan, reference)
@@ -443,7 +441,7 @@ function run_adaptive_cycles(options; build_initial_field, build_problem, output
     end
 
     _push_total_row!(component_rows, cycle, first_component_row, time() - cycle_start)
-    push!(cycle_rows, _cycle_summary(cycle, field, system, solution_l2, adaptivity, target_field))
+    push!(cycle_rows, _cycle_summary(cycle, field, plan, solution_l2, adaptivity, target_field))
     print_progress && _print_cycle_row(last(cycle_rows))
     field = target_field
     isempty(adaptivity) && break
