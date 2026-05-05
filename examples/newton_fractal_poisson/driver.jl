@@ -1,7 +1,6 @@
 using Printf
 using Grico
 using WriteVTK
-import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 # This example solves a manufactured Poisson problem on the unit square,
 #
@@ -47,7 +46,6 @@ const WRITE_VTK = true
 const EXPORT_SUBDIVISIONS = 1
 const EXPORT_DEGREE = 3
 
-Base.include(@__MODULE__, joinpath(@__DIR__, "operators.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "problem.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "adaptive_driver.jl"))
 

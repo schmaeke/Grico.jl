@@ -71,7 +71,7 @@ function write_blast_wave_vtk(context, entry; output_directory=joinpath(@__DIR__
                                  pressure(q, context.gamma)
                                end),
                    cell_data=(leaf=leaf -> Float64(leaf),
-                              level=leaf -> Float64.(level(current_grid, leaf)),
+                              level=leaf -> Float64.(Grico.level(current_grid, leaf)),
                               degree=leaf -> Float64.(cell_degrees(context.space, leaf)),
                               refinement_indicator=refinement_indicator,
                               refinement_indicator_norm=refinement_indicator_norm),

@@ -52,8 +52,8 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
 
   for step in 0:adaptive_steps
     problem = build_newton_fractal_poisson_problem(u, context)
-    state = solve(problem; solver)
     assembly_plan = compile(problem)
+    state = solve(assembly_plan; solver)
     error_value = relative_l2_error(state, u, context.exact_solution; plan=assembly_plan,
                                     extra_points=VERIFICATION_EXTRA_POINTS)
 
@@ -109,7 +109,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
                                              abs_error=(x, values) -> abs(values.u -
                                                                           context.exact_solution(x))),
                                  cell_data=(leaf=leaf -> Float64(leaf),
-                                            level=leaf -> Float64.(level(current_grid, leaf)),
+                                            level=leaf -> Float64.(Grico.level(current_grid, leaf)),
                                             degree=leaf -> Float64.(cell_degrees(current_space,
                                                                                  leaf)),
                                             basin=leaf -> Float64(newton_basin_index(context.model,

@@ -55,7 +55,7 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
                                        abs_error=(x, values) -> abs(values.u -
                                                                     context.exact_solution(x))),
                            cell_data=(leaf=leaf -> Float64(leaf),
-                                      level=leaf -> Float64.(level(current_grid, leaf)),
+                                      level=leaf -> Float64.(Grico.level(current_grid, leaf)),
                                       degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
                            field_data=(step=Float64(step), relative_l2_error=error_value),
                            subdivisions=EXPORT_SUBDIVISIONS, append=true, compress=true,

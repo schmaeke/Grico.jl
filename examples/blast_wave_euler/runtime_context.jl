@@ -348,7 +348,7 @@ function blast_wave_adaptivity_plan(context; tolerance=ADAPTIVITY_TOLERANCE,
                                     max_h_level=MAX_H_LEVEL)
   limits = AdaptivityLimits(context.space; min_p=context.degree, max_p=context.degree,
                             max_h_level=max_h_level)
-  return adaptivity_plan(context.state, context.conserved; tolerance=tolerance, limits=limits)
+  return Grico.adaptivity_plan(context.state, context.conserved; tolerance=tolerance, limits=limits)
 end
 
 # Mesh adaptation is performed between fixed-mesh ODE segments. The current DG

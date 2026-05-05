@@ -17,7 +17,7 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
                                                               abs(values.u -
                                                                   context.exact_solution(x)) : 0.0),
                          cell_data=(leaf=leaf -> Float64(leaf),
-                                    level=leaf -> Float64.(level(current_grid, leaf)),
+                                    level=leaf -> Float64.(Grico.level(current_grid, leaf)),
                                     degree=leaf -> Float64.(cell_degrees(current_space, leaf))),
                          field_data=(relative_l2_error=error_value,),
                          subdivisions=EXPORT_SUBDIVISIONS, sample_degree=EXPORT_DEGREE, append=true,

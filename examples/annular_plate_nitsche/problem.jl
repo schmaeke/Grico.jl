@@ -25,9 +25,22 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
   space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
   u = ScalarField(space; name=:u)
 
-  problem = AffineProblem(u)
-  add_cell!(problem, Diffusion(u))
-  add_surface!(problem, NitscheDirichlet(u, exact_solution, penalty))
+  problem = AffineProblem(u; operator_class=SPD())
+  add_cell_bilinear!(problem, u, u) do q, v, w
+    inner(grad(v), grad(w))
+  end
+  add_surface_bilinear!(problem, u, u) do q, v, w
+    h = minimum(cell_size(q, u))
+    scaled_penalty = penalty / h
+    -value(v) * normal_gradient(w) - value(w) * normal_gradient(v) +
+    scaled_penalty * value(v) * value(w)
+  end
+  add_surface_linear!(problem, u) do q, v
+    g = exact_solution(point(q))
+    h = minimum(cell_size(q, u))
+    scaled_penalty = penalty / h
+    -g * normal_gradient(v) + scaled_penalty * g * value(v)
+  end
   add_embedded_surface!(problem, boundary)
 
   return (; domain, space, u, boundary, exact_solution, annulus_levelset, is_physical, problem,

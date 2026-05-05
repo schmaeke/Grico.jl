@@ -273,6 +273,11 @@ end
 @inline weight(q::_WeakQuadraturePoint) = weight(q.values, q.point_index)
 @inline coordinate(q::_WeakQuadraturePoint, axis::Integer) = point(q)[axis]
 @inline normal(q::_WeakQuadraturePoint) = normal(q.values, q.point_index)
+@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField) =
+  ntuple(axis -> cell_size(field_space(field).domain, q.values.leaf, axis),
+         dimension(field_space(field)))
+@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField, axis::Integer) =
+  cell_size(field_space(field).domain, q.values.leaf, axis)
 
 @inline value(basis::_WeakBasisFunction) =
   shape_value(basis.values, basis.field, basis.point_index, basis.mode_index)

@@ -192,9 +192,13 @@ end
 # `ℓ(v) = ∫Ω ∇v · ∇uₑ dΩ`, and the exact nonzero trace `uₑ|∂Ω` is imposed on
 # every physical boundary face through strong Dirichlet projection.
 function build_newton_fractal_poisson_problem(u, context)
-  problem = AffineProblem(u)
-  add_cell!(problem, NewtonFractalPoissonDiffusion(u))
-  add_cell!(problem, NewtonFractalPoissonGradientLoad(u, context.exact_gradient))
+  problem = AffineProblem(u; operator_class=SPD())
+  add_cell_bilinear!(problem, u, u) do q, v, w
+    inner(grad(v), grad(w))
+  end
+  add_cell_linear!(problem, u) do q, v
+    inner(grad(v), context.exact_gradient(point(q)))
+  end
 
   for axis in 1:context.dimension
     add_constraint!(problem, Dirichlet(u, BoundaryFace(axis, LOWER), context.exact_solution))
@@ -212,14 +216,14 @@ function newton_fractal_adaptivity_plan(state, u, context; tolerance=context.ada
                                         max_h_level=context.max_h_level)
   limits = AdaptivityLimits(field_space(u); min_p=context.min_degree, max_p=context.max_degree,
                             max_h_level=max_h_level)
-  return adaptivity_plan(state, u; tolerance, smoothness_threshold, limits)
+  return Grico.adaptivity_plan(state, u; tolerance, smoothness_threshold, limits)
 end
 
 # Report the deepest dyadic level `ℓ` currently present in any active leaf. This
 # is the stopping criterion used by the example driver.
 function newton_fractal_max_h_level(space)
   grid_data = grid(space)
-  return maximum((maximum(level(grid_data, leaf)) for leaf in active_leaves(space)); init=0)
+  return maximum((maximum(Grico.level(grid_data, leaf)) for leaf in active_leaves(space)); init=0)
 end
 
 # Count active leaves by their deepest coordinate direction level. The histogram
@@ -230,7 +234,7 @@ function newton_fractal_level_histogram(space)
   counts = Dict{Int,Int}()
 
   for leaf in active_leaves(space)
-    leaf_level = maximum(level(grid_data, leaf))
+    leaf_level = maximum(Grico.level(grid_data, leaf))
     counts[leaf_level] = get(counts, leaf_level, 0) + 1
   end
 

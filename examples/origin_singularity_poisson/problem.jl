@@ -34,9 +34,13 @@ function build_origin_singularity_poisson_context(; dimension=DIMENSION,
 end
 
 function build_origin_singularity_problem(u, context)
-  problem = AffineProblem(u)
-  add_cell!(problem, Diffusion(u))
-  add_cell!(problem, Source(u, context.source_term))
+  problem = AffineProblem(u; operator_class=SPD())
+  add_cell_bilinear!(problem, u, u) do q, v, w
+    inner(grad(v), grad(w))
+  end
+  add_cell_linear!(problem, u) do q, v
+    value(v) * context.source_term(point(q))
+  end
 
   for axis in 1:context.dimension
     add_constraint!(problem, Dirichlet(u, BoundaryFace(axis, UPPER), context.exact_solution))
@@ -47,5 +51,5 @@ end
 
 function origin_adaptivity_plan(state, u)
   limits = AdaptivityLimits(field_space(u); max_p=MAX_DEGREE, max_h_level=MAX_H_LEVEL)
-  return adaptivity_plan(state, u; tolerance=ADAPTIVITY_TOLERANCE, limits=limits)
+  return Grico.adaptivity_plan(state, u; tolerance=ADAPTIVITY_TOLERANCE, limits=limits)
 end

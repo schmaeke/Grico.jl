@@ -3,8 +3,7 @@ using Printf
 using Grico
 using WriteVTK
 import OrdinaryDiffEq
-import Grico: cell_apply!, cell_diagonal!, cell_residual!, cell_rhs!, face_residual!,
-              interface_residual!
+import Grico: cell_residual!, face_residual!, interface_residual!
 
 # This example solves the compressible Euler equations
 #

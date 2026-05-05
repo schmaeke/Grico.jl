@@ -1,7 +1,6 @@
 using Printf
 using Grico
 using WriteVTK
-import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 
 # This example is meant to be the simplest "read it from top to bottom" tour of
 # adaptive finite elements in Grico.
@@ -44,8 +43,8 @@ import Grico: cell_apply!, cell_diagonal!, cell_rhs!
 # Directory organization:
 #
 # - `driver.jl` selects the parameters and loads the pieces in reading order.
-# - `operators.jl` defines the local diffusion and load operators.
-# - `problem.jl` defines the manufactured data, space, boundary data, and adaptivity plan.
+# - `problem.jl` defines the weak form, manufactured data, space, boundary data,
+#   and adaptivity plan.
 # - `adaptive_driver.jl` performs the solve-estimate-adapt loop and optional VTK export.
 
 # The code is written dimension-independently, but the default is now 2D so a
@@ -73,7 +72,6 @@ const SINGULAR_EXPONENT = 0.5
 # Optional quadrature enrichment for the verification integral.
 const VERIFICATION_EXTRA_POINTS = 0
 
-Base.include(@__MODULE__, joinpath(@__DIR__, "operators.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "problem.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "adaptive_driver.jl"))
 

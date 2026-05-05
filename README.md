@@ -59,7 +59,7 @@ generated benchmark reports stay untracked.
 
 1. Build a `Domain` on a Cartesian grid.
 2. Compile an `HpSpace` from basis, degree, quadrature, and continuity choices.
-3. Define fields and add local operators to an `AffineProblem` or
+3. Define fields and add weak forms to an `AffineProblem` or
    `ResidualProblem`.
 4. `compile`, apply matrix-free operators directly, and `solve`.
 5. Optionally verify, sample/export, or build a new adaptive space with
@@ -69,73 +69,18 @@ generated benchmark reports stay untracked.
 
 ```julia
 using Grico
-import Grico: cell_apply!, cell_diagonal!, cell_rhs!
-
-struct Diffusion{F,T}
-  field::F
-  kappa::T
-end
-
-function cell_apply!(local_result, op::Diffusion, values::CellValues, local_coefficients)
-  mode_count = local_mode_count(values, op.field)
-
-  for q in 1:point_count(values)
-    grad_u = gradient(values, local_coefficients, op.field, q)
-    w = op.kappa * weight(values, q)
-
-    for i in 1:mode_count
-      grad_i = shape_gradient(values, op.field, q, i)
-      row = local_dof_index(values, op.field, 1, i)
-      local_result[row] += sum(grad_i[a] * grad_u[a] for a in eachindex(grad_i)) * w
-    end
-  end
-
-  return nothing
-end
-
-function cell_diagonal!(local_diagonal, op::Diffusion, values::CellValues)
-  mode_count = local_mode_count(values, op.field)
-
-  for q in 1:point_count(values)
-    w = op.kappa * weight(values, q)
-
-    for i in 1:mode_count
-      grad_i = shape_gradient(values, op.field, q, i)
-      row = local_dof_index(values, op.field, 1, i)
-      local_diagonal[row] += sum(grad_i[a] * grad_i[a] for a in eachindex(grad_i)) * w
-    end
-  end
-
-  return nothing
-end
-
-struct Source{F,G}
-  field::F
-  f::G
-end
-
-function cell_rhs!(local_rhs, op::Source, values::CellValues)
-  b = block(local_rhs, values, op.field)
-  mode_count = local_mode_count(values, op.field)
-
-  for q in 1:point_count(values)
-    w = op.f(point(values, q)) * weight(values, q)
-
-    for i in 1:mode_count
-      b[i] += shape_value(values, op.field, q, i) * w
-    end
-  end
-
-  return nothing
-end
 
 domain = Domain((0.0,), (1.0,), (8,))
 space = HpSpace(domain, SpaceOptions(degree=UniformDegree(2)))
 u = ScalarField(space; name=:u)
 
-problem = AffineProblem(u)
-add_cell!(problem, Diffusion(u, 1.0))
-add_cell!(problem, Source(u, x -> 1.0))
+problem = AffineProblem(u; operator_class=SPD())
+add_cell_bilinear!(problem, u, u) do q, v, w
+  inner(grad(v), grad(w))
+end
+add_cell_linear!(problem, u) do q, v
+  value(v)
+end
 add_constraint!(problem, Dirichlet(u, BoundaryFace(1, LOWER), 0.0))
 add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 

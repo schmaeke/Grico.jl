@@ -1,7 +1,6 @@
 using Printf
 using Grico
 using WriteVTK
-import Grico: cell_apply!, cell_diagonal!, surface_apply!, surface_diagonal!, surface_rhs!
 
 # This example is the compact "unfitted methods" tour of the package.
 #
@@ -30,7 +29,7 @@ import Grico: cell_apply!, cell_diagonal!, surface_apply!, surface_diagonal!, su
 # Directory organization:
 #
 # - `driver.jl` selects the annulus parameters and loads the mathematical pieces.
-# - `operators.jl` defines the volume Laplace form and symmetric Nitsche boundary terms.
+# - `problem.jl` defines the volume Laplace form and symmetric Nitsche boundary terms.
 # - `geometry.jl` builds the polygonal circle meshes used for the embedded boundary.
 # - `problem.jl` assembles the unfitted physical-domain problem description.
 # - `solve_and_export.jl` solves, verifies, prints a summary, and optionally writes VTK output.
@@ -69,7 +68,6 @@ const WRITE_VTK = true
 const EXPORT_SUBDIVISIONS = 1
 const EXPORT_DEGREE = 4
 
-Base.include(@__MODULE__, joinpath(@__DIR__, "operators.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "geometry.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "problem.jl"))
 Base.include(@__MODULE__, joinpath(@__DIR__, "solve_and_export.jl"))
