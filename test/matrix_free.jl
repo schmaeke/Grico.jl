@@ -450,6 +450,9 @@ end
   no_diagonal_operator = Grico._ReducedAffineOperator(no_diagonal_plan, no_diagonal_workspace)
   @test Grico._compile_preconditioner(JacobiPreconditioner(), no_diagonal_operator) isa
         Grico._JacobiCompiledPreconditioner
+  counting_operator = Grico._CountingReducedOperator(no_diagonal_operator, Ref(0))
+  @test Grico._compile_preconditioner(IdentityPreconditioner(), counting_operator) isa
+        Grico._IdentityCompiledPreconditioner
   no_diagonal_state = solve(no_diagonal_plan;
                             solver=CGSolver(preconditioner=JacobiPreconditioner()))
   @test coefficients(no_diagonal_state) ≈ [1.0, 1.0]
@@ -499,6 +502,9 @@ end
   weak_diffusion_plan = compile(weak_diffusion_problem)
   @test apply(weak_diffusion_plan, diffusion_coefficients) ≈
         apply(diffusion_plan, diffusion_coefficients)
+  weak_diffusion_diagonal_selected, weak_diffusion_diagonal = _kernel_reduced_diagonal(weak_diffusion_plan)
+  @test weak_diffusion_diagonal_selected
+  @test weak_diffusion_diagonal ≈ _reference_reduced_diagonal(weak_diffusion_plan)
 
   tensor_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   tensor_space = HpSpace(tensor_domain,

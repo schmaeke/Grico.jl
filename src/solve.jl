@@ -572,6 +572,11 @@ function _compile_preconditioner(::IdentityPreconditioner,
   return _IdentityCompiledPreconditioner{T}()
 end
 
+function _compile_preconditioner(preconditioner::IdentityPreconditioner,
+                                 operator::_CountingReducedOperator{T}) where {T<:AbstractFloat}
+  return _compile_preconditioner(preconditioner, operator.operator)
+end
+
 function _compile_preconditioner(::JacobiPreconditioner,
                                  operator::_ReducedAffineOperator{D,T}) where {D,T<:AbstractFloat}
   inverse_diagonal = _jacobi_inverse_diagonal(operator.plan, operator.workspace)

@@ -64,6 +64,36 @@ struct _WeakBasisFunction{V,F<:AbstractField}
   mode_index::Int
 end
 
+# During matrix-free application, a bilinear trial argument represents the
+# discrete trial field u_h rather than one basis function. This is equivalent to
+# multiplying the assembled local matrix by the coefficient vector for genuine
+# bilinear forms, and it avoids the quadratic trial-mode loop in the hot apply
+# path.
+struct _WeakTrialFunction{D,T<:AbstractFloat,F<:AbstractField,N}
+  field::F
+  component::Int
+  value::T
+  gradient::NTuple{D,T}
+  normal_gradient::N
+end
+
+# The tensorized cell path evaluates the form once per quadrature point with a
+# symbolic test function. The resulting `_WeakTestTerm` stores the coefficients
+# multiplying v_h and ∇v_h so that the contribution can be projected with
+# sum-factorized tensor kernels.
+struct _WeakTestFunction{D,T<:AbstractFloat,F<:AbstractField}
+  field::F
+  component::Int
+end
+
+# A test term is the affine functional α v_h + β · ∇v_h at one quadrature point.
+# Nonlinear dependence on the test function is rejected explicitly because such
+# a form cannot be represented by a bilinear matrix-free operator.
+struct _WeakTestTerm{D,T<:AbstractFloat} <: Number
+  value_coefficient::T
+  gradient_coefficients::NTuple{D,T}
+end
+
 struct _WeakTracePair{M,P}
   minus::M
   plus::P
@@ -280,6 +310,12 @@ end
 @inline value(basis::_WeakBasisFunction) = shape_value(basis.values, basis.field, basis.point_index,
                                                        basis.mode_index)
 
+@inline value(trial::_WeakTrialFunction) = trial.value
+
+@inline function value(test::_WeakTestFunction{D,T}) where {D,T<:AbstractFloat}
+  return _WeakTestTerm(one(T), ntuple(_ -> zero(T), Val(D)))
+end
+
 @inline function value(basis::_WeakTraceBasisFunction)
   active_value = _trace_shape_value(basis)
   inactive_value = zero(active_value)
@@ -291,6 +327,14 @@ end
   return shape_gradient(basis.values, basis.field, basis.point_index, basis.mode_index)
 end
 
+@inline gradient(trial::_WeakTrialFunction) = trial.gradient
+
+@inline function gradient(test::_WeakTestFunction{D,T}) where {D,T<:AbstractFloat}
+  return ntuple(axis -> _WeakTestTerm(zero(T),
+                                      ntuple(current -> current == axis ? one(T) : zero(T), Val(D))),
+                Val(D))
+end
+
 @inline function gradient(basis::_WeakTraceBasisFunction)
   active_gradient = _trace_shape_gradient(basis)
   inactive_gradient = _zero_like(active_gradient)
@@ -299,12 +343,30 @@ end
 end
 
 @inline grad(basis::_WeakBasisFunction) = gradient(basis)
+@inline grad(trial::_WeakTrialFunction) = gradient(trial)
+@inline grad(test::_WeakTestFunction) = gradient(test)
 @inline grad(basis::_WeakTraceBasisFunction) = gradient(basis)
 @inline ∇(basis::_WeakBasisFunction) = gradient(basis)
+@inline ∇(trial::_WeakTrialFunction) = gradient(trial)
+@inline ∇(test::_WeakTestFunction) = gradient(test)
 @inline ∇(basis::_WeakTraceBasisFunction) = gradient(basis)
 
 @inline function normal_gradient(basis::_WeakBasisFunction)
   return shape_normal_gradient(basis.values, basis.field, basis.point_index, basis.mode_index)
+end
+
+@inline function normal_gradient(trial::_WeakTrialFunction{D,T,F,T}) where {D,T<:AbstractFloat,
+                                                                            F<:AbstractField}
+  return trial.normal_gradient
+end
+
+function normal_gradient(::_WeakTrialFunction{D,T,F,Nothing}) where {D,T<:AbstractFloat,
+                                                                     F<:AbstractField}
+  throw(ArgumentError("normal_gradient is only available for weak-form trial functions on faces, interfaces, and embedded surfaces"))
+end
+
+function normal_gradient(::_WeakTestFunction)
+  throw(ArgumentError("normal_gradient is not available in tensorized cell weak-form projection"))
 end
 
 @inline function normal_gradient(basis::_WeakTraceBasisFunction)
@@ -315,7 +377,60 @@ end
 end
 
 @inline component(basis::_WeakBasisFunction) = basis.component
+@inline component(trial::_WeakTrialFunction) = trial.component
+@inline component(test::_WeakTestFunction) = test.component
 @inline component(basis::_WeakTraceBasisFunction) = basis.component
+
+@inline function _zero_test_term(::Type{T}, ::Val{D}) where {D,T<:AbstractFloat}
+  return _WeakTestTerm(zero(T), ntuple(_ -> zero(T), Val(D)))
+end
+
+@inline Base.zero(term::_WeakTestTerm{D,T}) where {D,T<:AbstractFloat} = _zero_test_term(T, Val(D))
+@inline Base.zero(::Type{_WeakTestTerm{D,T}}) where {D,T<:AbstractFloat} = _zero_test_term(T,
+                                                                                           Val(D))
+
+@inline function Base.:+(a::_WeakTestTerm{D,T}, b::_WeakTestTerm{D,T}) where {D,T<:AbstractFloat}
+  return _WeakTestTerm(a.value_coefficient + b.value_coefficient,
+                       ntuple(axis -> a.gradient_coefficients[axis] + b.gradient_coefficients[axis],
+                              Val(D)))
+end
+
+@inline Base.:-(a::_WeakTestTerm{D,T}) where {D,T<:AbstractFloat} = -one(T) * a
+
+@inline Base.:-(a::_WeakTestTerm{D,T}, b::_WeakTestTerm{D,T}) where {D,T<:AbstractFloat} = a + (-b)
+
+@inline function Base.:+(a::_WeakTestTerm, b::Number)
+  iszero(b) && return a
+  throw(ArgumentError("cell bilinear form produced a nonzero term independent of the test function"))
+end
+
+@inline Base.:+(a::Number, b::_WeakTestTerm) = b + a
+
+@inline function Base.:-(a::_WeakTestTerm, b::Number)
+  iszero(b) && return a
+  throw(ArgumentError("cell bilinear form produced a nonzero term independent of the test function"))
+end
+
+@inline function Base.:-(a::Number, b::_WeakTestTerm)
+  iszero(a) && return -b
+  throw(ArgumentError("cell bilinear form produced a nonzero term independent of the test function"))
+end
+
+@inline function Base.:*(a::_WeakTestTerm{D,T}, b::Number) where {D,T<:AbstractFloat}
+  scale = T(b)
+  return _WeakTestTerm(scale * a.value_coefficient,
+                       ntuple(axis -> scale * a.gradient_coefficients[axis], Val(D)))
+end
+
+@inline Base.:*(a::Number, b::_WeakTestTerm) = b * a
+
+function Base.:*(::_WeakTestTerm, ::_WeakTestTerm)
+  throw(ArgumentError("cell bilinear form is nonlinear in the test function"))
+end
+
+@inline Base.:/(a::_WeakTestTerm{D,T}, b::Number) where {D,T<:AbstractFloat} = a * inv(T(b))
+
+@inline Base.conj(a::_WeakTestTerm) = a
 
 @inline inner(a::Number, b::Number) = a * b
 
@@ -384,21 +499,21 @@ end
 function cell_apply!(local_result::AbstractVector{T}, operator::_CellBilinearForm, values,
                      local_coefficients::AbstractVector{T},
                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
-  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
+  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients, scratch)
   return nothing
 end
 
 function face_apply!(local_result::AbstractVector{T}, operator::_BoundaryBilinearForm, values,
                      local_coefficients::AbstractVector{T},
                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
-  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
+  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients, scratch)
   return nothing
 end
 
 function surface_apply!(local_result::AbstractVector{T}, operator::_SurfaceBilinearForm, values,
                         local_coefficients::AbstractVector{T},
                         scratch::KernelScratch{T}) where {T<:AbstractFloat}
-  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
+  _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients, scratch)
   return nothing
 end
 
@@ -495,7 +610,27 @@ end
 
 function _accumulate_cell_bilinear_apply!(local_result::AbstractVector{T},
                                           operator::_LocalBilinearForm, values,
-                                          local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
+                                          local_coefficients::AbstractVector{T},
+                                          scratch::KernelScratch{T}) where {T<:AbstractFloat}
+  # Vector-valued trial fields keep the basis loop because component-coupled
+  # forms need the exact per-component matrix semantics.
+  component_count(operator.trial_field) == 1 ||
+    return _accumulate_cell_bilinear_apply_by_basis!(local_result, operator, values,
+                                                     local_coefficients)
+  tensor = tensor_values(values, operator.trial_field)
+
+  if tensor !== nothing && is_full_tensor(tensor)
+    return _accumulate_cell_bilinear_apply_tensor_trial!(local_result, operator, values,
+                                                         local_coefficients, tensor, scratch)
+  end
+
+  return _accumulate_cell_bilinear_apply_scalar_trial!(local_result, operator, values,
+                                                       local_coefficients)
+end
+
+function _accumulate_cell_bilinear_apply_by_basis!(local_result::AbstractVector{T},
+                                                   operator::_LocalBilinearForm, values,
+                                                   local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
   test_field = operator.test_field
   trial_field = operator.trial_field
 
@@ -528,11 +663,202 @@ function _accumulate_cell_bilinear_apply!(local_result::AbstractVector{T},
   return local_result
 end
 
+function _trial_function(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
+                         field::AbstractField, point_index::Int) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  value_data = _local_field_value_component(data, local_coefficients, 1, point_index)
+  gradient_data = _local_field_gradient(data, local_coefficients, 1, point_index)
+  normal_data = _normal_trial_gradient(values, data, local_coefficients, point_index)
+  return _WeakTrialFunction(field, 1, value_data, gradient_data, normal_data)
+end
+
+@inline _normal_trial_gradient(values, data, local_coefficients, point_index) = nothing
+
+@inline function _normal_trial_gradient(values::_NormalEvaluationValues, data::_FieldValues{D,T},
+                                        local_coefficients::AbstractVector{T},
+                                        point_index::Int) where {D,T<:AbstractFloat}
+  return _local_field_normal_gradient(data, local_coefficients, 1, point_index,
+                                      _point_normal(values, point_index))
+end
+
+function _accumulate_cell_bilinear_apply_scalar_trial!(local_result::AbstractVector{T},
+                                                       operator::_LocalBilinearForm, values,
+                                                       local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
+  test_field = operator.test_field
+  trial_field = operator.trial_field
+
+  for point_index in 1:point_count(values)
+    q = _WeakQuadraturePoint(values, point_index)
+    weighted = weight(q)
+    trial = _trial_function(values, local_coefficients, trial_field, point_index)
+
+    for test_component in 1:component_count(test_field)
+      for test_mode in 1:local_mode_count(values, test_field)
+        row = local_dof_index(values, test_field, test_component, test_mode)
+        test = _WeakBasisFunction(values, test_field, point_index, test_component, test_mode)
+        local_result[row] += weighted * operator.form(q, test, trial)
+      end
+    end
+  end
+
+  return local_result
+end
+
+function _copy_scalar_tensor_trial_coefficients!(result::AbstractVector{T}, values,
+                                                 field::AbstractField,
+                                                 local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  offset = first(data.block) + _field_component_offset(data, 1) - 1
+
+  @inbounds for mode_index in eachindex(result)
+    result[mode_index] = local_coefficients[offset+mode_index]
+  end
+
+  return result
+end
+
+@inline function _tensor_trial_function(::Val{D}, field::AbstractField, point_index::Int,
+                                        point_values::AbstractVector{T},
+                                        point_gradients::AbstractMatrix{T}) where {D,
+                                                                                   T<:AbstractFloat}
+  gradient_data = ntuple(axis -> (@inbounds point_gradients[axis, point_index]), Val(D))
+  value_data = @inbounds point_values[point_index]
+  return _WeakTrialFunction(field, 1, value_data, gradient_data, nothing)
+end
+
+function _accumulate_cell_bilinear_apply_tensor_trial!(local_result::AbstractVector{T},
+                                                       operator::_CellBilinearForm, values,
+                                                       local_coefficients::AbstractVector{T},
+                                                       tensor::TensorProductValues{D,T},
+                                                       scratch::KernelScratch{T}) where {D,
+                                                                                         T<:AbstractFloat}
+  test_tensor = tensor_values(values, operator.test_field)
+  if component_count(operator.test_field) == 1 &&
+     test_tensor !== nothing &&
+     is_full_tensor(test_tensor)
+    return _accumulate_cell_bilinear_apply_tensor_project!(local_result, operator, values,
+                                                           local_coefficients, test_tensor, tensor,
+                                                           scratch)
+  end
+
+  return _accumulate_cell_bilinear_apply_tensor_test_basis!(local_result, operator, values,
+                                                            local_coefficients, tensor, scratch)
+end
+
+function _accumulate_cell_bilinear_apply_tensor_test_basis!(local_result::AbstractVector{T},
+                                                            operator::_CellBilinearForm, values,
+                                                            local_coefficients::AbstractVector{T},
+                                                            tensor::TensorProductValues{D,T},
+                                                            scratch::KernelScratch{T}) where {D,
+                                                                                              T<:AbstractFloat}
+  test_field = operator.test_field
+  trial_field = operator.trial_field
+  trial_coefficients = scratch_vector(scratch, D + 2, tensor_mode_count(tensor))
+  point_values = scratch_vector(scratch, D + 3, tensor_point_count(tensor))
+  point_gradients = scratch_matrix(scratch, 1, D, tensor_point_count(tensor))
+  _copy_scalar_tensor_trial_coefficients!(trial_coefficients, values, trial_field,
+                                          local_coefficients)
+  tensor_interpolate!(point_values, tensor, trial_coefficients, scratch)
+  tensor_gradient!(point_gradients, tensor, trial_coefficients, scratch)
+
+  for point_index in 1:point_count(values)
+    q = _WeakQuadraturePoint(values, point_index)
+    weighted = weight(q)
+    trial = _tensor_trial_function(Val(D), trial_field, point_index, point_values, point_gradients)
+
+    for test_component in 1:component_count(test_field)
+      for test_mode in 1:local_mode_count(values, test_field)
+        row = local_dof_index(values, test_field, test_component, test_mode)
+        test = _WeakBasisFunction(values, test_field, point_index, test_component, test_mode)
+        local_result[row] += weighted * operator.form(q, test, trial)
+      end
+    end
+  end
+
+  return local_result
+end
+
+function _add_scalar_tensor_output!(local_result::AbstractVector{T}, values, field::AbstractField,
+                                    contribution::AbstractVector{T}) where {T<:AbstractFloat}
+  data = _field_values(values, field)
+  offset = first(data.block) + _field_component_offset(data, 1) - 1
+
+  @inbounds for mode_index in eachindex(contribution)
+    local_result[offset+mode_index] += contribution[mode_index]
+  end
+
+  return local_result
+end
+
+@inline _test_value_coefficient(term::_WeakTestTerm) = term.value_coefficient
+
+@inline function _test_value_coefficient(term::Number)
+  iszero(term) && return term
+  throw(ArgumentError("cell bilinear form produced a nonzero term independent of the test function"))
+end
+
+@inline _test_gradient_coefficient(term::_WeakTestTerm, axis::Int) = term.gradient_coefficients[axis]
+
+@inline function _test_gradient_coefficient(term::Number, axis::Int)
+  iszero(term) && return term
+  throw(ArgumentError("cell bilinear form produced a nonzero term independent of the test function"))
+end
+
+function _accumulate_cell_bilinear_apply_tensor_project!(local_result::AbstractVector{T},
+                                                         operator::_CellBilinearForm, values,
+                                                         local_coefficients::AbstractVector{T},
+                                                         test_tensor::TensorProductValues{D,T},
+                                                         trial_tensor::TensorProductValues{D,T},
+                                                         scratch::KernelScratch{T}) where {D,
+                                                                                           T<:AbstractFloat}
+  test_field = operator.test_field
+  trial_field = operator.trial_field
+  trial_coefficients = scratch_vector(scratch, D + 2, tensor_mode_count(trial_tensor))
+  trial_values = scratch_vector(scratch, D + 3, tensor_point_count(trial_tensor))
+  weighted_values = scratch_vector(scratch, D + 4, tensor_point_count(test_tensor))
+  contribution = scratch_vector(scratch, D + 5, tensor_mode_count(test_tensor))
+  trial_gradients = scratch_matrix(scratch, 1, D, tensor_point_count(trial_tensor))
+  weighted_gradients = scratch_matrix(scratch, 2, D, tensor_point_count(test_tensor))
+  _copy_scalar_tensor_trial_coefficients!(trial_coefficients, values, trial_field,
+                                          local_coefficients)
+  tensor_interpolate!(trial_values, trial_tensor, trial_coefficients, scratch)
+  tensor_gradient!(trial_gradients, trial_tensor, trial_coefficients, scratch)
+  fill!(contribution, zero(T))
+
+  for point_index in 1:point_count(values)
+    q = _WeakQuadraturePoint(values, point_index)
+    weighted = weight(q)
+    test = _WeakTestFunction{D,T,typeof(test_field)}(test_field, 1)
+    trial = _tensor_trial_function(Val(D), trial_field, point_index, trial_values, trial_gradients)
+    term = operator.form(q, test, trial)
+    weighted_values[point_index] = weighted * T(_test_value_coefficient(term))
+
+    for axis in 1:D
+      weighted_gradients[axis, point_index] = weighted * T(_test_gradient_coefficient(term, axis))
+    end
+  end
+
+  tensor_project!(contribution, test_tensor, weighted_values, scratch)
+  tensor_project_gradient!(contribution, test_tensor, weighted_gradients, scratch)
+  _add_scalar_tensor_output!(local_result, values, test_field, contribution)
+  return local_result
+end
+
+function _accumulate_cell_bilinear_apply_tensor_trial!(local_result::AbstractVector{T},
+                                                       operator::_LocalBilinearForm, values,
+                                                       local_coefficients::AbstractVector{T},
+                                                       tensor::TensorProductValues,
+                                                       scratch::KernelScratch{T}) where {T<:AbstractFloat}
+  return _accumulate_cell_bilinear_apply_scalar_trial!(local_result, operator, values,
+                                                       local_coefficients)
+end
+
 function _accumulate_cell_bilinear_diagonal!(local_diagonal::AbstractVector{T},
                                              operator::_LocalBilinearForm,
                                              values) where {T<:AbstractFloat}
   test_field = operator.test_field
   trial_field = operator.trial_field
+  _field_id(test_field) == _field_id(trial_field) || return local_diagonal
 
   for point_index in 1:point_count(values)
     q = _WeakQuadraturePoint(values, point_index)
@@ -542,16 +868,8 @@ function _accumulate_cell_bilinear_diagonal!(local_diagonal::AbstractVector{T},
       for test_mode in 1:local_mode_count(values, test_field)
         row = local_dof_index(values, test_field, test_component, test_mode)
         test = _WeakBasisFunction(values, test_field, point_index, test_component, test_mode)
-
-        for trial_component in 1:component_count(trial_field)
-          for trial_mode in 1:local_mode_count(values, trial_field)
-            column = local_dof_index(values, trial_field, trial_component, trial_mode)
-            row == column || continue
-            trial = _WeakBasisFunction(values, trial_field, point_index, trial_component,
-                                       trial_mode)
-            local_diagonal[row] += weighted * operator.form(q, test, trial)
-          end
-        end
+        trial = _WeakBasisFunction(values, trial_field, point_index, test_component, test_mode)
+        local_diagonal[row] += weighted * operator.form(q, test, trial)
       end
     end
   end
