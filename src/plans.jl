@@ -126,13 +126,15 @@ The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
 must be compiled.
 """
-struct AssemblyPlan{D,T<:AbstractFloat,CO<:Tuple,BO<:Tuple,IO<:Tuple,SO<:Tuple,I,S}
+struct AssemblyPlan{D,T<:AbstractFloat,CO<:Tuple,BO<:Tuple,IO<:Tuple,SO<:Tuple,I,
+                    OC<:AbstractOperatorClass,S}
   layout::FieldLayout{D,T}
   cell_operators::CO
   boundary_operators::BO
   interface_operators::IO
   surface_operators::SO
   integration::I
+  operator_class::OC
   dirichlet::_CompiledDirichlet{T}
   mean_constraints::Vector{_CompiledLinearConstraint{T}}
   constraint_masks::_ConstraintMasks{T}
@@ -173,7 +175,7 @@ function _compile_problem_description(problem::_AbstractProblem, assembly_kind)
   return _compile_problem(data.fields, Tuple(data.cell_operators), Tuple(data.boundary_operators),
                           Tuple(data.interface_operators), Tuple(data.surface_operators),
                           data.cell_quadratures, data.embedded_surfaces, data.dirichlet_constraints,
-                          data.mean_constraints, assembly_kind)
+                          data.mean_constraints, data.operator_class, assembly_kind)
 end
 
 # Main compilation pipeline from problem description to immutable plan.
@@ -203,7 +205,8 @@ end
 # callbacks are used.
 function _compile_problem(fields, cell_operators, boundary_operators, interface_operators,
                           surface_operators, cell_quadratures, embedded_surfaces,
-                          dirichlet_constraints, mean_constraints, assembly_kind)
+                          dirichlet_constraints, mean_constraints, operator_class,
+                          assembly_kind)
   layout = _field_layout(fields)
   integration = _compile_integration(layout, cell_quadratures, embedded_surfaces;
                                      include_interfaces=(!isempty(interface_operators)))
@@ -222,8 +225,9 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                                                    compiled_dirichlet, compiled_mean_constraints,
                                                    constraint_masks)
   return AssemblyPlan(layout, cell_operators, boundary_operators, interface_operators,
-                      surface_operators, integration, compiled_dirichlet, compiled_mean_constraints,
-                      constraint_masks, traversal_plan, assembly_structure)
+                      surface_operators, integration, operator_class, compiled_dirichlet,
+                      compiled_mean_constraints, constraint_masks, traversal_plan,
+                      assembly_structure)
 end
 
 # Compile serial traversal metadata for operator and nonlinear evaluation.

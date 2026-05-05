@@ -8,23 +8,28 @@
 # transpose, so constraints remain part of the reduced operator contract.
 
 """
-    GeometricMultigridSolver(; kwargs...)
+    GeometricMultigridPreconditioner(; kwargs...)
 
-Matrix-free geometric multigrid solver policy for affine SPD problems.
+Matrix-free geometric multigrid preconditioner policy for affine problems.
 
 The hierarchy is compiled from an `AffineProblem`, not from an already compiled
 `AssemblyPlan`, so every level can rediscretize the same weak form on adapted
-fields. The implementation builds one configurable hp hierarchy on a shared
-`HpSpace`; unsupported coupled-space or non-nested cases throw explicit
-`ArgumentError`s instead of silently falling back to a weaker method.
+fields. Use it as the preconditioner of [`CGSolver`](@ref) for SPD systems or
+[`FGMRESSolver`](@ref) for nonsymmetric, indefinite, or otherwise general
+systems.
+
+The implementation builds one configurable hp hierarchy on a shared `HpSpace`;
+unsupported coupled-space or non-nested cases throw explicit `ArgumentError`s
+when requested explicitly. [`AutoLinearSolver`](@ref) chooses this
+preconditioner when a hierarchy is available and otherwise falls back to a
+generic preconditioner.
 
 `coarse_direct_dof_limit` controls the base-level solve: reduced coarse systems
 at or below this size are assembled from local operator matrices and solved
-with dense Cholesky when the coarse matrix is numerically symmetric positive
-definite. Larger, nonsymmetric, or indefinite coarse systems use the configured
-Krylov tolerance policy.
+with dense Cholesky for declared SPD operators or dense LU for general
+operators. Larger systems use the configured coarse Krylov tolerance policy.
 """
-struct GeometricMultigridSolver <: AbstractLinearSolver
+struct GeometricMultigridPreconditioner <: AbstractPreconditioner
   min_degree::Int
   max_levels::Int
   p_sequence::Symbol
@@ -37,7 +42,7 @@ struct GeometricMultigridSolver <: AbstractLinearSolver
   coarse_direct_dof_limit::Int
 end
 
-function GeometricMultigridSolver(; min_degree::Integer=1, max_levels::Integer=16,
+function GeometricMultigridPreconditioner(; min_degree::Integer=1, max_levels::Integer=16,
                                   p_sequence::Symbol=:bisect,
                                   pre_smoothing_steps::Integer=2,
                                   post_smoothing_steps::Integer=2,
@@ -61,7 +66,7 @@ function GeometricMultigridSolver(; min_degree::Integer=1, max_levels::Integer=1
   checked_coarse_maxiter = _checked_positive(coarse_maxiter, "coarse_maxiter")
   checked_coarse_direct = _checked_nonnegative(coarse_direct_dof_limit,
                                                "coarse_direct_dof_limit")
-  return GeometricMultigridSolver(checked_min_degree, checked_max_levels, p_sequence,
+  return GeometricMultigridPreconditioner(checked_min_degree, checked_max_levels, p_sequence,
                                   checked_pre, checked_post, damping, coarse_rtol,
                                   coarse_atol, checked_coarse_maxiter, checked_coarse_direct)
 end
@@ -100,17 +105,24 @@ struct _MultigridHCoarseningCandidate{D}
   target_degrees::NTuple{D,Int}
 end
 
-struct _DenseCoarseSolver{T<:AbstractFloat}
+struct _DenseCholeskyCoarseSolver{T<:AbstractFloat}
   factor::Matrix{T}
+end
+
+struct _DenseLUCoarseSolver{T<:AbstractFloat}
+  factor::Matrix{T}
+  pivots::Vector{Int}
 end
 
 struct _KrylovCoarseSolver end
 
-struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,L,TR,CS} <:
+struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,
+                                                 OC<:AbstractOperatorClass} <:
        _CompiledPreconditioner{T}
-  levels::L
-  transfers::TR
+  levels::Vector{_MultigridLevel{T}}
+  transfers::Vector{_ReducedTransfer{T}}
   coarse_solver::CS
+  operator_class::OC
   level_rhs::Vector{Vector{T}}
   level_solution::Vector{Vector{T}}
   pre_smoothing_steps::Int
@@ -122,31 +134,20 @@ struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,L,TR,CS} <:
 end
 
 function _solve_affine_problem(problem::AffineProblem, ::AutoLinearSolver; kwargs...)
-  return _solve_affine_problem(problem, GeometricMultigridSolver(); kwargs...)
+  preconditioner = _default_affine_preconditioner(problem)
+  solver = _is_spd_operator_class(operator_class(problem)) ?
+           CGSolver(; preconditioner) :
+           FGMRESSolver(; preconditioner)
+  return _solve_affine_problem(problem, solver; kwargs...)
 end
 
 function _solve_affine_problem(problem::AffineProblem,
-                               solver::GeometricMultigridSolver;
+                               solver::CGSolver{<:GeometricMultigridPreconditioner};
                                relative_tolerance=sqrt(eps(Float64)),
                                absolute_tolerance=0.0, maxiter=nothing,
                                initial_solution=nothing)
-  fine_fields = Tuple(_problem_data(problem).fields)
-  fine_space = _single_multigrid_space(fine_fields)
-  if !_has_multigrid_coarsening_level(fine_space, solver)
-    plan = compile(problem)
-    fallback_solver = CGSolver(; preconditioner=JacobiPreconditioner())
-    return _solve_affine(plan; solver=fallback_solver,
-                         relative_tolerance=relative_tolerance,
-                         absolute_tolerance=absolute_tolerance,
-                         maxiter=maxiter === nothing ? max(1_000, 2 * reduced_dof_count(plan)) :
-                         maxiter,
-                         initial_solution=initial_solution)
-  end
-
-  hierarchy = _compile_geometric_multigrid(problem, solver)
-  levels = hierarchy.levels
-
-  finest = levels[end]
+  hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
+  finest = hierarchy.levels[end]
   T = eltype(finest.residual)
   rhs = zeros(T, reduced_dof_count(finest.plan))
   _reduced_rhs!(rhs, finest.plan, finest.workspace)
@@ -159,12 +160,56 @@ function _solve_affine_problem(problem::AffineProblem,
   return _state_from_reduced_result(finest.plan, reduced_values)
 end
 
-function _has_multigrid_coarsening_level(space::HpSpace, solver::GeometricMultigridSolver)
+function _solve_affine_problem(problem::AffineProblem,
+                               solver::FGMRESSolver{<:GeometricMultigridPreconditioner};
+                               relative_tolerance=sqrt(eps(Float64)),
+                               absolute_tolerance=0.0, maxiter=nothing,
+                               initial_solution=nothing)
+  hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
+  finest = hierarchy.levels[end]
+  T = eltype(finest.residual)
+  rhs = zeros(T, reduced_dof_count(finest.plan))
+  _reduced_rhs!(rhs, finest.plan, finest.workspace)
+  outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) : maxiter
+  reduced_values = _fgmres_solve(finest.operator, rhs, hierarchy;
+                                 restart=solver.restart,
+                                 relative_tolerance=T(relative_tolerance),
+                                 absolute_tolerance=T(absolute_tolerance),
+                                 maxiter=outer_maxiter,
+                                 initial_solution=initial_solution)
+  return _state_from_reduced_result(finest.plan, reduced_values)
+end
+
+function _default_affine_preconditioner(problem::AffineProblem)
+  candidate = GeometricMultigridPreconditioner()
+  return _supports_geometric_multigrid(problem, candidate) ? candidate : JacobiPreconditioner()
+end
+
+function _supports_geometric_multigrid(problem::AffineProblem,
+                                       preconditioner::GeometricMultigridPreconditioner)
+  fields_tuple = Tuple(_problem_data(problem).fields)
+  space = _maybe_single_multigrid_space(fields_tuple)
+  space === nothing && return false
+  return _has_multigrid_coarsening_level(space, preconditioner)
+end
+
+function _maybe_single_multigrid_space(fields_tuple::Tuple)
+  isempty(fields_tuple) && return nothing
+  space = field_space(fields_tuple[1])
+
+  for field in fields_tuple
+    field_space(field) === space || return nothing
+  end
+
+  return space
+end
+
+function _has_multigrid_coarsening_level(space::HpSpace, solver::GeometricMultigridPreconditioner)
   solver.max_levels > 1 || return false
   return _has_p_coarsening_level(space, solver) || _has_h_coarsening_level(space)
 end
 
-function _has_p_coarsening_level(space::HpSpace, solver::GeometricMultigridSolver)
+function _has_p_coarsening_level(space::HpSpace, solver::GeometricMultigridPreconditioner)
   active_degrees = space.degree_policy.data
   isempty(active_degrees) && return false
   continuity = continuity_policy(space)
@@ -180,23 +225,36 @@ end
 
 _has_h_coarsening_level(space::HpSpace) = !isempty(_multigrid_h_coarsening_candidates(space))
 
-function _compile_geometric_multigrid(problem::AffineProblem,
-                                      solver::GeometricMultigridSolver)
-  data = _problem_data(problem)
-  fine_fields = Tuple(data.fields)
-  fine_space = _single_multigrid_space(fine_fields)
-  spaces = _hp_multigrid_spaces(fine_space, solver)
-  level_fields = _multigrid_level_fields(fine_fields, spaces)
-  level_problems = [_problem_on_fields(problem, fields_tuple) for fields_tuple in level_fields]
-  plans = [compile(level_problem) for level_problem in level_problems]
-  levels = [_compile_multigrid_level(plan) for plan in plans]
-  transfers = [_compile_multigrid_transfer(levels[index].plan, levels[index+1].plan)
-               for index in 1:(length(levels)-1)]
-  coarse_solver = _compile_coarse_solver(levels[1], solver)
+# Hierarchy construction crosses several deeply parameterized plan and operator
+# types. Keep this setup path behind explicit inference barriers so first-use
+# latency does not dominate every GMG solve while the V-cycle data remain typed
+# by scalar precision.
+Base.@nospecializeinfer function _compile_geometric_multigrid(
+    problem::AffineProblem, solver::GeometricMultigridPreconditioner)
+  data = Base.inferencebarrier(_problem_data(problem))
+  fine_fields = Base.inferencebarrier(Tuple(data.fields))
+  fine_space = Base.inferencebarrier(_single_multigrid_space(fine_fields))
+  _has_multigrid_coarsening_level(fine_space, solver) ||
+    throw(ArgumentError("GeometricMultigridPreconditioner requires at least one admissible h or p coarsening level; use AutoLinearSolver or an explicit non-GMG preconditioner for this problem"))
   T = eltype(origin(field_space(fine_fields[1])))
+  spaces = Base.inferencebarrier(_hp_multigrid_spaces(fine_space, solver))
+  level_fields = Base.inferencebarrier(_multigrid_level_fields(fine_fields, spaces))
+  level_problems = Base.inferencebarrier([_problem_on_fields(problem, fields_tuple)
+                                          for fields_tuple in level_fields])
+  plans = Base.inferencebarrier(AssemblyPlan[compile(level_problem)
+                                             for level_problem in level_problems])
+  levels = Base.inferencebarrier(_MultigridLevel{T}[_compile_multigrid_level(plan)
+                                                    for plan in plans])
+  transfers = Base.inferencebarrier(_ReducedTransfer{T}[
+                                      _compile_multigrid_transfer(levels[index].plan,
+                                                                  levels[index+1].plan)
+                                      for index in 1:(length(levels)-1)])
+  coarse_solver = Base.inferencebarrier(_compile_coarse_solver(levels[1], solver,
+                                                               operator_class(problem)))
   level_rhs = [zeros(T, reduced_dof_count(level.plan)) for level in levels]
   level_solution = [zeros(T, reduced_dof_count(level.plan)) for level in levels]
-  return _CompiledGeometricMultigridPreconditioner(levels, transfers, coarse_solver, level_rhs,
+  return _CompiledGeometricMultigridPreconditioner(levels, transfers, coarse_solver,
+                                                   operator_class(problem), level_rhs,
                                                    level_solution, solver.pre_smoothing_steps,
                                                    solver.post_smoothing_steps,
                                                    T(solver.smoother_damping),
@@ -215,18 +273,31 @@ function _compile_multigrid_level(plan::AssemblyPlan{D,T}) where {D,T<:AbstractF
 end
 
 function _compile_coarse_solver(level::_MultigridLevel{T},
-                                solver::GeometricMultigridSolver) where {T<:AbstractFloat}
+                                solver::GeometricMultigridPreconditioner,
+                                operator_class::AbstractOperatorClass) where {T<:AbstractFloat}
   n = reduced_dof_count(level.plan)
   0 < n <= solver.coarse_direct_dof_limit || return _KrylovCoarseSolver()
   matrix = _assemble_reduced_operator_matrix(level.plan, level.workspace.scratch)
-  _matrix_is_symmetric(matrix) || return _KrylovCoarseSolver()
+  if _is_spd_operator_class(operator_class)
+    _matrix_is_symmetric(matrix) ||
+      throw(ArgumentError("declared SPD coarse multigrid matrix is not numerically symmetric"))
 
+    try
+      _dense_cholesky_factor!(matrix)
+      return _DenseCholeskyCoarseSolver(matrix)
+    catch error
+      error isa PosDefException || rethrow()
+      throw(ArgumentError("declared SPD coarse multigrid matrix is not positive definite"))
+    end
+  end
+
+  pivots = zeros(Int, n)
   try
-    _dense_cholesky_factor!(matrix)
-    return _DenseCoarseSolver(matrix)
+    _dense_lu_factor!(matrix, pivots)
+    return _DenseLUCoarseSolver(matrix, pivots)
   catch error
-    error isa PosDefException || rethrow()
-    return _KrylovCoarseSolver()
+    error isa SingularException || rethrow()
+    throw(ArgumentError("coarse multigrid matrix is singular; add constraints or use a problem-specific solver policy"))
   end
 end
 
@@ -257,7 +328,7 @@ function _single_multigrid_space(fields_tuple::Tuple)
 end
 
 function _hp_multigrid_spaces(fine_space::HpSpace{D,T},
-                              solver::GeometricMultigridSolver) where {D,T<:AbstractFloat}
+                              solver::GeometricMultigridPreconditioner) where {D,T<:AbstractFloat}
   fine_to_coarse = HpSpace{D,T}[fine_space]
   current_space = fine_space
   current_degrees = copy(fine_space.degree_policy.data)
@@ -679,6 +750,11 @@ function _accumulate_transfer_entry!(entries::Dict{Tuple{Int,Int},T}, coarse_dof
   return entries
 end
 
+function _compile_preconditioner(::GeometricMultigridPreconditioner,
+                                 ::_ReducedAffineOperator)
+  throw(ArgumentError("GeometricMultigridPreconditioner requires the original AffineProblem so every level can rediscretize the weak form; call solve(problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner())) for SPD systems or solve(problem; solver=FGMRESSolver(preconditioner=GeometricMultigridPreconditioner())) for general systems"))
+end
+
 function _apply_preconditioner!(result::AbstractVector{T},
                                 preconditioner::_CompiledGeometricMultigridPreconditioner{T},
                                 residual::AbstractVector{T}) where {T<:AbstractFloat}
@@ -712,7 +788,7 @@ function _vcycle!(mg::_CompiledGeometricMultigridPreconditioner{T}, level_index:
   return solution
 end
 
-function _coarse_solve!(solution::AbstractVector{T}, solver::_DenseCoarseSolver{T},
+function _coarse_solve!(solution::AbstractVector{T}, solver::_DenseCholeskyCoarseSolver{T},
                         level::_MultigridLevel{T}, rhs::AbstractVector{T},
                         mg::_CompiledGeometricMultigridPreconditioner{T}) where {T<:AbstractFloat}
   _require_length(solution, length(rhs), "coarse multigrid solution")
@@ -721,14 +797,32 @@ function _coarse_solve!(solution::AbstractVector{T}, solver::_DenseCoarseSolver{
   return solution
 end
 
+function _coarse_solve!(solution::AbstractVector{T}, solver::_DenseLUCoarseSolver{T},
+                        level::_MultigridLevel{T}, rhs::AbstractVector{T},
+                        mg::_CompiledGeometricMultigridPreconditioner{T}) where {T<:AbstractFloat}
+  _require_length(solution, length(rhs), "coarse multigrid solution")
+  copyto!(solution, rhs)
+  _dense_lu_solve!(solver.factor, solver.pivots, solution)
+  return solution
+end
+
 function _coarse_solve!(solution::AbstractVector{T}, ::_KrylovCoarseSolver,
                         level::_MultigridLevel{T}, rhs::AbstractVector{T},
                         mg::_CompiledGeometricMultigridPreconditioner{T}) where {T<:AbstractFloat}
-  coarse_solution = _cg_solve(level.operator, rhs, level.jacobi;
-                              relative_tolerance=mg.coarse_relative_tolerance,
-                              absolute_tolerance=mg.coarse_absolute_tolerance,
-                              maxiter=mg.coarse_maxiter,
-                              initial_solution=nothing)
+  coarse_solution = if _is_spd_operator_class(mg.operator_class)
+    _cg_solve(level.operator, rhs, level.jacobi;
+              relative_tolerance=mg.coarse_relative_tolerance,
+              absolute_tolerance=mg.coarse_absolute_tolerance,
+              maxiter=mg.coarse_maxiter,
+              initial_solution=nothing)
+  else
+    _fgmres_solve(level.operator, rhs, level.jacobi;
+                  restart=max(1, min(30, length(rhs))),
+                  relative_tolerance=mg.coarse_relative_tolerance,
+                  absolute_tolerance=mg.coarse_absolute_tolerance,
+                  maxiter=mg.coarse_maxiter,
+                  initial_solution=nothing)
+  end
   copyto!(solution, coarse_solution)
   return solution
 end

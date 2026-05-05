@@ -170,14 +170,14 @@ public field_component_range
 # apply matrix-free operators, solve them, and transition states across adaptive
 # mesh or degree changes.
 include("problem.jl")
-export AffineProblem, BoundaryFace, Dirichlet, GeneralOperator, MeanValue, ResidualProblem, SPD,
-       add_boundary!, add_cell!, add_constraint!, add_interface!, add_surface!, cell_apply!,
-       cell_diagonal!, cell_matrix!, cell_residual!, cell_rhs!, cell_tangent_apply!, constrain!,
-       face_apply!, face_diagonal!, face_matrix!, face_residual!, face_rhs!, face_tangent_apply!,
-       interface_apply!, interface_diagonal!, interface_matrix!, interface_residual!,
-       interface_rhs!, interface_tangent_apply!, operator_class, surface_apply!,
-       surface_diagonal!, surface_matrix!, surface_residual!, surface_rhs!,
-       surface_tangent_apply!, KernelScratch, scratch_matrix, scratch_vector
+export AffineProblem, BoundaryFace, Dirichlet, GeneralOperator, IndefiniteOperator, MeanValue,
+       NonsymmetricOperator, ResidualProblem, SPD, add_boundary!, add_cell!, add_constraint!,
+       add_interface!, add_surface!, cell_apply!, cell_diagonal!, cell_matrix!, cell_residual!,
+       cell_rhs!, cell_tangent_apply!, constrain!, face_apply!, face_diagonal!, face_matrix!,
+       face_residual!, face_rhs!, face_tangent_apply!, interface_apply!, interface_diagonal!,
+       interface_matrix!, interface_residual!, interface_rhs!, interface_tangent_apply!,
+       operator_class, surface_apply!, surface_diagonal!, surface_matrix!, surface_residual!,
+       surface_rhs!, surface_tangent_apply!, KernelScratch, scratch_matrix, scratch_vector
 public AbstractOperatorClass
 
 include("embedded.jl")
@@ -207,11 +207,12 @@ export OperatorWorkspace, ResidualWorkspace, apply, apply!, residual, residual!,
        tangent_apply, tangent_apply!
 
 include("solve.jl")
-export AutoLinearSolver, CGSolver, IdentityPreconditioner, JacobiPreconditioner, solve
+export AutoLinearSolver, CGSolver, FGMRESSolver, IdentityPreconditioner, JacobiPreconditioner,
+       solve
 public AbstractLinearSolver, AbstractPreconditioner, default_tangent_linear_solve
 
 include("multigrid.jl")
-export GeometricMultigridSolver
+export GeometricMultigridPreconditioner
 
 include("adaptivity.jl")
 export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, request_h_derefinement!,

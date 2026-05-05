@@ -56,15 +56,36 @@ function CGSolver(; preconditioner=IdentityPreconditioner())
 end
 
 """
+    FGMRESSolver(; preconditioner=IdentityPreconditioner(), restart=30)
+
+Flexible GMRES solver configuration for general reduced linear systems.
+
+This is the default outer Krylov method for affine problems whose
+`operator_class` is not [`SPD`](@ref). The preconditioner is applied on the
+right, so variable preconditioners such as multigrid V-cycles remain valid.
+"""
+struct FGMRESSolver{P<:AbstractPreconditioner} <: AbstractLinearSolver
+  preconditioner::P
+  restart::Int
+end
+
+function FGMRESSolver(; preconditioner=IdentityPreconditioner(), restart::Integer=30)
+  preconditioner isa AbstractPreconditioner ||
+    throw(ArgumentError("preconditioner must be an AbstractPreconditioner"))
+  checked_restart = _checked_positive(restart, "restart")
+  return FGMRESSolver(preconditioner, checked_restart)
+end
+
+"""
     AutoLinearSolver()
 
 Default linear-solver policy.
 
-For affine problems this policy prefers the first-party geometric multigrid
-path when a supported hierarchy can be compiled from the problem description.
-When only an `AssemblyPlan` is available, or when no coarser p-level exists, it
-uses matrix-free CG with a Jacobi preconditioner generated from the reduced
-operator.
+For affine problems this policy chooses the outer Krylov method from the
+declared operator class: CG for [`SPD`](@ref) problems and FGMRES for general,
+nonsymmetric, or indefinite problems. When solving from an `AffineProblem`, it
+uses geometric multigrid as the preferred preconditioner whenever a supported
+hierarchy can be compiled; otherwise it falls back to Jacobi.
 """
 struct AutoLinearSolver <: AbstractLinearSolver end
 
@@ -92,6 +113,8 @@ end
 
 _operator_size(operator::_AbstractReducedLinearOperator) = reduced_dof_count(operator.plan)
 _operator_size(operator::_CountingReducedOperator) = _operator_size(operator.operator)
+_operator_class(operator::_AbstractReducedLinearOperator) = operator.plan.operator_class
+_operator_class(operator::_CountingReducedOperator) = _operator_class(operator.operator)
 
 function _apply_operator!(result::AbstractVector{T}, operator::_ReducedAffineOperator{D,T},
                           vector::AbstractVector{T}) where {D,T<:AbstractFloat}
@@ -153,7 +176,7 @@ function solve(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=AutoLinearS
   kind = _matrix_free_kind(plan.assembly_structure)
   if kind === :affine
     (linear_solve === nothing && preconditioner === nothing) ||
-      throw(ArgumentError("affine solves use solver=...; construct a CGSolver, AutoLinearSolver, or GeometricMultigridSolver policy instead of passing linear_solve/preconditioner"))
+      throw(ArgumentError("affine solves use solver=...; construct a CGSolver, FGMRESSolver, or AutoLinearSolver policy instead of passing linear_solve/preconditioner"))
     return _solve_affine(plan; solver, kwargs...)
   end
   residual_linear_solve = linear_solve === nothing ? default_tangent_linear_solve : linear_solve
@@ -271,8 +294,10 @@ end
 
 function _solve_reduced_system(::AutoLinearSolver, operator::_AbstractReducedLinearOperator{T},
                                rhs_data::AbstractVector{T}; kwargs...) where {T<:AbstractFloat}
-  return _solve_reduced_system(CGSolver(; preconditioner=JacobiPreconditioner()), operator,
-                               rhs_data; kwargs...)
+  solver = _is_spd_operator_class(_operator_class(operator)) ?
+           CGSolver(; preconditioner=JacobiPreconditioner()) :
+           FGMRESSolver(; preconditioner=JacobiPreconditioner())
+  return _solve_reduced_system(solver, operator, rhs_data; kwargs...)
 end
 
 function _solve_reduced_system(solver::CGSolver, operator::_AbstractReducedLinearOperator{T},
@@ -284,6 +309,19 @@ function _solve_reduced_system(solver::CGSolver, operator::_AbstractReducedLinea
                    relative_tolerance=relative_tolerance,
                    absolute_tolerance=absolute_tolerance, maxiter=maxiter,
                    initial_solution=initial_solution)
+end
+
+function _solve_reduced_system(solver::FGMRESSolver,
+                               operator::_AbstractReducedLinearOperator{T},
+                               rhs_data::AbstractVector{T}; relative_tolerance::T,
+                               absolute_tolerance::T, maxiter::Int,
+                               initial_solution=nothing) where {T<:AbstractFloat}
+  preconditioner = _compile_preconditioner(solver.preconditioner, operator)
+  return _fgmres_solve(operator, rhs_data, preconditioner;
+                       restart=solver.restart,
+                       relative_tolerance=relative_tolerance,
+                       absolute_tolerance=absolute_tolerance, maxiter=maxiter,
+                       initial_solution=initial_solution)
 end
 
 function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::AbstractVector{T},
@@ -340,6 +378,138 @@ function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Abstra
   end
 
   throw(ArgumentError("CG did not converge in $maxiter iterations"))
+end
+
+function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
+                       rhs_data::AbstractVector{T},
+                       preconditioner::_CompiledPreconditioner{T}; restart::Int,
+                       relative_tolerance::T, absolute_tolerance::T, maxiter::Int,
+                       initial_solution=nothing) where {T<:AbstractFloat}
+  n = length(rhs_data)
+  n == 0 && return T[]
+  n == _operator_size(operator) ||
+    throw(ArgumentError("rhs length must match the reduced operator size"))
+  restart >= 1 || throw(ArgumentError("restart must be positive"))
+  maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
+  solution = zeros(T, n)
+
+  if initial_solution !== nothing
+    _require_length(initial_solution, n, "initial solution")
+    eltype(initial_solution) == T ||
+      throw(ArgumentError("initial solution element type must match the plan scalar type"))
+    copyto!(solution, initial_solution)
+  end
+
+  residual = copy(rhs_data)
+  operator_values = zeros(T, n)
+
+  if initial_solution !== nothing
+    _apply_operator!(operator_values, operator, solution)
+    _axpy!(residual, -one(T), operator_values)
+  end
+
+  rhs_norm = sqrt(_dot_self(rhs_data))
+  tolerance = max(absolute_tolerance, relative_tolerance * max(rhs_norm, one(T)))
+  residual_norm = sqrt(_dot_self(residual))
+  residual_norm <= tolerance && return solution
+
+  restart_count = min(restart, n)
+  krylov = zeros(T, n, restart_count + 1)
+  preconditioned = zeros(T, n, restart_count)
+  hessenberg = zeros(T, restart_count + 1, restart_count)
+  least_squares_rhs = zeros(T, restart_count + 1)
+  total_iterations = 0
+
+  while total_iterations < maxiter
+    fill!(krylov, zero(T))
+    fill!(preconditioned, zero(T))
+    fill!(hessenberg, zero(T))
+    fill!(least_squares_rhs, zero(T))
+    residual_norm = sqrt(_dot_self(residual))
+    residual_norm <= tolerance && return solution
+
+    @inbounds for row in 1:n
+      krylov[row, 1] = residual[row] / residual_norm
+    end
+
+    least_squares_rhs[1] = residual_norm
+    inner_limit = min(restart_count, maxiter - total_iterations)
+    accepted = false
+
+    for column in 1:inner_limit
+      total_iterations += 1
+      z_column = view(preconditioned, :, column)
+      v_column = view(krylov, :, column)
+      _apply_preconditioner!(z_column, preconditioner, v_column)
+      _apply_operator!(operator_values, operator, z_column)
+
+      for basis_column in 1:column
+        v_basis = view(krylov, :, basis_column)
+        hessenberg[basis_column, column] = _dot(operator_values, v_basis)
+        _axpy!(operator_values, -hessenberg[basis_column, column], v_basis)
+      end
+
+      next_norm = sqrt(_dot_self(operator_values))
+      hessenberg[column+1, column] = next_norm
+
+      if next_norm > zero(T) && column < restart_count + 1
+        @inbounds for row in 1:n
+          krylov[row, column+1] = operator_values[row] / next_norm
+        end
+      end
+
+      h_view = view(hessenberg, 1:(column+1), 1:column)
+      g_view = view(least_squares_rhs, 1:(column+1))
+      y = h_view \ g_view
+      residual_estimate = sqrt(_dot_self(g_view - h_view * y))
+
+      if residual_estimate <= tolerance || next_norm == zero(T)
+        _update_fgmres_solution!(solution, preconditioned, y, column)
+        _apply_operator!(operator_values, operator, solution)
+        _copy_residual!(residual, rhs_data, operator_values)
+        sqrt(_dot_self(residual)) <= tolerance && return solution
+        accepted = true
+        break
+      end
+
+      if column == inner_limit
+        _update_fgmres_solution!(solution, preconditioned, y, column)
+        accepted = true
+      end
+    end
+
+    accepted || throw(ArgumentError("FGMRES failed to build a Krylov update"))
+    _apply_operator!(operator_values, operator, solution)
+    _copy_residual!(residual, rhs_data, operator_values)
+  end
+
+  throw(ArgumentError("FGMRES did not converge in $maxiter iterations"))
+end
+
+function _update_fgmres_solution!(solution::AbstractVector{T},
+                                  preconditioned::AbstractMatrix{T},
+                                  coefficients::AbstractVector{T},
+                                  count::Int) where {T<:AbstractFloat}
+  for column in 1:count
+    scale = coefficients[column]
+    iszero(scale) && continue
+    z_column = view(preconditioned, :, column)
+    _axpy!(solution, scale, z_column)
+  end
+
+  return solution
+end
+
+function _copy_residual!(residual::AbstractVector{T}, rhs_data::AbstractVector{T},
+                         operator_values::AbstractVector{T}) where {T<:AbstractFloat}
+  _require_length(rhs_data, length(residual), "rhs")
+  _require_length(operator_values, length(residual), "operator values")
+
+  @inbounds for index in eachindex(residual)
+    residual[index] = rhs_data[index] - operator_values[index]
+  end
+
+  return residual
 end
 
 function _compile_preconditioner(::IdentityPreconditioner,

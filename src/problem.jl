@@ -161,6 +161,23 @@ This is the conservative default for user-supplied low-level callbacks.
 struct GeneralOperator <: AbstractOperatorClass end
 
 """
+    NonsymmetricOperator()
+
+Declare that the affine operator should be treated as nonsymmetric. This uses
+general Krylov solves such as FGMRES instead of CG while still allowing
+operator-based preconditioners such as geometric multigrid.
+"""
+struct NonsymmetricOperator <: AbstractOperatorClass end
+
+"""
+    IndefiniteOperator()
+
+Declare that the affine operator may be symmetric but indefinite. This avoids
+SPD-only assumptions and selects general Krylov solver policy.
+"""
+struct IndefiniteOperator <: AbstractOperatorClass end
+
+"""
     SPD()
 
 Declare that the affine operator is symmetric positive definite after applying
@@ -168,6 +185,9 @@ the problem constraints. This enables SPD-specific default solvers such as
 CG-based geometric multigrid.
 """
 struct SPD <: AbstractOperatorClass end
+
+_is_spd_operator_class(::SPD) = true
+_is_spd_operator_class(::AbstractOperatorClass) = false
 
 # Internal symbolic selector used by tagged embedded-surface attachments and
 # operators. `nothing` denotes the untagged wildcard behavior "all embedded
