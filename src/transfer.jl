@@ -224,9 +224,8 @@ _is_fully_dg_space(space::HpSpace) = all(kind -> kind === :dg, continuity_policy
 #   `linear_solve` into those local systems;
 # - the default CG/mixed path uses local cell projections followed by small
 #   normal-equation components induced by shared dofs;
-# - an explicit custom solver on a CG/mixed target keeps the legacy global
-#   variational projection hook for users who need to override the transfer
-#   solve.
+# - an explicit custom solver on a CG/mixed target uses the global variational
+#   projection hook for users who need to override the transfer solve.
 #
 # Keeping this as a small internal strategy boundary makes the stable transfer
 # core independent of the advanced indicator/planner code below.
@@ -630,8 +629,18 @@ function _transfer_variational_state(transition::SpaceTransition, state::State, 
 
   plan = compile(problem)
   return disable_polyester_threads() do
-    _solve_affine_with_callback(plan; linear_solve=linear_solve)
+    _solve_variational_transfer_plan(plan; linear_solve=linear_solve)
   end
+end
+
+function _solve_variational_transfer_plan(plan::AssemblyPlan{D,T};
+                                          linear_solve) where {D,T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  workspace = _ReducedOperatorWorkspace(plan)
+  reduced_rhs = zeros(T, reduced_dof_count(plan))
+  _reduced_rhs!(reduced_rhs, plan, workspace)
+  reduced_values = linear_solve(plan, reduced_rhs; workspace=workspace)
+  return _state_from_reduced_result(plan, reduced_values)
 end
 
 function _transfer_state_with_strategy(::_CellwiseDGTransferStrategy, transition::SpaceTransition,

@@ -1,10 +1,11 @@
 # This file owns the solve API on the matrix-free branch.
 #
-# Affine solves run CG on the reduced matrix-free operator. Residual solves run
-# Newton on the reduced nonlinear equations and use the same reduced-operator CG
-# kernel for matrix-free tangent corrections. Solver objects and preconditioners
-# are kept separate from the reduced algebra so GMG can plug in as an ordinary
-# preconditioner instead of as a special CG code path.
+# Affine solves run operator-class-selected Krylov methods on reduced
+# matrix-free operators. Residual solves run Newton on the reduced nonlinear
+# equations and use the same reduced-operator CG kernel for matrix-free tangent
+# corrections. Solver objects and preconditioners are kept separate from the
+# reduced algebra so GMG can plug in as an ordinary preconditioner instead of as
+# a special CG code path.
 
 abstract type AbstractLinearSolver end
 abstract type AbstractPreconditioner end
@@ -42,8 +43,8 @@ Conjugate-gradient solver configuration for symmetric positive-definite reduced
 systems.
 
 The preconditioner is compiled against the concrete reduced operator before the
-iteration starts. Unlike the older inverse-diagonal-only path, this solver only
-assumes that the compiled preconditioner implements an application operation.
+iteration starts. The solver only assumes that the compiled preconditioner
+implements an application operation.
 """
 struct CGSolver{P<:AbstractPreconditioner} <: AbstractLinearSolver
   preconditioner::P
@@ -151,8 +152,8 @@ For affine problems, `solver` is compiled against the reduced constraint-
 compatible system and returns a reduced coefficient vector. The returned vector
 is expanded back to a full-layout [`State`](@ref). `AutoLinearSolver` uses
 geometric multigrid when a supported hierarchy can be built from the problem
-description, and otherwise uses matrix-free CG with Jacobi data generated from
-the reduced operator.
+description. When only a compiled plan is available, it chooses CG/Jacobi for
+declared SPD operators and FGMRES/Jacobi otherwise.
 
 For residual problems, the same keyword names configure a Newton solve. The
 default tangent correction uses matrix-free CG on `P' J(u) P` without
@@ -204,17 +205,6 @@ function _solve_affine(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=Aut
                                          absolute_tolerance=T(absolute_tolerance),
                                          maxiter=maxiter,
                                          initial_solution=initial_solution)
-  return _state_from_reduced_result(plan, reduced_values)
-end
-
-function _solve_affine_with_callback(plan::AssemblyPlan{D,T}; linear_solve,
-                                     preconditioner=nothing, kwargs...) where {D,T<:AbstractFloat}
-  _require_matrix_free_kind(plan, :affine)
-  workspace = _ReducedOperatorWorkspace(plan)
-  reduced_rhs = zeros(T, reduced_dof_count(plan))
-  _reduced_rhs!(reduced_rhs, plan, workspace)
-  reduced_values = linear_solve(plan, reduced_rhs; preconditioner=preconditioner,
-                                workspace=workspace, kwargs...)
   return _state_from_reduced_result(plan, reduced_values)
 end
 
@@ -418,6 +408,9 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
   preconditioned = zeros(T, n, restart_count)
   hessenberg = zeros(T, restart_count + 1, restart_count)
   least_squares_rhs = zeros(T, restart_count + 1)
+  givens_cosine = zeros(T, restart_count)
+  givens_sine = zeros(T, restart_count)
+  coefficients = zeros(T, restart_count)
   total_iterations = 0
 
   while total_iterations < maxiter
@@ -425,6 +418,8 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
     fill!(preconditioned, zero(T))
     fill!(hessenberg, zero(T))
     fill!(least_squares_rhs, zero(T))
+    fill!(givens_cosine, zero(T))
+    fill!(givens_sine, zero(T))
     residual_norm = sqrt(_dot_self(residual))
     residual_norm <= tolerance && return solution
 
@@ -434,10 +429,12 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
 
     least_squares_rhs[1] = residual_norm
     inner_limit = min(restart_count, maxiter - total_iterations)
-    accepted = false
+    inner_count = 0
+    cycle_updated = false
 
     for column in 1:inner_limit
       total_iterations += 1
+      inner_count = column
       z_column = view(preconditioned, :, column)
       v_column = view(krylov, :, column)
       _apply_preconditioner!(z_column, preconditioner, v_column)
@@ -458,32 +455,109 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
         end
       end
 
-      h_view = view(hessenberg, 1:(column+1), 1:column)
-      g_view = view(least_squares_rhs, 1:(column+1))
-      y = h_view \ g_view
-      residual_estimate = sqrt(_dot_self(g_view - h_view * y))
+      _apply_previous_givens_rotations!(hessenberg, givens_cosine, givens_sine, column)
+      cosine, sine = _givens_rotation(hessenberg[column, column],
+                                      hessenberg[column+1, column])
+      givens_cosine[column] = cosine
+      givens_sine[column] = sine
+      _apply_givens_rotation!(hessenberg, column, column, cosine, sine)
+      _apply_givens_rotation!(least_squares_rhs, column, cosine, sine)
 
-      if residual_estimate <= tolerance || next_norm == zero(T)
-        _update_fgmres_solution!(solution, preconditioned, y, column)
-        _apply_operator!(operator_values, operator, solution)
-        _copy_residual!(residual, rhs_data, operator_values)
+      if abs(least_squares_rhs[column+1]) <= tolerance || next_norm == zero(T)
+        _finish_fgmres_cycle!(solution, residual, operator_values, operator, rhs_data,
+                              preconditioned, hessenberg, least_squares_rhs, coefficients,
+                              column)
         sqrt(_dot_self(residual)) <= tolerance && return solution
-        accepted = true
+        cycle_updated = true
         break
-      end
-
-      if column == inner_limit
-        _update_fgmres_solution!(solution, preconditioned, y, column)
-        accepted = true
       end
     end
 
-    accepted || throw(ArgumentError("FGMRES failed to build a Krylov update"))
-    _apply_operator!(operator_values, operator, solution)
-    _copy_residual!(residual, rhs_data, operator_values)
+    inner_count > 0 || throw(ArgumentError("FGMRES failed to build a Krylov update"))
+    cycle_updated ||
+      _finish_fgmres_cycle!(solution, residual, operator_values, operator, rhs_data,
+                            preconditioned, hessenberg, least_squares_rhs, coefficients,
+                            inner_count)
+    sqrt(_dot_self(residual)) <= tolerance && return solution
   end
 
   throw(ArgumentError("FGMRES did not converge in $maxiter iterations"))
+end
+
+function _apply_previous_givens_rotations!(hessenberg::AbstractMatrix{T},
+                                           cosine::AbstractVector{T},
+                                           sine::AbstractVector{T},
+                                           column::Int) where {T<:AbstractFloat}
+  for row in 1:(column-1)
+    _apply_givens_rotation!(hessenberg, row, column, cosine[row], sine[row])
+  end
+
+  return hessenberg
+end
+
+function _givens_rotation(first::T, second::T) where {T<:AbstractFloat}
+  scale = hypot(first, second)
+  scale == zero(T) && return one(T), zero(T)
+  return first / scale, second / scale
+end
+
+function _apply_givens_rotation!(matrix::AbstractMatrix{T}, row::Int, column::Int,
+                                 cosine::T, sine::T) where {T<:AbstractFloat}
+  first = @inbounds matrix[row, column]
+  second = @inbounds matrix[row+1, column]
+  @inbounds matrix[row, column] = cosine * first + sine * second
+  @inbounds matrix[row+1, column] = -sine * first + cosine * second
+  return matrix
+end
+
+function _apply_givens_rotation!(vector::AbstractVector{T}, row::Int, cosine::T,
+                                 sine::T) where {T<:AbstractFloat}
+  first = @inbounds vector[row]
+  second = @inbounds vector[row+1]
+  @inbounds vector[row] = cosine * first + sine * second
+  @inbounds vector[row+1] = -sine * first + cosine * second
+  return vector
+end
+
+function _finish_fgmres_cycle!(solution::AbstractVector{T}, residual::AbstractVector{T},
+                               operator_values::AbstractVector{T},
+                               operator::_AbstractReducedLinearOperator{T},
+                               rhs_data::AbstractVector{T},
+                               preconditioned::AbstractMatrix{T},
+                               hessenberg::AbstractMatrix{T},
+                               least_squares_rhs::AbstractVector{T},
+                               coefficients::AbstractVector{T},
+                               count::Int) where {T<:AbstractFloat}
+  _upper_triangular_solve!(coefficients, hessenberg, least_squares_rhs, count)
+  _update_fgmres_solution!(solution, preconditioned, coefficients, count)
+  _apply_operator!(operator_values, operator, solution)
+  _copy_residual!(residual, rhs_data, operator_values)
+  return solution
+end
+
+function _upper_triangular_solve!(result::AbstractVector{T},
+                                  upper::AbstractMatrix{T},
+                                  rhs_data::AbstractVector{T},
+                                  count::Int) where {T<:AbstractFloat}
+  _require_length(result, count, "FGMRES coefficient work vector")
+  _require_length(rhs_data, count, "FGMRES least-squares rhs")
+  size(upper, 1) >= count && size(upper, 2) >= count ||
+    throw(ArgumentError("FGMRES upper Hessenberg factor is too small"))
+
+  for row in count:-1:1
+    value = @inbounds rhs_data[row]
+
+    for column in (row+1):count
+      @inbounds value -= upper[row, column] * result[column]
+    end
+
+    diagonal = @inbounds upper[row, row]
+    abs(diagonal) > 1000 * eps(T) ||
+      throw(ArgumentError("FGMRES encountered a singular Krylov least-squares problem"))
+    @inbounds result[row] = value / diagonal
+  end
+
+  return result
 end
 
 function _update_fgmres_solution!(solution::AbstractVector{T},
