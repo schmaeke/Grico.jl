@@ -170,13 +170,15 @@ public field_component_range
 # apply matrix-free operators, solve them, and transition states across adaptive
 # mesh or degree changes.
 include("problem.jl")
-export AffineProblem, BoundaryFace, Dirichlet, MeanValue, ResidualProblem, add_boundary!, add_cell!,
-       add_constraint!, add_interface!, add_surface!, cell_apply!, cell_diagonal!, cell_residual!,
-       cell_rhs!, cell_tangent_apply!, constrain!, face_apply!, face_diagonal!, face_residual!,
-       face_rhs!, face_tangent_apply!, interface_apply!, interface_diagonal!, interface_residual!,
-       interface_rhs!, interface_tangent_apply!, surface_apply!, surface_diagonal!,
-       surface_residual!, surface_rhs!, surface_tangent_apply!, KernelScratch, scratch_matrix,
-       scratch_vector
+export AffineProblem, BoundaryFace, Dirichlet, GeneralOperator, MeanValue, ResidualProblem, SPD,
+       add_boundary!, add_cell!, add_constraint!, add_interface!, add_surface!, cell_apply!,
+       cell_diagonal!, cell_matrix!, cell_residual!, cell_rhs!, cell_tangent_apply!, constrain!,
+       face_apply!, face_diagonal!, face_matrix!, face_residual!, face_rhs!, face_tangent_apply!,
+       interface_apply!, interface_diagonal!, interface_matrix!, interface_residual!,
+       interface_rhs!, interface_tangent_apply!, operator_class, surface_apply!,
+       surface_diagonal!, surface_matrix!, surface_residual!, surface_rhs!,
+       surface_tangent_apply!, KernelScratch, scratch_matrix, scratch_vector
+public AbstractOperatorClass
 
 include("embedded.jl")
 export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
@@ -191,6 +193,11 @@ export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_si
        tensor_degrees, tensor_gradient!, tensor_interpolate!, tensor_local_modes, tensor_mode_count,
        tensor_mode_shape, tensor_point_count, tensor_project!, tensor_project_gradient!,
        tensor_quadrature_shape, tensor_values, value, is_full_tensor
+
+include("weakforms.jl")
+export add_boundary_bilinear!, add_boundary_linear!, add_cell_bilinear!, add_cell_linear!,
+       add_interface_bilinear!, add_interface_linear!, add_surface_bilinear!,
+       add_surface_linear!, avg, component, grad, inner, ∇, ⋅
 
 include("plans.jl")
 export AssemblyPlan, compile

@@ -19,9 +19,10 @@ fields. The implementation builds one configurable hp hierarchy on a shared
 `ArgumentError`s instead of silently falling back to a weaker method.
 
 `coarse_direct_dof_limit` controls the base-level solve: reduced coarse systems
-at or below this size are assembled by matrix-free probing and solved with dense
-Cholesky, while larger or non-SPD coarse systems use the configured Krylov
-tolerance policy.
+at or below this size are assembled from local operator matrices and solved
+with dense Cholesky when the coarse matrix is numerically symmetric positive
+definite. Larger, nonsymmetric, or indefinite coarse systems use the configured
+Krylov tolerance policy.
 """
 struct GeometricMultigridSolver <: AbstractLinearSolver
   min_degree::Int
@@ -217,22 +218,8 @@ function _compile_coarse_solver(level::_MultigridLevel{T},
                                 solver::GeometricMultigridSolver) where {T<:AbstractFloat}
   n = reduced_dof_count(level.plan)
   0 < n <= solver.coarse_direct_dof_limit || return _KrylovCoarseSolver()
-  matrix = zeros(T, n, n)
-  basis = zeros(T, n)
-  response = zeros(T, n)
-
-  for column in 1:n
-    basis[column] = one(T)
-    _apply_operator!(response, level.operator, basis)
-
-    for row in 1:n
-      matrix[row, column] = response[row]
-    end
-
-    basis[column] = zero(T)
-  end
-
-  _symmetrize_dense_operator!(matrix)
+  matrix = _assemble_reduced_operator_matrix(level.plan, level.workspace.scratch)
+  _matrix_is_symmetric(matrix) || return _KrylovCoarseSolver()
 
   try
     _dense_cholesky_factor!(matrix)
@@ -243,18 +230,18 @@ function _compile_coarse_solver(level::_MultigridLevel{T},
   end
 end
 
-function _symmetrize_dense_operator!(matrix::AbstractMatrix{T}) where {T<:AbstractFloat}
+function _matrix_is_symmetric(matrix::AbstractMatrix{T}) where {T<:AbstractFloat}
   n = _require_square_matrix(matrix, "coarse multigrid matrix")
+  tolerance = sqrt(eps(T))
 
   for column in 1:n
     for row in (column+1):n
-      value = (matrix[row, column] + matrix[column, row]) / T(2)
-      matrix[row, column] = value
-      matrix[column, row] = value
+      scale = max(abs(matrix[row, column]), abs(matrix[column, row]), one(T))
+      abs(matrix[row, column] - matrix[column, row]) <= tolerance * scale || return false
     end
   end
 
-  return matrix
+  return true
 end
 
 function _single_multigrid_space(fields_tuple::Tuple)
@@ -435,7 +422,7 @@ end
 
 function _problem_on_fields(source::AffineProblem, new_fields::Tuple)
   source_data = _problem_data(source)
-  problem = AffineProblem(new_fields...)
+  problem = AffineProblem(new_fields...; operator_class=operator_class(source))
   target_data = _problem_data(problem)
   append!(target_data.cell_operators, source_data.cell_operators)
   append!(target_data.boundary_operators, source_data.boundary_operators)

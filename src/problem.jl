@@ -16,9 +16,10 @@
 #
 # Next comes the shared mutable storage used by the public `AffineProblem` and
 # `ResidualProblem` wrappers. The storage is deliberately internal: users build
-# problems with `add_cell!`, `add_boundary!`, `add_interface!`, `add_surface!`,
-# `add_*_quadrature!`, and `add_constraint!`, while later compilation stages
-# work with one normalized representation.
+# problems with weak-form helpers, `add_cell!`, `add_boundary!`,
+# `add_interface!`, `add_surface!`, `add_*_quadrature!`, and
+# `add_constraint!`, while later compilation stages work with one normalized
+# representation.
 #
 # After that, the file provides the incremental mutation API used to build
 # problems operator by operator and constraint by constraint.
@@ -147,6 +148,27 @@ struct MeanValue
   target
 end
 
+# Operator classification.
+
+abstract type AbstractOperatorClass end
+
+"""
+    GeneralOperator()
+
+Declare that no symmetry or definiteness assumptions are known for a problem.
+This is the conservative default for user-supplied low-level callbacks.
+"""
+struct GeneralOperator <: AbstractOperatorClass end
+
+"""
+    SPD()
+
+Declare that the affine operator is symmetric positive definite after applying
+the problem constraints. This enables SPD-specific default solvers such as
+CG-based geometric multigrid.
+"""
+struct SPD <: AbstractOperatorClass end
+
 # Internal symbolic selector used by tagged embedded-surface attachments and
 # operators. `nothing` denotes the untagged wildcard behavior "all embedded
 # surfaces".
@@ -189,6 +211,7 @@ end
 # which operator callbacks later evaluation routines use.
 mutable struct _ProblemData
   fields::Vector{AbstractField}
+  operator_class::AbstractOperatorClass
   cell_operators::Vector{Any}
   boundary_operators::Vector{_BoundaryContribution}
   interface_operators::Vector{Any}
@@ -198,8 +221,8 @@ mutable struct _ProblemData
   dirichlet_constraints::Vector{Dirichlet}
   mean_constraints::Vector{MeanValue}
 
-  function _ProblemData(fields::Vector{AbstractField})
-    return new(_checked_problem_fields(fields), Any[], _BoundaryContribution[], Any[],
+  function _ProblemData(fields::Vector{AbstractField}, operator_class::AbstractOperatorClass)
+    return new(_checked_problem_fields(fields), operator_class, Any[], _BoundaryContribution[], Any[],
                _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
                Dirichlet[], MeanValue[])
   end
@@ -207,9 +230,9 @@ end
 
 abstract type _AbstractProblem end
 
-function _empty_problem_data(fields::AbstractField...)
+function _empty_problem_data(operator_class::AbstractOperatorClass, fields::AbstractField...)
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
-  return _ProblemData(AbstractField[fields...])
+  return _ProblemData(AbstractField[fields...], operator_class)
 end
 
 _problem_data(problem::_AbstractProblem) = getfield(problem, :_data)
@@ -241,7 +264,7 @@ Base.propertynames(::_AbstractProblem, private::Bool=false) = private ? (:_data,
 # Public problem wrapper types.
 
 """
-    AffineProblem(fields...)
+    AffineProblem(fields...; operator_class=GeneralOperator())
 
 Container for linear operators, quadrature overrides, embedded surfaces, and
 constraints that can be compiled into an `AssemblyPlan`.
@@ -256,9 +279,12 @@ problem in this library. It stores
 - optional cell quadrature overrides and embedded surfaces,
 - and global constraints such as Dirichlet and mean-value conditions.
 
-The operators themselves are plain Julia objects. Their meaning is determined by
-the callback methods they implement, such as [`cell_apply!`](@ref),
-[`cell_rhs!`](@ref), [`face_apply!`](@ref), or [`interface_apply!`](@ref).
+The preferred operator API is weak-form based: use
+[`add_cell_bilinear!`](@ref) and [`add_cell_linear!`](@ref) when possible, so
+the same mathematical definition can be lowered to matrix-free application,
+local matrices, and solver data. Plain Julia operator callbacks such as
+[`cell_apply!`](@ref), [`cell_rhs!`](@ref), [`face_apply!`](@ref), and
+[`interface_apply!`](@ref) remain available as advanced escape hatches.
 
 The problem object itself does not evaluate anything yet. It is purely a
 mutable declaration of what should later be compiled and traversed by operator
@@ -267,7 +293,10 @@ plans.
 struct AffineProblem <: _AbstractProblem
   _data::_ProblemData
 
-  AffineProblem(fields::AbstractField...) = new(_empty_problem_data(fields...))
+  function AffineProblem(fields::AbstractField...;
+                         operator_class::AbstractOperatorClass=GeneralOperator())
+    return new(_empty_problem_data(operator_class, fields...))
+  end
 end
 
 """
@@ -289,7 +318,7 @@ operator callbacks.
 struct ResidualProblem <: _AbstractProblem
   _data::_ProblemData
 
-  ResidualProblem(fields::AbstractField...) = new(_empty_problem_data(fields...))
+  ResidualProblem(fields::AbstractField...) = new(_empty_problem_data(GeneralOperator(), fields...))
 end
 
 """
@@ -308,6 +337,13 @@ fields(problem::_AbstractProblem) = Tuple(_problem_data(problem).fields)
 Return the number of fields stored in `problem`.
 """
 field_count(problem::_AbstractProblem) = length(_problem_data(problem).fields)
+
+"""
+    operator_class(problem)
+
+Return the algebraic operator class declared for `problem`.
+"""
+operator_class(problem::_AbstractProblem) = _problem_data(problem).operator_class
 
 # Validation helpers for problem containers.
 
@@ -606,6 +642,25 @@ function cell_apply!(local_result, operator, values, local_coefficients, scratch
 end
 
 """
+    cell_matrix!(local_matrix, operator, values)
+
+Accumulate the local affine cell matrix of `operator` into `local_matrix`.
+
+The default implementation derives the local matrix by applying
+[`cell_apply!`](@ref) to local basis vectors. This probing is intentionally
+local to one integration item and is a compatibility path for low-level
+callbacks; first-party weak-form operators provide analytic local-matrix
+lowerings.
+"""
+function cell_matrix!(local_matrix, operator, values)
+  cell_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))
+end
+
+function cell_matrix!(local_matrix, operator, values, scratch::KernelScratch)
+  _probe_local_matrix!(local_matrix, operator, values, cell_apply!, scratch)
+end
+
+"""
     cell_diagonal!(local_diagonal, operator, values)
 
 Accumulate the local diagonal of an affine cell operator into
@@ -666,6 +721,20 @@ function face_apply!(local_result, operator, values, local_coefficients, scratch
 end
 
 """
+    face_matrix!(local_matrix, operator, values)
+
+Accumulate the local affine boundary-face matrix of `operator` into
+`local_matrix`.
+"""
+function face_matrix!(local_matrix, operator, values)
+  face_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))
+end
+
+function face_matrix!(local_matrix, operator, values, scratch::KernelScratch)
+  _probe_local_matrix!(local_matrix, operator, values, face_apply!, scratch)
+end
+
+"""
     face_diagonal!(local_diagonal, operator, values)
 
 Accumulate the local diagonal of an affine boundary-face operator into
@@ -710,6 +779,20 @@ function surface_apply!(local_result, operator, values, local_coefficients, scra
 end
 
 """
+    surface_matrix!(local_matrix, operator, values)
+
+Accumulate the local affine embedded-surface matrix of `operator` into
+`local_matrix`.
+"""
+function surface_matrix!(local_matrix, operator, values)
+  surface_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))
+end
+
+function surface_matrix!(local_matrix, operator, values, scratch::KernelScratch)
+  _probe_local_matrix!(local_matrix, operator, values, surface_apply!, scratch)
+end
+
+"""
     surface_diagonal!(local_diagonal, operator, values)
 
 Accumulate the local diagonal of an affine embedded-surface operator into
@@ -750,6 +833,19 @@ interface_apply!(local_result, operator, values, local_coefficients) = nothing
 function interface_apply!(local_result, operator, values, local_coefficients,
                           scratch::KernelScratch)
   interface_apply!(local_result, operator, values, local_coefficients)
+end
+
+"""
+    interface_matrix!(local_matrix, operator, values)
+
+Accumulate the local affine interface matrix of `operator` into `local_matrix`.
+"""
+function interface_matrix!(local_matrix, operator, values)
+  interface_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))
+end
+
+function interface_matrix!(local_matrix, operator, values, scratch::KernelScratch)
+  _probe_local_matrix!(local_matrix, operator, values, interface_apply!, scratch)
 end
 
 """
@@ -889,6 +985,27 @@ interface_tangent_apply!(local_result, operator, values, state, local_increment)
 function interface_tangent_apply!(local_result, operator, values, state, local_increment,
                                   scratch::KernelScratch)
   interface_tangent_apply!(local_result, operator, values, state, local_increment)
+end
+
+function _probe_local_matrix!(local_matrix::AbstractMatrix{T}, operator, values, apply_hook,
+                              scratch::KernelScratch{T}) where {T<:AbstractFloat}
+  rows, columns = size(local_matrix)
+  rows == columns || throw(ArgumentError("local operator matrix must be square"))
+  local_input = scratch_vector(scratch, 1, rows)
+  local_output = scratch_vector(scratch, 2, rows)
+
+  for column in 1:columns
+    fill!(local_input, zero(T))
+    fill!(local_output, zero(T))
+    local_input[column] = one(T)
+    apply_hook(local_output, operator, values, local_input, scratch)
+
+    for row in 1:rows
+      local_matrix[row, column] += local_output[row]
+    end
+  end
+
+  return local_matrix
 end
 
 const _DEFAULT_CELL_DIAGONAL_METHOD = which(cell_diagonal!, Tuple{Any,Any,Any})

@@ -45,6 +45,7 @@ end
 
     @test fields(problem) == (u,)
     @test field_count(problem) == 1
+    @test operator_class(AffineProblem(u; operator_class=SPD())) isa SPD
     @test propertynames(problem) == ()
     _throws_problem_argument_message(() -> getproperty(problem, :cell_operators), "problem storage")
     _throws_problem_argument_message(() -> setproperty!(problem, :fields, AbstractField[]),

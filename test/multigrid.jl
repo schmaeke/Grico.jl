@@ -59,6 +59,22 @@ end
   @test hierarchy.coarse_solver isa Grico._DenseCoarseSolver
   @test _test_transfer_adjoint(only(hierarchy.transfers))
 
+  weak_problem, weak_field = _mg_identity_problem(continuity=:dg, degree=3)
+  weak_problem = AffineProblem(weak_field; operator_class=SPD())
+  add_cell_bilinear!(weak_problem, weak_field, weak_field) do q, v, w
+    value(v) * value(w)
+  end
+  add_cell_linear!(weak_problem, weak_field) do q, v
+    value(v)
+  end
+  weak_hierarchy = Grico._compile_geometric_multigrid(weak_problem, GeometricMultigridSolver())
+  @test weak_hierarchy.coarse_solver isa Grico._DenseCoarseSolver
+  weak_gmg = solve(weak_problem; solver=GeometricMultigridSolver())
+  weak_cg = solve(compile(weak_problem);
+                  solver=CGSolver(preconditioner=JacobiPreconditioner()),
+                  relative_tolerance=1.0e-12)
+  @test coefficients(weak_gmg) ≈ coefficients(weak_cg) atol = 1.0e-8
+
   low_order_problem, = _mg_identity_problem(continuity=:dg, degree=1)
   @test coefficients(solve(low_order_problem; solver=AutoLinearSolver())) ≈ ones(4)
 

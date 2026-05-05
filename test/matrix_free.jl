@@ -464,6 +464,20 @@ end
   @test mass_diagonal_selected
   @test mass_diagonal ≈ _reference_reduced_diagonal(mass_plan)
 
+  weak_mass_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_cell_bilinear!(weak_mass_problem, dg_field, dg_field) do q, v, w
+    value(v) * value(w)
+  end
+  add_cell_linear!(weak_mass_problem, dg_field) do q, v
+    value(v)
+  end
+  weak_mass_plan = compile(weak_mass_problem)
+  @test apply(weak_mass_plan, [0.25, -0.5]) ≈ apply(mass_plan, [0.25, -0.5])
+  @test rhs(weak_mass_plan) ≈ [0.5, 0.5]
+  weak_mass_matrix = Grico._assemble_reduced_operator_matrix(weak_mass_plan,
+                                                             Grico._ReducedOperatorWorkspace(weak_mass_plan).scratch)
+  @test weak_mass_matrix * [0.25, -0.5] ≈ apply(weak_mass_plan, [0.25, -0.5])
+
   diffusion_problem = AffineProblem(dg_field)
   add_cell!(diffusion_problem, _MatrixFreeDiffusion(dg_field, 2.0))
   diffusion_plan = compile(diffusion_problem)
@@ -476,6 +490,14 @@ end
   diffusion_diagonal_selected, diffusion_diagonal = _kernel_reduced_diagonal(diffusion_plan)
   @test diffusion_diagonal_selected
   @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
+
+  weak_diffusion_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_cell_bilinear!(weak_diffusion_problem, dg_field, dg_field) do q, v, w
+    2.0 * (∇(v) ⋅ ∇(w))
+  end
+  weak_diffusion_plan = compile(weak_diffusion_problem)
+  @test apply(weak_diffusion_plan, diffusion_coefficients) ≈
+        apply(diffusion_plan, diffusion_coefficients)
 
   tensor_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   tensor_space = HpSpace(tensor_domain,
@@ -491,6 +513,12 @@ end
                                (local_matrix, values) -> _local_reference_diffusion!(local_matrix,
                                                                                      tensor_field,
                                                                                      values, 1.75))
+  weak_tensor_problem = AffineProblem(tensor_field; operator_class=SPD())
+  add_cell_bilinear!(weak_tensor_problem, tensor_field, tensor_field) do q, v, w
+    1.75 * inner(grad(v), grad(w))
+  end
+  weak_tensor_plan = compile(weak_tensor_problem)
+  @test apply(weak_tensor_plan, tensor_coefficients) ≈ apply(tensor_plan, tensor_coefficients)
   tensor_item = tensor_plan.integration.cells[1]
   tensor_data = tensor_values(tensor_item, tensor_field)
   @test tensor_data !== nothing
@@ -513,6 +541,14 @@ end
   @test boundary_diagonal ≈ _reference_reduced_diagonal(boundary_plan)
   @test apply(boundary_plan, [0.25, -0.5]) ≈ [0.0, -1.5]
 
+  weak_boundary_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_boundary_bilinear!(weak_boundary_problem, BoundaryFace(1, UPPER), dg_field,
+                         dg_field) do q, v, w
+    3.0 * value(v) * value(w)
+  end
+  weak_boundary_plan = compile(weak_boundary_problem)
+  @test apply(weak_boundary_plan, [0.25, -0.5]) ≈ apply(boundary_plan, [0.25, -0.5])
+
   interface_domain = Domain((0.0,), (1.0,), (2,))
   interface_space = HpSpace(interface_domain, SpaceOptions(degree=UniformDegree(1), continuity=:dg))
   interface_field = ScalarField(interface_space; name=:u)
@@ -523,6 +559,15 @@ end
   @test interface_diagonal_selected
   @test interface_diagonal ≈ _reference_reduced_diagonal(interface_plan)
 
+  weak_interface_problem = AffineProblem(interface_field; operator_class=SPD())
+  add_interface_bilinear!(weak_interface_problem, interface_field, interface_field) do q, v, w
+    2.0 * jump(value(v)) * jump(value(w))
+  end
+  weak_interface_plan = compile(weak_interface_problem)
+  weak_interface_coefficients = [0.25, -0.5, 0.75, -0.125]
+  @test apply(weak_interface_plan, weak_interface_coefficients) ≈
+        apply(interface_plan, weak_interface_coefficients)
+
   surface_problem = AffineProblem(dg_field)
   surface_quadrature = PointQuadrature([(0.0,)], [1.0])
   add_surface_quadrature!(surface_problem, SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
@@ -531,6 +576,14 @@ end
   surface_diagonal_selected, surface_diagonal = _kernel_reduced_diagonal(surface_plan)
   @test surface_diagonal_selected
   @test surface_diagonal ≈ _reference_reduced_diagonal(surface_plan)
+
+  weak_surface_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_surface_quadrature!(weak_surface_problem, SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
+  add_surface_bilinear!(weak_surface_problem, dg_field, dg_field) do q, v, w
+    5.0 * value(v) * value(w)
+  end
+  weak_surface_plan = compile(weak_surface_problem)
+  @test apply(weak_surface_plan, [0.25, -0.5]) ≈ apply(surface_plan, [0.25, -0.5])
 
   cg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
   cg_field = ScalarField(cg_space; name=:u)

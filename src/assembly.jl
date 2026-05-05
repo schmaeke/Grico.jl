@@ -665,6 +665,25 @@ function _diagonal_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
   return result
 end
 
+function _assemble_reduced_operator_matrix(plan::AssemblyPlan{D,T},
+                                           scratch::_OperatorScratch{T}) where {
+                                                                                 D,
+                                                                                 T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  map = _reduced_map(plan)
+  result = zeros(T, reduced_dof_count(map), reduced_dof_count(map))
+  traversal = plan.traversal_plan
+  _matrix_pass!(scratch, result, map, traversal.cell_batches, plan.integration.cells,
+                plan.cell_operators, cell_matrix!)
+  _boundary_matrix_pass!(scratch, result, map, traversal.boundary_batches,
+                         plan.integration.boundary_faces, plan.boundary_operators)
+  _matrix_pass!(scratch, result, map, traversal.interface_batches, plan.integration.interfaces,
+                plan.interface_operators, interface_matrix!)
+  _surface_matrix_pass!(scratch, result, map, traversal.surface_batches,
+                        plan.integration.embedded_surfaces, plan.surface_operators)
+  return result
+end
+
 function _reduced_diagonal!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
                             workspace::_ReducedOperatorWorkspace{T}) where {D,T<:AbstractFloat}
   map = _reduced_map(plan)
@@ -1782,6 +1801,85 @@ function _surface_diagonal_pass!(scratch::_OperatorScratch{T}, result::AbstractV
   return nothing
 end
 
+@inline _matrix_operators!(local_matrix, ::Tuple{}, item, matrix_hook, scratch) = nothing
+
+@inline function _matrix_operators!(local_matrix, operators::Tuple, item, matrix_hook, scratch)
+  matrix_hook(local_matrix, first(operators), item, scratch)
+  return _matrix_operators!(local_matrix, Base.tail(operators), item, matrix_hook, scratch)
+end
+
+function _matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
+                       map::_ReducedOperatorMap{T}, batches::Vector{_KernelBatch}, items,
+                       operators, matrix_hook) where {T<:AbstractFloat}
+  (isempty(batches) || isempty(operators)) && return nothing
+
+  for kernel_batch in batches
+    local_dof_count = kernel_batch.local_dof_count
+    local_matrix = scratch_matrix(scratch.kernel, 1, local_dof_count, local_dof_count)
+
+    for batch_item_index in eachindex(kernel_batch.item_indices)
+      item = @inbounds items[kernel_batch.item_indices[batch_item_index]]
+      fill!(local_matrix, zero(T))
+      _matrix_operators!(local_matrix, operators, item, matrix_hook, scratch.kernel)
+      _scatter_local_matrix_reduced!(result, map, item, local_matrix)
+    end
+  end
+
+  return nothing
+end
+
+function _boundary_matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
+                                map::_ReducedOperatorMap{T},
+                                batches::Vector{_FilteredKernelBatch}, faces,
+                                operators) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+
+  for kernel_batch in batches
+    local_dof_count = kernel_batch.local_dof_count
+    local_matrix = scratch_matrix(scratch.kernel, 1, local_dof_count, local_dof_count)
+
+    for batch_face_index in eachindex(kernel_batch.item_indices)
+      face = @inbounds faces[kernel_batch.item_indices[batch_face_index]]
+      fill!(local_matrix, zero(T))
+
+      for operator_index in kernel_batch.operator_indices
+        wrapped = @inbounds operators[operator_index]
+        face_matrix!(local_matrix, wrapped.operator, face, scratch.kernel)
+      end
+
+      _scatter_local_matrix_reduced!(result, map, face, local_matrix)
+    end
+  end
+
+  return nothing
+end
+
+function _surface_matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
+                               map::_ReducedOperatorMap{T},
+                               batches::Vector{_FilteredKernelBatch}, surfaces,
+                               operators) where {T<:AbstractFloat}
+  isempty(batches) && return nothing
+
+  for kernel_batch in batches
+    local_dof_count = kernel_batch.local_dof_count
+    local_matrix = scratch_matrix(scratch.kernel, 1, local_dof_count, local_dof_count)
+
+    for batch_surface_index in eachindex(kernel_batch.item_indices)
+      surface = @inbounds surfaces[kernel_batch.item_indices[batch_surface_index]]
+      fill!(local_matrix, zero(T))
+
+      for operator_index in kernel_batch.operator_indices
+        wrapped = @inbounds operators[operator_index]
+        surface_matrix!(local_matrix, wrapped.operator, surface, scratch.kernel)
+      end
+
+      _scatter_local_matrix_reduced!(result, map, surface, local_matrix)
+    end
+  end
+
+  return nothing
+end
+
 function _residual_pass!(scratch::_OperatorScratch{T}, result::AbstractVector{T},
                          batches::Vector{_KernelBatch}, items, operators, state::State{T},
                          fixed::BitVector, blocked_rows::BitVector,
@@ -2017,6 +2115,53 @@ function _scatter_local_diagonal!(result::AbstractVector{T}, item::_AssemblyValu
   end
 
   return nothing
+end
+
+function _scatter_local_matrix_reduced!(result::AbstractMatrix{T},
+                                        map::_ReducedOperatorMap{T},
+                                        item::_AssemblyValues,
+                                        local_matrix::AbstractMatrix{T}) where {T<:AbstractFloat}
+  tolerance = 1000 * eps(T)
+
+  for local_column in 1:item.local_dof_count
+    for local_row in 1:item.local_dof_count
+      local_value = local_matrix[local_row, local_column]
+      abs(local_value) > tolerance || continue
+
+      @inbounds for row_term in _local_term_range(item, local_row)
+        full_row = item.term_indices[row_term]
+        row_value = item.term_coefficients[row_term] * local_value
+
+        for column_term in _local_term_range(item, local_column)
+          full_column = item.term_indices[column_term]
+          value = row_value * item.term_coefficients[column_term]
+          _scatter_full_matrix_entry_reduced!(result, map, full_row, full_column, value)
+        end
+      end
+    end
+  end
+
+  return result
+end
+
+function _scatter_full_matrix_entry_reduced!(result::AbstractMatrix{T},
+                                             map::_ReducedOperatorMap{T},
+                                             full_row::Int, full_column::Int,
+                                             value::T) where {T<:AbstractFloat}
+  iszero(value) && return result
+
+  @inbounds for row_pointer in map.row_offsets[full_row]:(map.row_offsets[full_row+1]-1)
+    reduced_row = map.row_indices[row_pointer]
+    row_coefficient = map.row_coefficients[row_pointer]
+
+    for column_pointer in map.row_offsets[full_column]:(map.row_offsets[full_column+1]-1)
+      reduced_column = map.row_indices[column_pointer]
+      coefficient = row_coefficient * value * map.row_coefficients[column_pointer]
+      result[reduced_row, reduced_column] += coefficient
+    end
+  end
+
+  return result
 end
 
 # Constraint rows.

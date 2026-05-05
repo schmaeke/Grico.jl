@@ -221,8 +221,8 @@ function _warmup_case(config)
   end
 
   limits = config.module_ref._adaptivity_limits(field_space(field), options)
-  adaptivity = adaptivity_plan(state, field; tolerance=options["tolerance"],
-                               smoothness_threshold=options["smoothness_threshold"], limits)
+  adaptivity = Grico.adaptivity_plan(state, field; tolerance=options["tolerance"],
+                                     smoothness_threshold=options["smoothness_threshold"], limits)
 
   if !isempty(adaptivity)
     transition_data = transition(adaptivity; compact=get(options, "compact_transition", false))
@@ -451,8 +451,8 @@ end
 function _measure_adaptivity!(rows, config, case_name, field, plan, state)
   limits = config.module_ref._adaptivity_limits(field_space(field), config.options)
   adaptivity = _measure!(rows, case_name, "phase", "adaptivity_plan", 1) do
-    adaptivity_plan(state, field; tolerance=config.options["tolerance"],
-                    smoothness_threshold=config.options["smoothness_threshold"], limits)
+    Grico.adaptivity_plan(state, field; tolerance=config.options["tolerance"],
+                          smoothness_threshold=config.options["smoothness_threshold"], limits)
   end
 
   isempty(adaptivity) && return nothing
