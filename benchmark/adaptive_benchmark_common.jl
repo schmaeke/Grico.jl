@@ -415,7 +415,7 @@ function run_adaptive_cycles(options; build_initial_field, build_problem, output
       compile(problem)
     end
     state = _timed!(component_rows, cycle, "solve") do
-      solve(plan; preconditioner=JacobiPreconditioner())
+      solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
     end
     solution_l2 = _timed!(component_rows, cycle, "solution_norm") do
       _solution_l2_norm(state, field, plan, reference)

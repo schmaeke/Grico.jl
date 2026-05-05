@@ -78,7 +78,7 @@ function run_poisson_1d_makie_example(; cell_count=2, degree=8, sample_subdivisi
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 
   plan = compile(problem)
-  state = solve(plan; preconditioner=JacobiPreconditioner())
+  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
   figure = poisson_figure(state, u; sample_subdivisions, sample_degree)
 
   mkpath(output_directory)

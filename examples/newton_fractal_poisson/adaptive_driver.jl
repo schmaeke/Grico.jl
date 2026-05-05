@@ -2,8 +2,8 @@ function _format_level_histogram(histogram)
   return join(("$(level):$(count)" for (level, count) in histogram), ",")
 end
 
-# The solve hook remains a keyword argument so large deep-tree runs can replace
-# the default reduced CG solve without changing the example setup.
+# The solver policy remains a keyword argument so large deep-tree runs can
+# replace the default matrix-free policy without changing the example setup.
 
 # Run the solve-estimate-adapt loop on a single scalar field. Each iteration
 # compiles the current mesh, solves the manufactured Poisson problem, records
@@ -22,7 +22,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
                                             residual_contrast=NEWTON_RESIDUAL_CONTRAST,
                                             derivative_regularization=NEWTON_DERIVATIVE_REGULARIZATION,
                                             difference_step=NEWTON_DIFFERENCE_STEP,
-                                            linear_solve=Grico.default_linear_solve,
+                                            solver=AutoLinearSolver(),
                                             output_directory=joinpath(@__DIR__, "output"),
                                             write_vtk=WRITE_VTK, sample_degree=EXPORT_DEGREE,
                                             print_summary=true)
@@ -52,8 +52,8 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
 
   for step in 0:adaptive_steps
     problem = build_newton_fractal_poisson_problem(u, context)
+    state = solve(problem; solver)
     assembly_plan = compile(problem)
-    state = solve(assembly_plan; linear_solve, preconditioner=JacobiPreconditioner())
     error_value = relative_l2_error(state, u, context.exact_solution; plan=assembly_plan,
                                     extra_points=VERIFICATION_EXTRA_POINTS)
 

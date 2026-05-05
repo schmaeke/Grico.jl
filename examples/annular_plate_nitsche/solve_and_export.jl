@@ -2,7 +2,7 @@
 function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=true, kwargs...)
   context = build_annular_plate_nitsche_context(; kwargs...)
   plan = compile(context.problem)
-  state = solve(plan; preconditioner=JacobiPreconditioner())
+  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
   error_value = relative_l2_error(state, context.u, context.exact_solution; plan=plan)
   vtk_path = nothing
 

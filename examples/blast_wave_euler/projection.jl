@@ -183,10 +183,9 @@ function cell_rhs!(local_rhs, operator::ProjectionSource, values::CellValues,
 end
 
 # Build the projected initial DG state `q_h(x, 0)`.
-function project_initial_condition(field, data; linear_solve=Grico.default_linear_solve)
+function project_initial_condition(field, data; solver=AutoLinearSolver())
   problem = AffineProblem(field)
   add_cell!(problem, MassMatrix(field))
   add_cell!(problem, ProjectionSource(field, data))
-  plan = compile(problem)
-  return solve(plan; linear_solve=linear_solve, preconditioner=JacobiPreconditioner())
+  return solve(problem; solver=solver)
 end

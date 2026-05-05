@@ -242,7 +242,7 @@ const _VARIATIONAL_TRANSFER = _VariationalTransferStrategy()
 
 function _transfer_strategy(transition::SpaceTransition, linear_solve)
   _is_fully_dg_space(target_space(transition)) && return _CELLWISE_DG_TRANSFER
-  linear_solve === default_linear_solve && return _LOCAL_PROJECTION_TRANSFER
+  linear_solve === nothing && return _LOCAL_PROJECTION_TRANSFER
   return _VARIATIONAL_TRANSFER
 end
 
@@ -284,7 +284,7 @@ end
 
 @inline function _cellwise_transfer_linear_solve(::Type{T}, local_matrix, local_rhs,
                                                  linear_solve) where {T<:AbstractFloat}
-  solution = if linear_solve === default_linear_solve
+  solution = if linear_solve === nothing
     _regularized_transfer_cholesky_solve!(local_matrix, local_rhs)
   else
     linear_solve(local_matrix, local_rhs)
@@ -427,7 +427,7 @@ end
 # Solve one independent dense projection system per target DG cell and scatter
 # the local coefficients directly into the new state vector.
 function _transfer_cellwise_dg_state(plan::_CellwiseDGTransferPlan{D,T}, state::State{T};
-                                     linear_solve=default_linear_solve) where {D,T<:AbstractFloat}
+                                     linear_solve=nothing) where {D,T<:AbstractFloat}
   state_coefficients = zeros(T, dof_count(plan.layout))
   isempty(plan.cells) && return State(plan.layout, state_coefficients)
   scratch = _CellwiseDGTransferScratch(T, Val(D), plan.max_local_dofs)
@@ -617,7 +617,7 @@ function _transfer_local_projection_state(plan::_LocalProjectionTransferPlan{D,T
 end
 
 function _transfer_variational_state(transition::SpaceTransition, state::State, old_fields::Tuple,
-                                     new_fields::Tuple; linear_solve=default_linear_solve)
+                                     new_fields::Tuple; linear_solve)
   problem = AffineProblem(new_fields...)
 
   for index in eachindex(old_fields)
@@ -630,34 +630,34 @@ function _transfer_variational_state(transition::SpaceTransition, state::State, 
 
   plan = compile(problem)
   return disable_polyester_threads() do
-    solve(plan; linear_solve=linear_solve)
+    _solve_affine_with_callback(plan; linear_solve=linear_solve)
   end
 end
 
 function _transfer_state_with_strategy(::_CellwiseDGTransferStrategy, transition::SpaceTransition,
                                        state::State, old_fields::Tuple, new_fields::Tuple;
-                                       linear_solve=default_linear_solve)
+                                       linear_solve=nothing)
   plan = _compile_cellwise_dg_transfer_plan(transition, old_fields, new_fields)
   return _transfer_cellwise_dg_state(plan, state; linear_solve=linear_solve)
 end
 
 function _transfer_state_with_strategy(::_LocalProjectionTransferStrategy,
                                        transition::SpaceTransition, state::State, old_fields::Tuple,
-                                       new_fields::Tuple; linear_solve=default_linear_solve)
+                                       new_fields::Tuple; linear_solve=nothing)
   plan = _compile_local_projection_transfer_plan(transition, old_fields, new_fields)
   return _transfer_local_projection_state(plan, state)
 end
 
 function _transfer_state_with_strategy(::_VariationalTransferStrategy, transition::SpaceTransition,
                                        state::State, old_fields::Tuple, new_fields::Tuple;
-                                       linear_solve=default_linear_solve)
+                                       linear_solve)
   return _transfer_variational_state(transition, state, old_fields, new_fields; linear_solve)
 end
 
 """
-    transfer_state(transition, state, old_fields, new_fields; linear_solve=default_linear_solve)
-    transfer_state(transition, state, old_field, new_field; linear_solve=default_linear_solve)
-    transfer_state(transition, state; linear_solve=default_linear_solve)
+    transfer_state(transition, state, old_fields, new_fields; linear_solve=nothing)
+    transfer_state(transition, state, old_field, new_field; linear_solve=nothing)
+    transfer_state(transition, state; linear_solve=nothing)
 
 Transfer field coefficients from the source space to the target space of
 `transition` by cellwise `L²` projection.
@@ -673,12 +673,13 @@ target spaces are projected by independent dense cell solves. For the default
 coupled-space path, Grico computes the same cellwise target projection and then
 reconciles shared coefficients by the small normal-equation components induced
 by continuity and hanging-node substitutions. This keeps transfer bounded and
-separate from the PDE linear-solve path. Passing a custom `linear_solve` keeps
-the legacy global variational projection hook for callers that need to override
-the transfer solve explicitly.
+separate from the PDE linear-solve path. Passing a custom `linear_solve` is an
+advanced transfer-only hook: fully DG targets pass dense local projection
+systems to the hook, while CG or mixed targets pass the internal variational
+projection system.
 """
 function transfer_state(transition::SpaceTransition, state::State, old_fields::Tuple,
-                        new_fields::Tuple; linear_solve=default_linear_solve)
+                        new_fields::Tuple; linear_solve=nothing)
   _checked_transfer_fields(transition, state, old_fields, new_fields)
   strategy = _transfer_strategy(transition, linear_solve)
   return _transfer_state_with_strategy(strategy, transition, state, old_fields, new_fields;
@@ -686,12 +687,11 @@ function transfer_state(transition::SpaceTransition, state::State, old_fields::T
 end
 
 function transfer_state(transition::SpaceTransition, state::State, old_field::AbstractField,
-                        new_field::AbstractField; linear_solve=default_linear_solve)
+                        new_field::AbstractField; linear_solve=nothing)
   return transfer_state(transition, state, (old_field,), (new_field,); linear_solve=linear_solve)
 end
 
-function transfer_state(transition::SpaceTransition, state::State;
-                        linear_solve=default_linear_solve)
+function transfer_state(transition::SpaceTransition, state::State; linear_solve=nothing)
   old_fields = fields(field_layout(state))
   new_fields = adapted_fields(transition, old_fields)
   return new_fields,
@@ -743,7 +743,7 @@ function _checked_transition_plans(plans::Tuple, state::State)
 end
 
 """
-    transfer_state(plans, state; linear_solve=default_linear_solve)
+    transfer_state(plans, state; linear_solve=nothing)
 
 Transfer a mixed-field [`State`](@ref) across one [`AdaptivityPlan`](@ref) per
 source space.
@@ -756,7 +756,7 @@ original layout order. The plans must therefore use distinct source spaces and
 describe one common target active-leaf topology so the transferred fields can
 again be combined into one [`FieldLayout`](@ref).
 """
-function transfer_state(plans::Tuple, state::State; linear_solve=default_linear_solve)
+function transfer_state(plans::Tuple, state::State; linear_solve=nothing)
   old_fields = fields(field_layout(state))
   plan_by_space = _checked_transition_plans(plans, state)
   space_to_group = IdDict{Any,Int}()

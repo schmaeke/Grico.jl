@@ -184,6 +184,11 @@ end
 
 _affine_preconditioner(config) = config.name === :annular_fcm ? nothing : JacobiPreconditioner()
 
+function _affine_solver(config)
+  preconditioner = _affine_preconditioner(config)
+  return preconditioner === nothing ? CGSolver() : CGSolver(preconditioner=preconditioner)
+end
+
 function _affine_maxiter(config, reduced_count::Int)
   config.name === :sipg_dg && return 500
   config.name === :annular_fcm && return 500
@@ -211,7 +216,7 @@ function _warmup_case(config)
     result = zeros(T, Grico.dof_count(plan))
     rhs!(result, plan)
     apply!(result, plan, vector)
-    state = solve(plan; preconditioner=_affine_preconditioner(config),
+    state = solve(plan; solver=_affine_solver(config),
                   maxiter=_affine_maxiter(config, Grico.reduced_dof_count(plan)))
   end
 
@@ -415,16 +420,13 @@ function _counting_affine_linear_solve(plan::AssemblyPlan{D,T}, reduced_rhs::Abs
                                        maxiter=max(1_000, 2 * length(reduced_rhs)),
                                        initial_solution=nothing,
                                        counter=Ref(0)) where {D,T<:AbstractFloat}
-  inverse_diagonal = Grico._preconditioner_data(plan, workspace, preconditioner)
-  operator_apply = function (target, vector)
-    counter[] += 1
-    Grico._reduced_apply!(target, plan, vector, workspace)
-    return target
-  end
-
-  return Grico._cg_solve(plan, reduced_rhs, workspace; relative_tolerance=T(relative_tolerance),
-                         absolute_tolerance=T(absolute_tolerance), maxiter, initial_solution,
-                         inverse_diagonal, operator_apply)
+  operator = Grico._CountingReducedOperator(Grico._ReducedAffineOperator(plan, workspace),
+                                            counter)
+  policy = preconditioner === nothing ? IdentityPreconditioner() : preconditioner
+  compiled_preconditioner = Grico._compile_preconditioner(policy, operator)
+  return Grico._cg_solve(operator, reduced_rhs, compiled_preconditioner;
+                         relative_tolerance=T(relative_tolerance),
+                         absolute_tolerance=T(absolute_tolerance), maxiter, initial_solution)
 end
 
 function _counting_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T},
@@ -437,15 +439,13 @@ function _counting_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T}
   preconditioner === nothing ||
     throw(ArgumentError("tangent counting solve expects identity preconditioning"))
   copyto!(workspace.full_state, coefficients(state))
-  operator_apply = function (target, vector)
-    counter[] += 1
-    Grico._reduced_tangent_apply!(target, plan, vector, workspace, residual_workspace)
-    return target
-  end
-
-  return Grico._cg_solve(plan, reduced_rhs, workspace; relative_tolerance=T(relative_tolerance),
-                         absolute_tolerance=T(absolute_tolerance), maxiter, initial_solution,
-                         inverse_diagonal=nothing, operator_apply)
+  operator = Grico._CountingReducedOperator(Grico._ReducedTangentOperator(plan, workspace,
+                                                                          residual_workspace),
+                                            counter)
+  compiled_preconditioner = Grico._compile_preconditioner(IdentityPreconditioner(), operator)
+  return Grico._cg_solve(operator, reduced_rhs, compiled_preconditioner;
+                         relative_tolerance=T(relative_tolerance),
+                         absolute_tolerance=T(absolute_tolerance), maxiter, initial_solution)
 end
 
 function _measure_adaptivity!(rows, config, case_name, field, plan, state)
@@ -528,10 +528,16 @@ function _measure_affine_case!(rows, config, repetitions::Int, local_repetitions
   operator_calls = Ref(0)
   preconditioner = _affine_preconditioner(config)
   solve_success, state = _measure_attempt!(rows, case_name, "phase", "solve") do
-    solve(plan; preconditioner=preconditioner,
-          maxiter=_affine_maxiter(config, length(reduced_values)),
-          linear_solve=(plan, rhs; kwargs...) -> _counting_affine_linear_solve(plan, rhs; kwargs...,
-                                                                               counter=operator_calls))
+    solve_workspace = Grico._ReducedOperatorWorkspace(plan)
+    solve_rhs = zeros(T, Grico.reduced_dof_count(plan))
+    Grico._reduced_rhs!(solve_rhs, plan, solve_workspace)
+    solve_values = _counting_affine_linear_solve(plan, solve_rhs;
+                                                 workspace=solve_workspace,
+                                                 preconditioner=preconditioner,
+                                                 maxiter=_affine_maxiter(config,
+                                                                         length(reduced_values)),
+                                                 counter=operator_calls)
+    Grico._state_from_reduced_result(plan, solve_values)
   end
   _push_metric!(rows, case_name, "metadata", "cg_operator_applications", operator_calls[])
   _push_metric!(rows, case_name, "metadata", "solve_succeeded", solve_success ? 1.0 : 0.0)

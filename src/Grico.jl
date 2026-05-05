@@ -200,8 +200,11 @@ export OperatorWorkspace, ResidualWorkspace, apply, apply!, residual, residual!,
        tangent_apply, tangent_apply!
 
 include("solve.jl")
-export JacobiPreconditioner, solve
-public default_linear_solve, default_tangent_linear_solve
+export AutoLinearSolver, CGSolver, IdentityPreconditioner, JacobiPreconditioner, solve
+public AbstractLinearSolver, AbstractPreconditioner, default_tangent_linear_solve
+
+include("multigrid.jl")
+export GeometricMultigridSolver
 
 include("adaptivity.jl")
 export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, request_h_derefinement!,

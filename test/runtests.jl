@@ -22,6 +22,7 @@ using Grico
 
   @testset verbose = true "Matrix-Free Problems" begin
     include("matrix_free.jl")
+    include("multigrid.jl")
   end
 
   @testset verbose = true "Adaptivity" begin

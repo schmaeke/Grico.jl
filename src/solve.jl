@@ -1,8 +1,24 @@
 # This file owns the solve API on the matrix-free branch.
 #
 # Affine solves run CG on the reduced matrix-free operator. Residual solves run
-# Newton on the reduced nonlinear equations and use the same CG kernel for
-# matrix-free tangent corrections.
+# Newton on the reduced nonlinear equations and use the same reduced-operator CG
+# kernel for matrix-free tangent corrections. Solver objects and preconditioners
+# are kept separate from the reduced algebra so GMG can plug in as an ordinary
+# preconditioner instead of as a special CG code path.
+
+abstract type AbstractLinearSolver end
+abstract type AbstractPreconditioner end
+
+"""
+    IdentityPreconditioner()
+
+Identity preconditioner for matrix-free reduced systems.
+
+This is mostly useful as an explicit solver policy and as the fallback compiled
+form used when a higher-level automatic solver decides that no preconditioner is
+available for the current operator class.
+"""
+struct IdentityPreconditioner <: AbstractPreconditioner end
 
 """
     JacobiPreconditioner()
@@ -11,48 +27,109 @@ Configuration for generic diagonal Jacobi preconditioning.
 
 For affine solves, the preconditioner builds the reduced diagonal directly from
 local diagonal kernels when every operator contribution can be scattered
-safely. It uses identity preconditioning when those kernels are unavailable or
-incompatible with the reduced operator map. The default residual tangent solve
+safely. When local diagonal callbacks are unavailable, it probes the reduced
+matrix-free operator so users do not need to implement a second operator path
+just to obtain a smoother or preconditioner. The default residual tangent solve
 does not implement tangent preconditioning; nonlinear users who need one should
-provide a custom `linear_solve`.
+provide an explicit tangent solver policy.
 """
-struct JacobiPreconditioner end
+struct JacobiPreconditioner <: AbstractPreconditioner end
 
 """
-    default_linear_solve(plan, reduced_rhs; workspace=..., preconditioner=nothing, kwargs...)
+    CGSolver(; preconditioner=IdentityPreconditioner())
 
-Default matrix-free CG solve for affine reduced systems.
+Conjugate-gradient solver configuration for symmetric positive-definite reduced
+systems.
 
-This is the stable reference implementation for the `linear_solve` callback
-used by affine [`solve`](@ref). It accepts the same keyword contract that custom
-affine solvers should support: a reusable reduced-operator workspace,
-optional preconditioner, tolerances, iteration limit, and optional initial
-solution.
+The preconditioner is compiled against the concrete reduced operator before the
+iteration starts. Unlike the older inverse-diagonal-only path, this solver only
+assumes that the compiled preconditioner implements an application operation.
 """
-function default_linear_solve(plan::AssemblyPlan{D,T}, reduced_rhs::AbstractVector{T};
-                              workspace=_ReducedOperatorWorkspace(plan), preconditioner=nothing,
-                              relative_tolerance=sqrt(eps(T)), absolute_tolerance=zero(T),
-                              maxiter=max(1_000, 2 * length(reduced_rhs)),
-                              initial_solution=nothing) where {D,T<:AbstractFloat}
-  inverse_diagonal = _preconditioner_data(plan, workspace, preconditioner)
-  return _cg_solve(plan, reduced_rhs, workspace; relative_tolerance=relative_tolerance,
-                   absolute_tolerance=absolute_tolerance, maxiter=maxiter,
-                   initial_solution=initial_solution, inverse_diagonal=inverse_diagonal)
+struct CGSolver{P<:AbstractPreconditioner} <: AbstractLinearSolver
+  preconditioner::P
+end
+
+function CGSolver(; preconditioner=IdentityPreconditioner())
+  preconditioner isa AbstractPreconditioner ||
+    throw(ArgumentError("preconditioner must be an AbstractPreconditioner"))
+  return CGSolver(preconditioner)
 end
 
 """
-    solve(problem; linear_solve=default_linear_solve, preconditioner=nothing, kwargs...)
-    solve(plan; linear_solve=default_linear_solve, preconditioner=nothing, kwargs...)
+    AutoLinearSolver()
+
+Default linear-solver policy.
+
+For affine problems this policy prefers the first-party geometric multigrid
+path when a supported hierarchy can be compiled from the problem description.
+When only an `AssemblyPlan` is available, or when no coarser p-level exists, it
+uses matrix-free CG with a Jacobi preconditioner generated from the reduced
+operator.
+"""
+struct AutoLinearSolver <: AbstractLinearSolver end
+
+abstract type _AbstractReducedLinearOperator{T<:AbstractFloat} end
+
+struct _ReducedAffineOperator{D,T<:AbstractFloat,W<:_ReducedOperatorWorkspace{T}} <:
+       _AbstractReducedLinearOperator{T}
+  plan::AssemblyPlan{D,T}
+  workspace::W
+end
+
+struct _ReducedTangentOperator{D,T<:AbstractFloat,W<:_ReducedOperatorWorkspace{T},
+                               R<:ResidualWorkspace{T}} <:
+       _AbstractReducedLinearOperator{T}
+  plan::AssemblyPlan{D,T}
+  workspace::W
+  residual_workspace::R
+end
+
+struct _CountingReducedOperator{T<:AbstractFloat,O<:_AbstractReducedLinearOperator{T},C} <:
+       _AbstractReducedLinearOperator{T}
+  operator::O
+  counter::C
+end
+
+_operator_size(operator::_AbstractReducedLinearOperator) = reduced_dof_count(operator.plan)
+_operator_size(operator::_CountingReducedOperator) = _operator_size(operator.operator)
+
+function _apply_operator!(result::AbstractVector{T}, operator::_ReducedAffineOperator{D,T},
+                          vector::AbstractVector{T}) where {D,T<:AbstractFloat}
+  return _reduced_apply!(result, operator.plan, vector, operator.workspace)
+end
+
+function _apply_operator!(result::AbstractVector{T}, operator::_ReducedTangentOperator{D,T},
+                          vector::AbstractVector{T}) where {D,T<:AbstractFloat}
+  return _reduced_tangent_apply!(result, operator.plan, vector, operator.workspace,
+                                 operator.residual_workspace)
+end
+
+function _apply_operator!(result::AbstractVector{T}, operator::_CountingReducedOperator{T},
+                          vector::AbstractVector{T}) where {T<:AbstractFloat}
+  operator.counter[] += 1
+  return _apply_operator!(result, operator.operator, vector)
+end
+
+abstract type _CompiledPreconditioner{T<:AbstractFloat} end
+
+struct _IdentityCompiledPreconditioner{T<:AbstractFloat} <: _CompiledPreconditioner{T} end
+
+struct _JacobiCompiledPreconditioner{T<:AbstractFloat} <: _CompiledPreconditioner{T}
+  inverse_diagonal::Vector{T}
+end
+
+"""
+    solve(problem; solver=AutoLinearSolver(), kwargs...)
+    solve(plan; solver=AutoLinearSolver(), kwargs...)
 
 Solve a compiled affine or residual problem.
 
-For affine problems, `linear_solve` is called on the reduced constraint-
-compatible system as
-
-    linear_solve(plan, reduced_rhs; preconditioner=preconditioner, workspace=workspace, kwargs...)
-
-and must return a reduced coefficient vector. The returned vector is expanded
-back to a full-layout [`State`](@ref).
+For affine problems, `solver` is compiled against the reduced constraint-
+compatible system and returns a reduced coefficient vector. The returned vector
+is expanded back to a full-layout [`State`](@ref). `AutoLinearSolver` uses
+geometric multigrid when a supported hierarchy can be built from the problem
+description, and otherwise uses matrix-free CG with Jacobi data generated from
+the reduced operator.
 
 For residual problems, the same keyword names configure a Newton solve. The
 default tangent correction uses matrix-free CG on `P' J(u) P` without
@@ -60,10 +137,9 @@ preconditioning. Passing a non-`nothing` preconditioner to the default residual
 solve is rejected so nonlinear preconditioning remains an explicit custom
 `linear_solve` decision.
 """
-function solve(problem::AffineProblem; linear_solve=default_linear_solve, preconditioner=nothing,
+function solve(problem::AffineProblem; solver::AbstractLinearSolver=AutoLinearSolver(),
                kwargs...)
-  return solve(compile(problem); linear_solve=linear_solve, preconditioner=preconditioner,
-               kwargs...)
+  return _solve_affine_problem(problem, solver; kwargs...)
 end
 
 function solve(problem::ResidualProblem; linear_solve=default_tangent_linear_solve,
@@ -72,25 +148,55 @@ function solve(problem::ResidualProblem; linear_solve=default_tangent_linear_sol
                kwargs...)
 end
 
-function solve(plan::AssemblyPlan{D,T}; linear_solve=default_linear_solve, preconditioner=nothing,
-               kwargs...) where {D,T<:AbstractFloat}
+function solve(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=AutoLinearSolver(),
+               linear_solve=nothing, preconditioner=nothing, kwargs...) where {D,T<:AbstractFloat}
   kind = _matrix_free_kind(plan.assembly_structure)
-  kind === :affine && return _solve_affine(plan; linear_solve, preconditioner, kwargs...)
-  residual_linear_solve = linear_solve === default_linear_solve ? default_tangent_linear_solve :
-                          linear_solve
+  if kind === :affine
+    (linear_solve === nothing && preconditioner === nothing) ||
+      throw(ArgumentError("affine solves use solver=...; construct a CGSolver, AutoLinearSolver, or GeometricMultigridSolver policy instead of passing linear_solve/preconditioner"))
+    return _solve_affine(plan; solver, kwargs...)
+  end
+  residual_linear_solve = linear_solve === nothing ? default_tangent_linear_solve : linear_solve
   kind === :residual &&
     return _solve_residual(plan; linear_solve=residual_linear_solve, preconditioner, kwargs...)
   throw(ArgumentError("unsupported matrix-free solve kind $kind"))
 end
 
-function _solve_affine(plan::AssemblyPlan{D,T}; linear_solve=default_linear_solve,
-                       preconditioner=nothing, kwargs...) where {D,T<:AbstractFloat}
+function _solve_affine_problem(problem::AffineProblem, solver::AbstractLinearSolver;
+                               kwargs...)
+  return _solve_affine(compile(problem); solver, kwargs...)
+end
+
+function _solve_affine(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=AutoLinearSolver(),
+                       relative_tolerance=sqrt(eps(T)), absolute_tolerance=zero(T),
+                       maxiter=max(1_000, 2 * reduced_dof_count(plan)),
+                       initial_solution=nothing) where {D,T<:AbstractFloat}
+  _require_matrix_free_kind(plan, :affine)
+  workspace = _ReducedOperatorWorkspace(plan)
+  reduced_rhs = zeros(T, reduced_dof_count(plan))
+  _reduced_rhs!(reduced_rhs, plan, workspace)
+  operator = _ReducedAffineOperator(plan, workspace)
+  reduced_values = _solve_reduced_system(solver, operator, reduced_rhs;
+                                         relative_tolerance=T(relative_tolerance),
+                                         absolute_tolerance=T(absolute_tolerance),
+                                         maxiter=maxiter,
+                                         initial_solution=initial_solution)
+  return _state_from_reduced_result(plan, reduced_values)
+end
+
+function _solve_affine_with_callback(plan::AssemblyPlan{D,T}; linear_solve,
+                                     preconditioner=nothing, kwargs...) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   workspace = _ReducedOperatorWorkspace(plan)
   reduced_rhs = zeros(T, reduced_dof_count(plan))
   _reduced_rhs!(reduced_rhs, plan, workspace)
   reduced_values = linear_solve(plan, reduced_rhs; preconditioner=preconditioner,
                                 workspace=workspace, kwargs...)
+  return _state_from_reduced_result(plan, reduced_values)
+end
+
+function _state_from_reduced_result(plan::AssemblyPlan{D,T},
+                                    reduced_values::AbstractVector{T}) where {D,T<:AbstractFloat}
   _require_length(reduced_values, reduced_dof_count(plan), "linear solve result")
   eltype(reduced_values) == T ||
     throw(ArgumentError("linear solve result element type must match the plan scalar type"))
@@ -163,14 +269,31 @@ function _state_from_reduced!(plan::AssemblyPlan{D,T}, workspace::_ReducedOperat
   return State(plan, full_values)
 end
 
-function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
-                   workspace::_ReducedOperatorWorkspace{T}; relative_tolerance::T,
-                   absolute_tolerance::T, maxiter::Int, initial_solution, inverse_diagonal,
-                   operator_apply=(target, vector) -> _reduced_apply!(target, plan, vector,
-                                                                      workspace)) where {D,
-                                                                                         T<:AbstractFloat}
+function _solve_reduced_system(::AutoLinearSolver, operator::_AbstractReducedLinearOperator{T},
+                               rhs_data::AbstractVector{T}; kwargs...) where {T<:AbstractFloat}
+  return _solve_reduced_system(CGSolver(; preconditioner=JacobiPreconditioner()), operator,
+                               rhs_data; kwargs...)
+end
+
+function _solve_reduced_system(solver::CGSolver, operator::_AbstractReducedLinearOperator{T},
+                               rhs_data::AbstractVector{T}; relative_tolerance::T,
+                               absolute_tolerance::T, maxiter::Int,
+                               initial_solution=nothing) where {T<:AbstractFloat}
+  preconditioner = _compile_preconditioner(solver.preconditioner, operator)
+  return _cg_solve(operator, rhs_data, preconditioner;
+                   relative_tolerance=relative_tolerance,
+                   absolute_tolerance=absolute_tolerance, maxiter=maxiter,
+                   initial_solution=initial_solution)
+end
+
+function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::AbstractVector{T},
+                   preconditioner::_CompiledPreconditioner{T}; relative_tolerance::T,
+                   absolute_tolerance::T, maxiter::Int,
+                   initial_solution=nothing) where {T<:AbstractFloat}
   n = length(rhs_data)
   n == 0 && return T[]
+  n == _operator_size(operator) ||
+    throw(ArgumentError("rhs length must match the reduced operator size"))
   maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
   solution = zeros(T, n)
 
@@ -185,12 +308,12 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
   operator_values = zeros(T, n)
 
   if initial_solution !== nothing
-    operator_apply(operator_values, solution)
+    _apply_operator!(operator_values, operator, solution)
     _axpy!(residual, -one(T), operator_values)
   end
 
   preconditioned_residual = similar(residual)
-  _apply_preconditioner!(preconditioned_residual, residual, inverse_diagonal)
+  _apply_preconditioner!(preconditioned_residual, preconditioner, residual)
   direction = copy(preconditioned_residual)
   residual_inner = _dot(residual, preconditioned_residual)
   rhs_norm = sqrt(_dot_self(rhs_data))
@@ -199,7 +322,7 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
   residual_norm2 <= tolerance * tolerance && return solution
 
   for iteration in 1:maxiter
-    operator_apply(operator_values, direction)
+    _apply_operator!(operator_values, operator, direction)
     denominator = _dot(direction, operator_values)
     denominator > zero(T) ||
       throw(ArgumentError("CG encountered a non-positive operator direction; provide a different linear_solve for this problem"))
@@ -208,7 +331,7 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
     _axpy!(residual, -alpha, operator_values)
     next_residual_norm2 = _dot_self(residual)
     next_residual_norm2 <= tolerance * tolerance && return solution
-    _apply_preconditioner!(preconditioned_residual, residual, inverse_diagonal)
+    _apply_preconditioner!(preconditioned_residual, preconditioner, residual)
     next_residual_inner = _dot(residual, preconditioned_residual)
     beta = next_residual_inner / residual_inner
     _update_direction!(direction, preconditioned_residual, beta)
@@ -219,14 +342,29 @@ function _cg_solve(plan::AssemblyPlan{D,T}, rhs_data::AbstractVector{T},
   throw(ArgumentError("CG did not converge in $maxiter iterations"))
 end
 
-_preconditioner_data(plan, workspace, ::Nothing) = nothing
-
-function _preconditioner_data(plan::AssemblyPlan{D,T}, workspace::_ReducedOperatorWorkspace{T},
-                              ::JacobiPreconditioner) where {D,T<:AbstractFloat}
-  return _jacobi_inverse_diagonal(plan, workspace)
+function _compile_preconditioner(::IdentityPreconditioner,
+                                 operator::_AbstractReducedLinearOperator{T}) where {T<:AbstractFloat}
+  return _IdentityCompiledPreconditioner{T}()
 end
 
-function _preconditioner_data(plan, workspace, preconditioner)
+function _compile_preconditioner(::JacobiPreconditioner,
+                                 operator::_ReducedAffineOperator{D,T}) where {D,T<:AbstractFloat}
+  inverse_diagonal = _jacobi_inverse_diagonal(operator.plan, operator.workspace)
+  inverse_diagonal === nothing && return _IdentityCompiledPreconditioner{T}()
+  return _JacobiCompiledPreconditioner(inverse_diagonal)
+end
+
+function _compile_preconditioner(preconditioner::AbstractPreconditioner,
+                                 operator::_AbstractReducedLinearOperator)
+  throw(ArgumentError("preconditioner $(typeof(preconditioner)) is not supported for this reduced operator"))
+end
+
+function _compile_preconditioner(preconditioner::AbstractPreconditioner,
+                                 operator::_CountingReducedOperator)
+  return _compile_preconditioner(preconditioner, operator.operator)
+end
+
+function _compile_preconditioner(preconditioner, operator::_AbstractReducedLinearOperator)
   throw(ArgumentError("unsupported matrix-free preconditioner $(typeof(preconditioner))"))
 end
 
@@ -257,19 +395,38 @@ function default_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T},
   preconditioner === nothing ||
     throw(ArgumentError("matrix-free tangent preconditioning is not implemented; pass preconditioner=nothing or a custom linear_solve"))
   copyto!(workspace.full_state, coefficients(state))
-  operator_apply = (target, vector) -> _reduced_tangent_apply!(target, plan, vector, workspace,
-                                                               residual_workspace)
-  return _cg_solve(plan, reduced_rhs, workspace; relative_tolerance=relative_tolerance,
-                   absolute_tolerance=absolute_tolerance, maxiter=maxiter,
-                   initial_solution=initial_solution, inverse_diagonal=nothing, operator_apply)
+  operator = _ReducedTangentOperator(plan, workspace, residual_workspace)
+  return _solve_reduced_system(CGSolver(), operator, reduced_rhs;
+                               relative_tolerance=relative_tolerance,
+                               absolute_tolerance=absolute_tolerance, maxiter=maxiter,
+                               initial_solution=initial_solution)
 end
 
 function _jacobi_inverse_diagonal(plan::AssemblyPlan{D,T},
                                   workspace::_ReducedOperatorWorkspace{T}) where {D,
                                                                                   T<:AbstractFloat}
   inverse_diagonal = zeros(T, reduced_dof_count(plan))
-  _reduced_diagonal!(inverse_diagonal, plan, workspace) || return nothing
+  _reduced_diagonal!(inverse_diagonal, plan, workspace) ||
+    _probe_reduced_diagonal!(inverse_diagonal, plan, workspace)
   return _invert_jacobi_diagonal!(inverse_diagonal)
+end
+
+function _probe_reduced_diagonal!(diagonal::AbstractVector{T}, plan::AssemblyPlan{D,T},
+                                  workspace::_ReducedOperatorWorkspace{T}) where {D,
+                                                                                  T<:AbstractFloat}
+  count = reduced_dof_count(plan)
+  _require_length(diagonal, count, "reduced diagonal")
+  basis = zeros(T, count)
+  response = zeros(T, count)
+
+  for index in 1:count
+    basis[index] = one(T)
+    _reduced_apply!(response, plan, basis, workspace)
+    diagonal[index] = response[index]
+    basis[index] = zero(T)
+  end
+
+  return diagonal
 end
 
 function _invert_jacobi_diagonal!(diagonal::AbstractVector{T}) where {T<:AbstractFloat}
@@ -285,16 +442,19 @@ function _invert_jacobi_diagonal!(diagonal::AbstractVector{T}) where {T<:Abstrac
   return diagonal
 end
 
-function _apply_preconditioner!(result::AbstractVector{T}, residual::AbstractVector{T},
-                                ::Nothing) where {T<:AbstractFloat}
+function _apply_preconditioner!(result::AbstractVector{T},
+                                ::_IdentityCompiledPreconditioner{T},
+                                residual::AbstractVector{T}) where {T<:AbstractFloat}
   _require_length(result, length(residual), "preconditioned residual")
   copyto!(result, residual)
   return result
 end
 
-function _apply_preconditioner!(result::AbstractVector{T}, residual::AbstractVector{T},
-                                inverse_diagonal::AbstractVector{T}) where {T<:AbstractFloat}
+function _apply_preconditioner!(result::AbstractVector{T},
+                                preconditioner::_JacobiCompiledPreconditioner{T},
+                                residual::AbstractVector{T}) where {T<:AbstractFloat}
   _require_length(result, length(residual), "preconditioned residual")
+  inverse_diagonal = preconditioner.inverse_diagonal
   _require_length(inverse_diagonal, length(residual), "inverse diagonal")
 
   @inbounds for index in eachindex(residual)

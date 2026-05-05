@@ -140,5 +140,5 @@ add_constraint!(problem, Dirichlet(u, BoundaryFace(1, LOWER), 0.0))
 add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 
 plan = compile(problem)
-state = solve(plan; preconditioner=JacobiPreconditioner())
+state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
 ```

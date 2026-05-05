@@ -354,7 +354,7 @@ end
 # Mesh adaptation is performed between fixed-mesh ODE segments. The current DG
 # state is used as an error indicator, then transferred to the adapted mesh.
 function adapt_blast_wave_context(context; tolerance=ADAPTIVITY_TOLERANCE, max_h_level=MAX_H_LEVEL,
-                                  linear_solve=Grico.default_linear_solve)
+                                  linear_solve=nothing)
   plan = blast_wave_adaptivity_plan(context; tolerance=tolerance, max_h_level=max_h_level)
 
   if isempty(plan)

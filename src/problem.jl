@@ -615,9 +615,10 @@ This callback supplies the diagonal data used by matrix-free preconditioners.
 It should add the diagonal entries of the same local bilinear form represented
 by [`cell_apply!`](@ref), using the local coefficient numbering of `values`.
 The method must accumulate into `local_diagonal` and leave entries belonging to
-other fields or operators unchanged. If a requested Jacobi preconditioner
-cannot use the available diagonal callbacks safely, it falls back to identity
-preconditioning. The default method does nothing.
+other fields or operators unchanged. Matrix-free preconditioners use this as a
+fast path; when the callback is unavailable or cannot be scattered safely,
+Grico can still build generic Jacobi data by probing the reduced operator. The
+default method does nothing.
 """
 cell_diagonal!(local_diagonal, operator, values) = nothing
 
@@ -675,8 +676,8 @@ the diagonal of the local bilinear form implemented by [`face_apply!`](@ref) in
 the local numbering of the [`FaceValues`](@ref) item. Matrix-free
 preconditioners use this method only when the local-to-global maps are direct
 enough for local diagonal scattering to be valid. If those requirements are not
-met, Jacobi preconditioning falls back to the identity. The default method does
-nothing.
+met, generic reduced-operator probing can still build Jacobi data. The default
+method does nothing.
 """
 face_diagonal!(local_diagonal, operator, values) = nothing
 
@@ -716,9 +717,9 @@ Accumulate the local diagonal of an affine embedded-surface operator into
 
 The callback should represent the diagonal part of the local bilinear surface
 contribution implemented by [`surface_apply!`](@ref), using the same local
-numbering as the [`SurfaceValues`](@ref) item. If a requested Jacobi
-preconditioner cannot use the available diagonal callbacks safely, it falls
-back to identity preconditioning.
+numbering as the [`SurfaceValues`](@ref) item. This callback is an optimization
+hook for matrix-free preconditioners; generic reduced-operator probing remains
+available when local diagonal scattering is not valid.
 """
 surface_diagonal!(local_diagonal, operator, values) = nothing
 
@@ -762,8 +763,9 @@ item. This callback should add the diagonal entries of the local bilinear form
 implemented by [`interface_apply!`](@ref) in that combined local numbering. It
 is intended for preconditioners and therefore does not replace the full
 matrix-free action; off-diagonal coupling remains the responsibility of
-`interface_apply!`. If the callback cannot be used safely, Jacobi
-preconditioning falls back to the identity. The default method does nothing.
+`interface_apply!`. If the callback cannot be used safely, generic
+reduced-operator probing can still build Jacobi data. The default method does
+nothing.
 """
 interface_diagonal!(local_diagonal, operator, values) = nothing
 

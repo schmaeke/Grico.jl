@@ -447,9 +447,10 @@ end
   add_cell!(no_diagonal_problem, _MatrixFreeNoDiagonalIdentity())
   no_diagonal_plan = compile(no_diagonal_problem)
   no_diagonal_workspace = Grico._ReducedOperatorWorkspace(no_diagonal_plan)
-  @test Grico._preconditioner_data(no_diagonal_plan, no_diagonal_workspace,
-                                   JacobiPreconditioner()) === nothing
-  no_diagonal_state = solve(no_diagonal_plan; preconditioner=JacobiPreconditioner())
+  no_diagonal_operator = Grico._ReducedAffineOperator(no_diagonal_plan, no_diagonal_workspace)
+  @test Grico._compile_preconditioner(JacobiPreconditioner(), no_diagonal_operator) isa
+        Grico._JacobiCompiledPreconditioner
+  no_diagonal_state = solve(no_diagonal_plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
   @test coefficients(no_diagonal_state) ≈ [1.0, 1.0]
 
   mass_problem = AffineProblem(dg_field)
@@ -541,7 +542,7 @@ end
   dirichlet_diagonal_selected, dirichlet_diagonal = _kernel_reduced_diagonal(compile(dirichlet_problem))
   @test dirichlet_diagonal_selected
   @test dirichlet_diagonal ≈ [1.0]
-  jacobi_dirichlet_state = solve(dirichlet_problem; preconditioner=JacobiPreconditioner())
+  jacobi_dirichlet_state = solve(dirichlet_problem; solver=CGSolver(preconditioner=JacobiPreconditioner()))
   @test coefficients(jacobi_dirichlet_state) ≈ [2.0, 1.0]
 
   constant_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(0), continuity=:dg))

@@ -5,11 +5,14 @@ import Grico
 # are meant for ordinary `using Grico` workflows; qualified public names are
 # supported as `Grico.name` but should not be injected into every user namespace.
 const EXPECTED_EXPORTED = Set(Symbol[:AbstractField, :AdaptivityLimits, :AdaptivityPlan,
-                                     :AffineProblem, :AssemblyPlan, :AxisDegrees, :BoundaryFace,
+                                     :AffineProblem, :AssemblyPlan, :AutoLinearSolver,
+                                     :AxisDegrees, :BoundaryFace,
                                      :ByLeafDegrees, :CartesianGrid, :CellValues,
-                                     :DegreePlusQuadrature, :Dirichlet, :Domain, :EmbeddedSurface,
+                                     :CGSolver, :DegreePlusQuadrature, :Dirichlet, :Domain,
+                                     :EmbeddedSurface,
                                      :FaceValues, :FieldLayout, :FiniteCellExtension,
-                                     :FullTensorBasis, :HpSpace, :ImplicitRegion, :InterfaceValues,
+                                     :FullTensorBasis, :GeometricMultigridSolver, :HpSpace,
+                                     :IdentityPreconditioner, :ImplicitRegion, :InterfaceValues,
                                      :JacobiPreconditioner, :KernelScratch, :LOWER, :MeanValue,
                                      :NONE, :OperatorWorkspace, :PhysicalDomain, :PhysicalMeasure,
                                      :PointQuadrature, :ResidualProblem, :ResidualWorkspace,
@@ -52,7 +55,8 @@ const EXPECTED_EXPORTED = Set(Symbol[:AbstractField, :AdaptivityLimits, :Adaptiv
                                      :transition, :value, :weight, :write_pvd, :write_vtk])
 
 const EXPECTED_QUALIFIED_PUBLIC = Set(Symbol[:AbstractBasisFamily, :AbstractDegreePolicy,
-                                             :AbstractDomain, :AbstractQuadrature,
+                                             :AbstractDomain, :AbstractLinearSolver,
+                                             :AbstractPreconditioner, :AbstractQuadrature,
                                              :AbstractQuadraturePolicy, :GaussLegendreRule,
                                              :Geometry, :GridSnapshot, :HCoarseningCandidate,
                                              :SampledMesh, :SampledMeshSkeleton,
@@ -64,7 +68,7 @@ const EXPECTED_QUALIFIED_PUBLIC = Set(Symbol[:AbstractBasisFamily, :AbstractDegr
                                              :check_snapshot, :check_space, :check_topology,
                                              :coefficient_coarsening_indicators, :compact,
                                              :compact!, :continuity_kind, :continuity_policy,
-                                             :coordinate, :covering_neighbor, :default_linear_solve,
+                                             :coordinate, :covering_neighbor,
                                              :default_tangent_linear_solve,
                                              :derived_adaptivity_plan, :dimension, :face_measure,
                                              :field_component_range, :finite_cell_quadrature,

@@ -97,7 +97,7 @@ end
   Grico.add_constraint!(problem, Grico.Dirichlet(u, Grico.BoundaryFace(1, Grico.UPPER), 1.0))
 
   plan = Grico.compile(problem)
-  state = Grico.solve(plan; preconditioner=Grico.JacobiPreconditioner())
+  state = Grico.solve(plan; solver=Grico.CGSolver(preconditioner=Grico.JacobiPreconditioner()))
   exact(x) = x[1] * (1.0 - x[1]) + 1.0
 
   @test Grico.l2_error(state, u, exact; plan=plan) <= VERIFICATION_TOL

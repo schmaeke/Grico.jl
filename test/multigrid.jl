@@ -1,0 +1,92 @@
+using Test
+using Grico
+
+struct _MGIdentity end
+
+function Grico.cell_apply!(local_result, ::_MGIdentity, values, local_coefficients)
+  copyto!(local_result, local_coefficients)
+  return nothing
+end
+
+function Grico.cell_rhs!(local_rhs, ::_MGIdentity, values)
+  fill!(local_rhs, 1.0)
+  return nothing
+end
+
+function _mg_identity_problem(; continuity=:dg, degree=3, cells=(2,), refine=nothing)
+  domain = Domain((0.0,), (1.0,), cells)
+  refine === nothing || refine(grid(domain))
+  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree), continuity=continuity))
+  field = ScalarField(space; name=:u)
+  problem = AffineProblem(field)
+  add_cell!(problem, _MGIdentity())
+  return problem, field
+end
+
+function _mg_identity_problem_2d(; continuity=:cg, degree=1, cells=(2, 1), refine=nothing)
+  domain = Domain((0.0, 0.0), (1.0, 1.0), cells)
+  refine === nothing || refine(grid(domain))
+  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree), continuity=continuity))
+  field = ScalarField(space; name=:u)
+  problem = AffineProblem(field)
+  add_cell!(problem, _MGIdentity())
+  return problem, field
+end
+
+function _test_transfer_adjoint(transfer)
+  coarse = [sin(0.2 * index) for index in 1:Grico.reduced_dof_count(transfer.coarse_plan)]
+  fine = [cos(0.3 * index) for index in 1:Grico.reduced_dof_count(transfer.fine_plan)]
+  prolonged = zeros(length(fine))
+  restricted = zeros(length(coarse))
+  Grico._prolongate_reduced_add!(prolonged, transfer, coarse)
+  Grico._restrict_reduced!(restricted, transfer, fine)
+  return sum(prolonged .* fine) ≈ sum(coarse .* restricted)
+end
+
+@testset "Geometric multigrid" begin
+  dg_problem, dg_field = _mg_identity_problem(continuity=:dg, degree=3)
+  dg_state = solve(dg_problem; solver=GeometricMultigridSolver())
+  @test coefficients(dg_state) ≈ ones(field_dof_count(dg_field))
+
+  cg_problem, cg_field = _mg_identity_problem(continuity=:cg, degree=3)
+  add_constraint!(cg_problem, Dirichlet(cg_field, BoundaryFace(1, LOWER), 2.0))
+  cg_state = solve(cg_problem; solver=GeometricMultigridSolver())
+  @test first(coefficients(cg_state)) ≈ 2.0
+  @test coefficients(cg_state)[2:end] ≈ ones(field_dof_count(cg_field) - 1)
+
+  hierarchy = Grico._compile_geometric_multigrid(dg_problem, GeometricMultigridSolver())
+  @test length(hierarchy.levels) == 2
+  @test hierarchy.coarse_solver isa Grico._DenseCoarseSolver
+  @test _test_transfer_adjoint(only(hierarchy.transfers))
+
+  low_order_problem, = _mg_identity_problem(continuity=:dg, degree=1)
+  @test coefficients(solve(low_order_problem; solver=AutoLinearSolver())) ≈ ones(4)
+
+  h_problem, h_field = _mg_identity_problem(continuity=:dg, degree=1, cells=(1,),
+                                            refine=grid -> begin
+                                              first = refine!(grid, 1, 1)
+                                              refine!(grid, first + 1, 1)
+                                            end)
+  h_hierarchy = Grico._compile_geometric_multigrid(h_problem, GeometricMultigridSolver())
+  @test map(level -> Grico.reduced_dof_count(level.plan), h_hierarchy.levels) == [2, 4, 6]
+  @test all(_test_transfer_adjoint, h_hierarchy.transfers)
+  @test isapprox(coefficients(solve(h_problem; solver=GeometricMultigridSolver())),
+                 ones(field_dof_count(h_field)); atol=1.0e-8)
+  @test isapprox(coefficients(solve(h_problem; solver=AutoLinearSolver())),
+                 ones(field_dof_count(h_field)); atol=1.0e-8)
+
+  hp_problem, = _mg_identity_problem(continuity=:dg, degree=3, cells=(1,),
+                                     refine=grid -> refine!(grid, 1, 1))
+  hp_hierarchy = Grico._compile_geometric_multigrid(hp_problem, GeometricMultigridSolver())
+  @test map(level -> Grico.reduced_dof_count(level.plan), hp_hierarchy.levels) == [2, 4, 8]
+  @test all(_test_transfer_adjoint, hp_hierarchy.transfers)
+
+  hanging_problem, hanging_field = _mg_identity_problem_2d(continuity=:cg, degree=1,
+                                                           refine=grid -> refine!(grid, 1, 1))
+  hanging_hierarchy = Grico._compile_geometric_multigrid(hanging_problem,
+                                                         GeometricMultigridSolver())
+  @test length(hanging_hierarchy.levels) == 2
+  @test _test_transfer_adjoint(only(hanging_hierarchy.transfers))
+  @test coefficients(solve(hanging_problem; solver=GeometricMultigridSolver())) ≈
+        ones(field_dof_count(hanging_field))
+end

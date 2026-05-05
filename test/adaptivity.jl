@@ -141,8 +141,7 @@ end
   cg_transition = transition(cg_plan)
   custom_solve = (A, b) -> A \ b
 
-  @test Grico._transfer_strategy(cg_transition, Grico.default_linear_solve) ===
-        Grico._LOCAL_PROJECTION_TRANSFER
+  @test Grico._transfer_strategy(cg_transition, nothing) === Grico._LOCAL_PROJECTION_TRANSFER
   @test Grico._transfer_strategy(cg_transition, custom_solve) === Grico._VARIATIONAL_TRANSFER
 
   dg_domain = Domain((0.0,), (1.0,), (1,))
@@ -152,8 +151,7 @@ end
   request_h_refinement!(dg_plan, 1, 1)
   dg_transition = transition(dg_plan)
 
-  @test Grico._transfer_strategy(dg_transition, Grico.default_linear_solve) ===
-        Grico._CELLWISE_DG_TRANSFER
+  @test Grico._transfer_strategy(dg_transition, nothing) === Grico._CELLWISE_DG_TRANSFER
   @test Grico._transfer_strategy(dg_transition, custom_solve) === Grico._CELLWISE_DG_TRANSFER
 end
 
@@ -294,7 +292,14 @@ end
                                linear_solve=(A, b; kwargs...) -> begin
                                  calls[] += 1
                                  if A isa Grico.AssemblyPlan
-                                   return Grico.default_linear_solve(A, b; kwargs...)
+                                   T = eltype(b)
+                                   operator = Grico._ReducedAffineOperator(A, kwargs[:workspace])
+                                   solver = Grico.CGSolver(preconditioner=Grico.JacobiPreconditioner())
+                                   return Grico._solve_reduced_system(solver, operator, b;
+                                                                       relative_tolerance=sqrt(eps(T)),
+                                                                       absolute_tolerance=zero(T),
+                                                                       maxiter=max(1_000, 2 * length(b)),
+                                                                       initial_solution=nothing)
                                  end
                                  return A \ b
                                end)

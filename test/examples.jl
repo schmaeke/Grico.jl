@@ -70,7 +70,7 @@ end
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 1.0))
 
   plan = compile(problem)
-  state = solve(plan; preconditioner=JacobiPreconditioner())
+  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
 
   @test l2_error(state, u, x -> x[1] * (1.0 - x[1]) + 1.0; plan) <= 1.0e-10
 end
