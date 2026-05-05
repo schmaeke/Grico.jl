@@ -205,8 +205,7 @@ end
 # callbacks are used.
 function _compile_problem(fields, cell_operators, boundary_operators, interface_operators,
                           surface_operators, cell_quadratures, embedded_surfaces,
-                          dirichlet_constraints, mean_constraints, operator_class,
-                          assembly_kind)
+                          dirichlet_constraints, mean_constraints, operator_class, assembly_kind)
   layout = _field_layout(fields)
   integration = _compile_integration(layout, cell_quadratures, embedded_surfaces;
                                      include_interfaces=(!isempty(interface_operators)))

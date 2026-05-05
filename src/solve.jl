@@ -99,8 +99,7 @@ struct _ReducedAffineOperator{D,T<:AbstractFloat,W<:_ReducedOperatorWorkspace{T}
 end
 
 struct _ReducedTangentOperator{D,T<:AbstractFloat,W<:_ReducedOperatorWorkspace{T},
-                               R<:ResidualWorkspace{T}} <:
-       _AbstractReducedLinearOperator{T}
+                               R<:ResidualWorkspace{T}} <: _AbstractReducedLinearOperator{T}
   plan::AssemblyPlan{D,T}
   workspace::W
   residual_workspace::R
@@ -161,8 +160,7 @@ preconditioning. Passing a non-`nothing` preconditioner to the default residual
 solve is rejected so nonlinear preconditioning remains an explicit custom
 `linear_solve` decision.
 """
-function solve(problem::AffineProblem; solver::AbstractLinearSolver=AutoLinearSolver(),
-               kwargs...)
+function solve(problem::AffineProblem; solver::AbstractLinearSolver=AutoLinearSolver(), kwargs...)
   return _solve_affine_problem(problem, solver; kwargs...)
 end
 
@@ -186,8 +184,7 @@ function solve(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=AutoLinearS
   throw(ArgumentError("unsupported matrix-free solve kind $kind"))
 end
 
-function _solve_affine_problem(problem::AffineProblem, solver::AbstractLinearSolver;
-                               kwargs...)
+function _solve_affine_problem(problem::AffineProblem, solver::AbstractLinearSolver; kwargs...)
   return _solve_affine(compile(problem); solver, kwargs...)
 end
 
@@ -202,8 +199,7 @@ function _solve_affine(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=Aut
   operator = _ReducedAffineOperator(plan, workspace)
   reduced_values = _solve_reduced_system(solver, operator, reduced_rhs;
                                          relative_tolerance=T(relative_tolerance),
-                                         absolute_tolerance=T(absolute_tolerance),
-                                         maxiter=maxiter,
+                                         absolute_tolerance=T(absolute_tolerance), maxiter=maxiter,
                                          initial_solution=initial_solution)
   return _state_from_reduced_result(plan, reduced_values)
 end
@@ -295,23 +291,19 @@ function _solve_reduced_system(solver::CGSolver, operator::_AbstractReducedLinea
                                absolute_tolerance::T, maxiter::Int,
                                initial_solution=nothing) where {T<:AbstractFloat}
   preconditioner = _compile_preconditioner(solver.preconditioner, operator)
-  return _cg_solve(operator, rhs_data, preconditioner;
-                   relative_tolerance=relative_tolerance,
+  return _cg_solve(operator, rhs_data, preconditioner; relative_tolerance=relative_tolerance,
                    absolute_tolerance=absolute_tolerance, maxiter=maxiter,
                    initial_solution=initial_solution)
 end
 
-function _solve_reduced_system(solver::FGMRESSolver,
-                               operator::_AbstractReducedLinearOperator{T},
+function _solve_reduced_system(solver::FGMRESSolver, operator::_AbstractReducedLinearOperator{T},
                                rhs_data::AbstractVector{T}; relative_tolerance::T,
                                absolute_tolerance::T, maxiter::Int,
                                initial_solution=nothing) where {T<:AbstractFloat}
   preconditioner = _compile_preconditioner(solver.preconditioner, operator)
-  return _fgmres_solve(operator, rhs_data, preconditioner;
-                       restart=solver.restart,
-                       relative_tolerance=relative_tolerance,
-                       absolute_tolerance=absolute_tolerance, maxiter=maxiter,
-                       initial_solution=initial_solution)
+  return _fgmres_solve(operator, rhs_data, preconditioner; restart=solver.restart,
+                       relative_tolerance=relative_tolerance, absolute_tolerance=absolute_tolerance,
+                       maxiter=maxiter, initial_solution=initial_solution)
 end
 
 function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::AbstractVector{T},
@@ -370,8 +362,7 @@ function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Abstra
   throw(ArgumentError("CG did not converge in $maxiter iterations"))
 end
 
-function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
-                       rhs_data::AbstractVector{T},
+function _fgmres_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::AbstractVector{T},
                        preconditioner::_CompiledPreconditioner{T}; restart::Int,
                        relative_tolerance::T, absolute_tolerance::T, maxiter::Int,
                        initial_solution=nothing) where {T<:AbstractFloat}
@@ -456,8 +447,7 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
       end
 
       _apply_previous_givens_rotations!(hessenberg, givens_cosine, givens_sine, column)
-      cosine, sine = _givens_rotation(hessenberg[column, column],
-                                      hessenberg[column+1, column])
+      cosine, sine = _givens_rotation(hessenberg[column, column], hessenberg[column+1, column])
       givens_cosine[column] = cosine
       givens_sine[column] = sine
       _apply_givens_rotation!(hessenberg, column, column, cosine, sine)
@@ -465,8 +455,7 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
 
       if abs(least_squares_rhs[column+1]) <= tolerance || next_norm == zero(T)
         _finish_fgmres_cycle!(solution, residual, operator_values, operator, rhs_data,
-                              preconditioned, hessenberg, least_squares_rhs, coefficients,
-                              column)
+                              preconditioned, hessenberg, least_squares_rhs, coefficients, column)
         sqrt(_dot_self(residual)) <= tolerance && return solution
         cycle_updated = true
         break
@@ -475,17 +464,15 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T},
 
     inner_count > 0 || throw(ArgumentError("FGMRES failed to build a Krylov update"))
     cycle_updated ||
-      _finish_fgmres_cycle!(solution, residual, operator_values, operator, rhs_data,
-                            preconditioned, hessenberg, least_squares_rhs, coefficients,
-                            inner_count)
+      _finish_fgmres_cycle!(solution, residual, operator_values, operator, rhs_data, preconditioned,
+                            hessenberg, least_squares_rhs, coefficients, inner_count)
     sqrt(_dot_self(residual)) <= tolerance && return solution
   end
 
   throw(ArgumentError("FGMRES did not converge in $maxiter iterations"))
 end
 
-function _apply_previous_givens_rotations!(hessenberg::AbstractMatrix{T},
-                                           cosine::AbstractVector{T},
+function _apply_previous_givens_rotations!(hessenberg::AbstractMatrix{T}, cosine::AbstractVector{T},
                                            sine::AbstractVector{T},
                                            column::Int) where {T<:AbstractFloat}
   for row in 1:(column-1)
@@ -501,8 +488,8 @@ function _givens_rotation(first::T, second::T) where {T<:AbstractFloat}
   return first / scale, second / scale
 end
 
-function _apply_givens_rotation!(matrix::AbstractMatrix{T}, row::Int, column::Int,
-                                 cosine::T, sine::T) where {T<:AbstractFloat}
+function _apply_givens_rotation!(matrix::AbstractMatrix{T}, row::Int, column::Int, cosine::T,
+                                 sine::T) where {T<:AbstractFloat}
   first = @inbounds matrix[row, column]
   second = @inbounds matrix[row+1, column]
   @inbounds matrix[row, column] = cosine * first + sine * second
@@ -522,12 +509,9 @@ end
 function _finish_fgmres_cycle!(solution::AbstractVector{T}, residual::AbstractVector{T},
                                operator_values::AbstractVector{T},
                                operator::_AbstractReducedLinearOperator{T},
-                               rhs_data::AbstractVector{T},
-                               preconditioned::AbstractMatrix{T},
-                               hessenberg::AbstractMatrix{T},
-                               least_squares_rhs::AbstractVector{T},
-                               coefficients::AbstractVector{T},
-                               count::Int) where {T<:AbstractFloat}
+                               rhs_data::AbstractVector{T}, preconditioned::AbstractMatrix{T},
+                               hessenberg::AbstractMatrix{T}, least_squares_rhs::AbstractVector{T},
+                               coefficients::AbstractVector{T}, count::Int) where {T<:AbstractFloat}
   _upper_triangular_solve!(coefficients, hessenberg, least_squares_rhs, count)
   _update_fgmres_solution!(solution, preconditioned, coefficients, count)
   _apply_operator!(operator_values, operator, solution)
@@ -535,10 +519,8 @@ function _finish_fgmres_cycle!(solution::AbstractVector{T}, residual::AbstractVe
   return solution
 end
 
-function _upper_triangular_solve!(result::AbstractVector{T},
-                                  upper::AbstractMatrix{T},
-                                  rhs_data::AbstractVector{T},
-                                  count::Int) where {T<:AbstractFloat}
+function _upper_triangular_solve!(result::AbstractVector{T}, upper::AbstractMatrix{T},
+                                  rhs_data::AbstractVector{T}, count::Int) where {T<:AbstractFloat}
   _require_length(result, count, "FGMRES coefficient work vector")
   _require_length(rhs_data, count, "FGMRES least-squares rhs")
   size(upper, 1) >= count && size(upper, 2) >= count ||
@@ -560,8 +542,7 @@ function _upper_triangular_solve!(result::AbstractVector{T},
   return result
 end
 
-function _update_fgmres_solution!(solution::AbstractVector{T},
-                                  preconditioned::AbstractMatrix{T},
+function _update_fgmres_solution!(solution::AbstractVector{T}, preconditioned::AbstractMatrix{T},
                                   coefficients::AbstractVector{T},
                                   count::Int) where {T<:AbstractFloat}
   for column in 1:count
@@ -686,8 +667,7 @@ function _invert_jacobi_diagonal!(diagonal::AbstractVector{T}) where {T<:Abstrac
   return diagonal
 end
 
-function _apply_preconditioner!(result::AbstractVector{T},
-                                ::_IdentityCompiledPreconditioner{T},
+function _apply_preconditioner!(result::AbstractVector{T}, ::_IdentityCompiledPreconditioner{T},
                                 residual::AbstractVector{T}) where {T<:AbstractFloat}
   _require_length(result, length(residual), "preconditioned residual")
   copyto!(result, residual)

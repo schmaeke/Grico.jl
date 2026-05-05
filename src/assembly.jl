@@ -666,9 +666,7 @@ function _diagonal_physical!(result::AbstractVector{T}, plan::AssemblyPlan{D,T},
 end
 
 function _assemble_reduced_operator_matrix(plan::AssemblyPlan{D,T},
-                                           scratch::_OperatorScratch{T}) where {
-                                                                                 D,
-                                                                                 T<:AbstractFloat}
+                                           scratch::_OperatorScratch{T}) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
   map = _reduced_map(plan)
   result = zeros(T, reduced_dof_count(map), reduced_dof_count(map))
@@ -1809,8 +1807,8 @@ end
 end
 
 function _matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
-                       map::_ReducedOperatorMap{T}, batches::Vector{_KernelBatch}, items,
-                       operators, matrix_hook) where {T<:AbstractFloat}
+                       map::_ReducedOperatorMap{T}, batches::Vector{_KernelBatch}, items, operators,
+                       matrix_hook) where {T<:AbstractFloat}
   (isempty(batches) || isempty(operators)) && return nothing
 
   for kernel_batch in batches
@@ -1829,9 +1827,8 @@ function _matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
 end
 
 function _boundary_matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
-                                map::_ReducedOperatorMap{T},
-                                batches::Vector{_FilteredKernelBatch}, faces,
-                                operators) where {T<:AbstractFloat}
+                                map::_ReducedOperatorMap{T}, batches::Vector{_FilteredKernelBatch},
+                                faces, operators) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for kernel_batch in batches
@@ -1855,9 +1852,8 @@ function _boundary_matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMa
 end
 
 function _surface_matrix_pass!(scratch::_OperatorScratch{T}, result::AbstractMatrix{T},
-                               map::_ReducedOperatorMap{T},
-                               batches::Vector{_FilteredKernelBatch}, surfaces,
-                               operators) where {T<:AbstractFloat}
+                               map::_ReducedOperatorMap{T}, batches::Vector{_FilteredKernelBatch},
+                               surfaces, operators) where {T<:AbstractFloat}
   isempty(batches) && return nothing
 
   for kernel_batch in batches
@@ -2117,8 +2113,7 @@ function _scatter_local_diagonal!(result::AbstractVector{T}, item::_AssemblyValu
   return nothing
 end
 
-function _scatter_local_matrix_reduced!(result::AbstractMatrix{T},
-                                        map::_ReducedOperatorMap{T},
+function _scatter_local_matrix_reduced!(result::AbstractMatrix{T}, map::_ReducedOperatorMap{T},
                                         item::_AssemblyValues,
                                         local_matrix::AbstractMatrix{T}) where {T<:AbstractFloat}
   tolerance = 1000 * eps(T)
@@ -2144,8 +2139,7 @@ function _scatter_local_matrix_reduced!(result::AbstractMatrix{T},
   return result
 end
 
-function _scatter_full_matrix_entry_reduced!(result::AbstractMatrix{T},
-                                             map::_ReducedOperatorMap{T},
+function _scatter_full_matrix_entry_reduced!(result::AbstractMatrix{T}, map::_ReducedOperatorMap{T},
                                              full_row::Int, full_column::Int,
                                              value::T) where {T<:AbstractFloat}
   iszero(value) && return result

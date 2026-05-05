@@ -45,14 +45,12 @@ end
 
 @testset "Geometric multigrid" begin
   dg_problem, dg_field = _mg_identity_problem(continuity=:dg, degree=3)
-  dg_state = solve(dg_problem;
-                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+  dg_state = solve(dg_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   @test coefficients(dg_state) ≈ ones(field_dof_count(dg_field))
 
   cg_problem, cg_field = _mg_identity_problem(continuity=:cg, degree=3)
   add_constraint!(cg_problem, Dirichlet(cg_field, BoundaryFace(1, LOWER), 2.0))
-  cg_state = solve(cg_problem;
-                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+  cg_state = solve(cg_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   @test first(coefficients(cg_state)) ≈ 2.0
   @test coefficients(cg_state)[2:end] ≈ ones(field_dof_count(cg_field) - 1)
 
@@ -69,20 +67,18 @@ end
   add_cell_linear!(weak_problem, weak_field) do q, v
     value(v)
   end
-  weak_hierarchy = Grico._compile_geometric_multigrid(weak_problem, GeometricMultigridPreconditioner())
+  weak_hierarchy = Grico._compile_geometric_multigrid(weak_problem,
+                                                      GeometricMultigridPreconditioner())
   @test weak_hierarchy.coarse_solver isa Grico._DenseCholeskyCoarseSolver
-  weak_gmg = solve(weak_problem;
-                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
-  weak_cg = solve(compile(weak_problem);
-                  solver=CGSolver(preconditioner=JacobiPreconditioner()),
+  weak_gmg = solve(weak_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+  weak_cg = solve(compile(weak_problem); solver=CGSolver(preconditioner=JacobiPreconditioner()),
                   relative_tolerance=1.0e-12)
   @test coefficients(weak_gmg) ≈ coefficients(weak_cg) atol = 1.0e-8
   @test_throws ArgumentError solve(compile(weak_problem);
                                    solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
 
   nonsym_domain = Domain((0.0,), (1.0,), (2,))
-  nonsym_space = HpSpace(nonsym_domain,
-                         SpaceOptions(degree=UniformDegree(3), continuity=:dg))
+  nonsym_space = HpSpace(nonsym_domain, SpaceOptions(degree=UniformDegree(3), continuity=:dg))
   nonsym_field = ScalarField(nonsym_space; name=:u)
   nonsym_problem = AffineProblem(nonsym_field; operator_class=NonsymmetricOperator())
   add_cell_bilinear!(nonsym_problem, nonsym_field, nonsym_field) do q, v, w
@@ -93,8 +89,7 @@ end
   end
   nonsym_plan = compile(nonsym_problem)
   nonsym_workspace = Grico._ReducedOperatorWorkspace(nonsym_plan)
-  nonsym_matrix = Grico._assemble_reduced_operator_matrix(nonsym_plan,
-                                                          nonsym_workspace.scratch)
+  nonsym_matrix = Grico._assemble_reduced_operator_matrix(nonsym_plan, nonsym_workspace.scratch)
   nonsym_rhs = rhs(nonsym_plan)
   nonsym_hierarchy = Grico._compile_geometric_multigrid(nonsym_problem,
                                                         GeometricMultigridPreconditioner())

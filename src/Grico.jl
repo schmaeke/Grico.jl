@@ -196,8 +196,8 @@ export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_si
 
 include("weakforms.jl")
 export add_boundary_bilinear!, add_boundary_linear!, add_cell_bilinear!, add_cell_linear!,
-       add_interface_bilinear!, add_interface_linear!, add_surface_bilinear!,
-       add_surface_linear!, avg, component, grad, inner, ∇, ⋅
+       add_interface_bilinear!, add_interface_linear!, add_surface_bilinear!, add_surface_linear!,
+       avg, component, grad, inner, ∇, ⋅
 
 include("plans.jl")
 export AssemblyPlan, compile
@@ -207,8 +207,7 @@ export OperatorWorkspace, ResidualWorkspace, apply, apply!, residual, residual!,
        tangent_apply, tangent_apply!
 
 include("solve.jl")
-export AutoLinearSolver, CGSolver, FGMRESSolver, IdentityPreconditioner, JacobiPreconditioner,
-       solve
+export AutoLinearSolver, CGSolver, FGMRESSolver, IdentityPreconditioner, JacobiPreconditioner, solve
 public AbstractLinearSolver, AbstractPreconditioner, default_tangent_linear_solve
 
 include("multigrid.jl")

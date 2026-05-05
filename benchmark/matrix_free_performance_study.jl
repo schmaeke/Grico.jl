@@ -420,8 +420,7 @@ function _counting_affine_linear_solve(plan::AssemblyPlan{D,T}, reduced_rhs::Abs
                                        maxiter=max(1_000, 2 * length(reduced_rhs)),
                                        initial_solution=nothing,
                                        counter=Ref(0)) where {D,T<:AbstractFloat}
-  operator = Grico._CountingReducedOperator(Grico._ReducedAffineOperator(plan, workspace),
-                                            counter)
+  operator = Grico._CountingReducedOperator(Grico._ReducedAffineOperator(plan, workspace), counter)
   policy = preconditioner === nothing ? IdentityPreconditioner() : preconditioner
   compiled_preconditioner = Grico._compile_preconditioner(policy, operator)
   return Grico._cg_solve(operator, reduced_rhs, compiled_preconditioner;
@@ -531,8 +530,7 @@ function _measure_affine_case!(rows, config, repetitions::Int, local_repetitions
     solve_workspace = Grico._ReducedOperatorWorkspace(plan)
     solve_rhs = zeros(T, Grico.reduced_dof_count(plan))
     Grico._reduced_rhs!(solve_rhs, plan, solve_workspace)
-    solve_values = _counting_affine_linear_solve(plan, solve_rhs;
-                                                 workspace=solve_workspace,
+    solve_values = _counting_affine_linear_solve(plan, solve_rhs; workspace=solve_workspace,
                                                  preconditioner=preconditioner,
                                                  maxiter=_affine_maxiter(config,
                                                                          length(reduced_values)),

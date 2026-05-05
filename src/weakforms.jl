@@ -130,8 +130,7 @@ end
 Add a boundary-face bilinear weak form to an affine problem.
 """
 function add_boundary_bilinear!(problem::AffineProblem, boundary::BoundaryFace,
-                                test_field::AbstractField, trial_field::AbstractField,
-                                form)
+                                test_field::AbstractField, trial_field::AbstractField, form)
   data = _problem_data(problem)
   _check_problem_field(data.fields, test_field, "boundary bilinear test")
   _check_problem_field(data.fields, trial_field, "boundary bilinear trial")
@@ -178,9 +177,8 @@ function add_surface_bilinear!(problem::AffineProblem, test_field::AbstractField
   return problem
 end
 
-function add_surface_bilinear!(problem::AffineProblem, tag::Symbol,
-                               test_field::AbstractField, trial_field::AbstractField,
-                               form)
+function add_surface_bilinear!(problem::AffineProblem, tag::Symbol, test_field::AbstractField,
+                               trial_field::AbstractField, form)
   data = _problem_data(problem)
   _check_problem_field(data.fields, test_field, "surface bilinear test")
   _check_problem_field(data.fields, trial_field, "surface bilinear trial")
@@ -193,8 +191,8 @@ function add_surface_bilinear!(form, problem::AffineProblem, test_field::Abstrac
   return add_surface_bilinear!(problem, test_field, trial_field, form)
 end
 
-function add_surface_bilinear!(form, problem::AffineProblem, tag::Symbol,
-                               test_field::AbstractField, trial_field::AbstractField)
+function add_surface_bilinear!(form, problem::AffineProblem, tag::Symbol, test_field::AbstractField,
+                               trial_field::AbstractField)
   return add_surface_bilinear!(problem, tag, test_field, trial_field, form)
 end
 
@@ -211,8 +209,7 @@ function add_surface_linear!(problem::AffineProblem, test_field::AbstractField, 
   return problem
 end
 
-function add_surface_linear!(problem::AffineProblem, tag::Symbol, test_field::AbstractField,
-                             form)
+function add_surface_linear!(problem::AffineProblem, tag::Symbol, test_field::AbstractField, form)
   data = _problem_data(problem)
   _check_problem_field(data.fields, test_field, "surface linear test")
   add_surface!(problem, tag, _SurfaceLinearForm(form, test_field))
@@ -223,8 +220,7 @@ function add_surface_linear!(form, problem::AffineProblem, test_field::AbstractF
   return add_surface_linear!(problem, test_field, form)
 end
 
-function add_surface_linear!(form, problem::AffineProblem, tag::Symbol,
-                             test_field::AbstractField)
+function add_surface_linear!(form, problem::AffineProblem, tag::Symbol, test_field::AbstractField)
   return add_surface_linear!(problem, tag, test_field, form)
 end
 
@@ -273,14 +269,16 @@ end
 @inline weight(q::_WeakQuadraturePoint) = weight(q.values, q.point_index)
 @inline coordinate(q::_WeakQuadraturePoint, axis::Integer) = point(q)[axis]
 @inline normal(q::_WeakQuadraturePoint) = normal(q.values, q.point_index)
-@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField) =
-  ntuple(axis -> cell_size(field_space(field).domain, q.values.leaf, axis),
-         dimension(field_space(field)))
-@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField, axis::Integer) =
-  cell_size(field_space(field).domain, q.values.leaf, axis)
+@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField) = ntuple(axis -> cell_size(field_space(field).domain,
+                                                                                            q.values.leaf,
+                                                                                            axis),
+                                                                          dimension(field_space(field)))
+@inline cell_size(q::_WeakQuadraturePoint, field::AbstractField, axis::Integer) = cell_size(field_space(field).domain,
+                                                                                            q.values.leaf,
+                                                                                            axis)
 
-@inline value(basis::_WeakBasisFunction) =
-  shape_value(basis.values, basis.field, basis.point_index, basis.mode_index)
+@inline value(basis::_WeakBasisFunction) = shape_value(basis.values, basis.field, basis.point_index,
+                                                       basis.mode_index)
 
 @inline function value(basis::_WeakTraceBasisFunction)
   active_value = _trace_shape_value(basis)
@@ -321,12 +319,9 @@ end
 
 @inline inner(a::Number, b::Number) = a * b
 
-@inline function inner(a::NTuple{N,<:Number}, b::NTuple{N,<:Number}) where {N}
-  return _tuple_inner(a, b, Val(N))
-end
+@inline inner(a::NTuple{N,<:Number}, b::NTuple{N,<:Number}) where {N} = _tuple_inner(a, b, Val(N))
 
-@inline function _tuple_inner(a::NTuple{N,<:Number}, b::NTuple{N,<:Number},
-                             ::Val{N}) where {N}
+@inline function _tuple_inner(a::NTuple{N,<:Number}, b::NTuple{N,<:Number}, ::Val{N}) where {N}
   result = zero(a[1] * b[1])
 
   for index in 1:N
@@ -368,53 +363,53 @@ end
   return shape_normal_gradient(values, basis.field, basis.point_index, basis.mode_index)
 end
 
-function cell_matrix!(local_matrix::AbstractMatrix{T}, operator::_CellBilinearForm,
-                      values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function cell_matrix!(local_matrix::AbstractMatrix{T}, operator::_CellBilinearForm, values,
+                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_matrix!(local_matrix, operator, values)
   return local_matrix
 end
 
-function face_matrix!(local_matrix::AbstractMatrix{T}, operator::_BoundaryBilinearForm,
-                      values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function face_matrix!(local_matrix::AbstractMatrix{T}, operator::_BoundaryBilinearForm, values,
+                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_matrix!(local_matrix, operator, values)
   return local_matrix
 end
 
-function surface_matrix!(local_matrix::AbstractMatrix{T}, operator::_SurfaceBilinearForm,
-                         values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function surface_matrix!(local_matrix::AbstractMatrix{T}, operator::_SurfaceBilinearForm, values,
+                         scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_matrix!(local_matrix, operator, values)
   return local_matrix
 end
 
-function cell_apply!(local_result::AbstractVector{T}, operator::_CellBilinearForm,
-                     values, local_coefficients::AbstractVector{T},
+function cell_apply!(local_result::AbstractVector{T}, operator::_CellBilinearForm, values,
+                     local_coefficients::AbstractVector{T},
                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
   return nothing
 end
 
-function face_apply!(local_result::AbstractVector{T}, operator::_BoundaryBilinearForm,
-                     values, local_coefficients::AbstractVector{T},
+function face_apply!(local_result::AbstractVector{T}, operator::_BoundaryBilinearForm, values,
+                     local_coefficients::AbstractVector{T},
                      scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
   return nothing
 end
 
-function surface_apply!(local_result::AbstractVector{T}, operator::_SurfaceBilinearForm,
-                        values, local_coefficients::AbstractVector{T},
+function surface_apply!(local_result::AbstractVector{T}, operator::_SurfaceBilinearForm, values,
+                        local_coefficients::AbstractVector{T},
                         scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_apply!(local_result, operator, values, local_coefficients)
   return nothing
 end
 
-function cell_diagonal!(local_diagonal::AbstractVector{T}, operator::_CellBilinearForm,
-                        values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function cell_diagonal!(local_diagonal::AbstractVector{T}, operator::_CellBilinearForm, values,
+                        scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_diagonal!(local_diagonal, operator, values)
   return nothing
 end
 
-function face_diagonal!(local_diagonal::AbstractVector{T}, operator::_BoundaryBilinearForm,
-                        values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function face_diagonal!(local_diagonal::AbstractVector{T}, operator::_BoundaryBilinearForm, values,
+                        scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_cell_bilinear_diagonal!(local_diagonal, operator, values)
   return nothing
 end
@@ -449,16 +444,15 @@ function interface_matrix!(local_matrix::AbstractMatrix{T}, operator::_Interface
   return local_matrix
 end
 
-function interface_apply!(local_result::AbstractVector{T}, operator::_InterfaceBilinearForm,
-                          values, local_coefficients::AbstractVector{T},
+function interface_apply!(local_result::AbstractVector{T}, operator::_InterfaceBilinearForm, values,
+                          local_coefficients::AbstractVector{T},
                           scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_interface_bilinear_apply!(local_result, operator, values, local_coefficients)
   return nothing
 end
 
-function interface_diagonal!(local_diagonal::AbstractVector{T},
-                             operator::_InterfaceBilinearForm, values,
-                             scratch::KernelScratch{T}) where {T<:AbstractFloat}
+function interface_diagonal!(local_diagonal::AbstractVector{T}, operator::_InterfaceBilinearForm,
+                             values, scratch::KernelScratch{T}) where {T<:AbstractFloat}
   _accumulate_interface_bilinear_diagonal!(local_diagonal, operator, values)
   return nothing
 end
@@ -500,10 +494,8 @@ function _accumulate_cell_bilinear_matrix!(local_matrix::AbstractMatrix{T},
 end
 
 function _accumulate_cell_bilinear_apply!(local_result::AbstractVector{T},
-                                          operator::_LocalBilinearForm,
-                                          values,
-                                          local_coefficients::AbstractVector{T}) where {
-                                                                                         T<:AbstractFloat}
+                                          operator::_LocalBilinearForm, values,
+                                          local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
   test_field = operator.test_field
   trial_field = operator.trial_field
 
@@ -567,8 +559,7 @@ function _accumulate_cell_bilinear_diagonal!(local_diagonal::AbstractVector{T},
   return local_diagonal
 end
 
-function _accumulate_cell_linear_rhs!(local_rhs::AbstractVector{T},
-                                      operator::_LocalLinearForm,
+function _accumulate_cell_linear_rhs!(local_rhs::AbstractVector{T}, operator::_LocalLinearForm,
                                       values) where {T<:AbstractFloat}
   test_field = operator.test_field
 
@@ -615,9 +606,8 @@ function _accumulate_interface_bilinear_matrix!(local_matrix::AbstractMatrix{T},
             for trial_component in 1:component_count(trial_field)
               for trial_mode in 1:local_mode_count(trial_values, trial_field)
                 column = local_dof_index(trial_values, trial_field, trial_component, trial_mode)
-                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field,
-                                                point_index, trial_component, trial_mode,
-                                                trial_side)
+                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field, point_index,
+                                                trial_component, trial_mode, trial_side)
                 local_matrix[row, column] += weighted * operator.form(q, test, trial)
               end
             end
@@ -631,10 +621,8 @@ function _accumulate_interface_bilinear_matrix!(local_matrix::AbstractMatrix{T},
 end
 
 function _accumulate_interface_bilinear_apply!(local_result::AbstractVector{T},
-                                               operator::_InterfaceBilinearForm,
-                                               values,
-                                               local_coefficients::AbstractVector{T}) where {
-                                                                                            T<:AbstractFloat}
+                                               operator::_InterfaceBilinearForm, values,
+                                               local_coefficients::AbstractVector{T}) where {T<:AbstractFloat}
   test_field = operator.test_field
   trial_field = operator.trial_field
   minus_values = minus(values)
@@ -662,9 +650,8 @@ function _accumulate_interface_bilinear_apply!(local_result::AbstractVector{T},
                 column = local_dof_index(trial_values, trial_field, trial_component, trial_mode)
                 coefficient = local_coefficients[column]
                 coefficient == zero(T) && continue
-                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field,
-                                                point_index, trial_component, trial_mode,
-                                                trial_side)
+                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field, point_index,
+                                                trial_component, trial_mode, trial_side)
                 value_sum += coefficient * operator.form(q, test, trial)
               end
             end
@@ -707,9 +694,8 @@ function _accumulate_interface_bilinear_diagonal!(local_diagonal::AbstractVector
               for trial_mode in 1:local_mode_count(trial_values, trial_field)
                 column = local_dof_index(trial_values, trial_field, trial_component, trial_mode)
                 row == column || continue
-                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field,
-                                                point_index, trial_component, trial_mode,
-                                                trial_side)
+                trial = _WeakTraceBasisFunction(minus_values, plus_values, trial_field, point_index,
+                                                trial_component, trial_mode, trial_side)
                 local_diagonal[row] += weighted * operator.form(q, test, trial)
               end
             end

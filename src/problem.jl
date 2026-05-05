@@ -242,8 +242,8 @@ mutable struct _ProblemData
   mean_constraints::Vector{MeanValue}
 
   function _ProblemData(fields::Vector{AbstractField}, operator_class::AbstractOperatorClass)
-    return new(_checked_problem_fields(fields), operator_class, Any[], _BoundaryContribution[], Any[],
-               _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
+    return new(_checked_problem_fields(fields), operator_class, Any[], _BoundaryContribution[],
+               Any[], _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
                Dirichlet[], MeanValue[])
   end
 end

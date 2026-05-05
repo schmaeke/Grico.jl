@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 
 const PROJECT_ROOT = @__DIR__
-const SKIP_DIRECTORIES = Set([".git", "old", "tmp", "output"])
+const SKIP_DIRECTORIES = Set([".git", "old", "tmp", "output", "refs"])
 const _FORMATTER_ERROR = Ref{Any}(nothing)
 const _FORMATTER_AVAILABLE = try
   @eval using JuliaFormatter

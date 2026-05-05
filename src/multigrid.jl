@@ -43,14 +43,14 @@ struct GeometricMultigridPreconditioner <: AbstractPreconditioner
 end
 
 function GeometricMultigridPreconditioner(; min_degree::Integer=1, max_levels::Integer=16,
-                                  p_sequence::Symbol=:bisect,
-                                  pre_smoothing_steps::Integer=2,
-                                  post_smoothing_steps::Integer=2,
-                                  smoother_damping::Real=0.8,
-                                  coarse_relative_tolerance::Real=1.0e-12,
-                                  coarse_absolute_tolerance::Real=0.0,
-                                  coarse_maxiter::Integer=10_000,
-                                  coarse_direct_dof_limit::Integer=512)
+                                          p_sequence::Symbol=:bisect,
+                                          pre_smoothing_steps::Integer=2,
+                                          post_smoothing_steps::Integer=2,
+                                          smoother_damping::Real=0.8,
+                                          coarse_relative_tolerance::Real=1.0e-12,
+                                          coarse_absolute_tolerance::Real=0.0,
+                                          coarse_maxiter::Integer=10_000,
+                                          coarse_direct_dof_limit::Integer=512)
   checked_min_degree = _checked_nonnegative(min_degree, "min_degree")
   checked_max_levels = _checked_positive(max_levels, "max_levels")
   p_sequence in (:bisect, :decrease_by_one, :go_to_one) ||
@@ -64,11 +64,11 @@ function GeometricMultigridPreconditioner(; min_degree::Integer=1, max_levels::I
   coarse_rtol >= 0 || throw(ArgumentError("coarse_relative_tolerance must be nonnegative"))
   coarse_atol >= 0 || throw(ArgumentError("coarse_absolute_tolerance must be nonnegative"))
   checked_coarse_maxiter = _checked_positive(coarse_maxiter, "coarse_maxiter")
-  checked_coarse_direct = _checked_nonnegative(coarse_direct_dof_limit,
-                                               "coarse_direct_dof_limit")
+  checked_coarse_direct = _checked_nonnegative(coarse_direct_dof_limit, "coarse_direct_dof_limit")
   return GeometricMultigridPreconditioner(checked_min_degree, checked_max_levels, p_sequence,
-                                  checked_pre, checked_post, damping, coarse_rtol,
-                                  coarse_atol, checked_coarse_maxiter, checked_coarse_direct)
+                                          checked_pre, checked_post, damping, coarse_rtol,
+                                          coarse_atol, checked_coarse_maxiter,
+                                          checked_coarse_direct)
 end
 
 struct _MultigridLevel{T<:AbstractFloat,P<:AssemblyPlan,W<:_ReducedOperatorWorkspace{T},
@@ -116,8 +116,7 @@ end
 
 struct _KrylovCoarseSolver end
 
-struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,
-                                                 OC<:AbstractOperatorClass} <:
+struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,OC<:AbstractOperatorClass} <:
        _CompiledPreconditioner{T}
   levels::Vector{_MultigridLevel{T}}
   transfers::Vector{_ReducedTransfer{T}}
@@ -135,17 +134,15 @@ end
 
 function _solve_affine_problem(problem::AffineProblem, ::AutoLinearSolver; kwargs...)
   preconditioner = _default_affine_preconditioner(problem)
-  solver = _is_spd_operator_class(operator_class(problem)) ?
-           CGSolver(; preconditioner) :
+  solver = _is_spd_operator_class(operator_class(problem)) ? CGSolver(; preconditioner) :
            FGMRESSolver(; preconditioner)
   return _solve_affine_problem(problem, solver; kwargs...)
 end
 
 function _solve_affine_problem(problem::AffineProblem,
                                solver::CGSolver{<:GeometricMultigridPreconditioner};
-                               relative_tolerance=sqrt(eps(Float64)),
-                               absolute_tolerance=0.0, maxiter=nothing,
-                               initial_solution=nothing)
+                               relative_tolerance=sqrt(eps(Float64)), absolute_tolerance=0.0,
+                               maxiter=nothing, initial_solution=nothing)
   hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
   finest = hierarchy.levels[end]
   T = eltype(finest.residual)
@@ -154,28 +151,24 @@ function _solve_affine_problem(problem::AffineProblem,
   outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) : maxiter
   reduced_values = _cg_solve(finest.operator, rhs, hierarchy;
                              relative_tolerance=T(relative_tolerance),
-                             absolute_tolerance=T(absolute_tolerance),
-                             maxiter=outer_maxiter,
+                             absolute_tolerance=T(absolute_tolerance), maxiter=outer_maxiter,
                              initial_solution=initial_solution)
   return _state_from_reduced_result(finest.plan, reduced_values)
 end
 
 function _solve_affine_problem(problem::AffineProblem,
                                solver::FGMRESSolver{<:GeometricMultigridPreconditioner};
-                               relative_tolerance=sqrt(eps(Float64)),
-                               absolute_tolerance=0.0, maxiter=nothing,
-                               initial_solution=nothing)
+                               relative_tolerance=sqrt(eps(Float64)), absolute_tolerance=0.0,
+                               maxiter=nothing, initial_solution=nothing)
   hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
   finest = hierarchy.levels[end]
   T = eltype(finest.residual)
   rhs = zeros(T, reduced_dof_count(finest.plan))
   _reduced_rhs!(rhs, finest.plan, finest.workspace)
   outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) : maxiter
-  reduced_values = _fgmres_solve(finest.operator, rhs, hierarchy;
-                                 restart=solver.restart,
+  reduced_values = _fgmres_solve(finest.operator, rhs, hierarchy; restart=solver.restart,
                                  relative_tolerance=T(relative_tolerance),
-                                 absolute_tolerance=T(absolute_tolerance),
-                                 maxiter=outer_maxiter,
+                                 absolute_tolerance=T(absolute_tolerance), maxiter=outer_maxiter,
                                  initial_solution=initial_solution)
   return _state_from_reduced_result(finest.plan, reduced_values)
 end
@@ -229,8 +222,8 @@ _has_h_coarsening_level(space::HpSpace) = !isempty(_multigrid_h_coarsening_candi
 # types. Keep this setup path behind explicit inference barriers so first-use
 # latency does not dominate every GMG solve while the V-cycle data remain typed
 # by scalar precision.
-Base.@nospecializeinfer function _compile_geometric_multigrid(
-    problem::AffineProblem, solver::GeometricMultigridPreconditioner)
+Base.@nospecializeinfer function _compile_geometric_multigrid(problem::AffineProblem,
+                                                              solver::GeometricMultigridPreconditioner)
   data = Base.inferencebarrier(_problem_data(problem))
   fine_fields = Base.inferencebarrier(Tuple(data.fields))
   fine_space = Base.inferencebarrier(_single_multigrid_space(fine_fields))
@@ -245,10 +238,9 @@ Base.@nospecializeinfer function _compile_geometric_multigrid(
                                              for level_problem in level_problems])
   levels = Base.inferencebarrier(_MultigridLevel{T}[_compile_multigrid_level(plan)
                                                     for plan in plans])
-  transfers = Base.inferencebarrier(_ReducedTransfer{T}[
-                                      _compile_multigrid_transfer(levels[index].plan,
-                                                                  levels[index+1].plan)
-                                      for index in 1:(length(levels)-1)])
+  transfers = Base.inferencebarrier(_ReducedTransfer{T}[_compile_multigrid_transfer(levels[index].plan,
+                                                                                    levels[index+1].plan)
+                                                        for index in 1:(length(levels)-1)])
   coarse_solver = Base.inferencebarrier(_compile_coarse_solver(levels[1], solver,
                                                                operator_class(problem)))
   level_rhs = [zeros(T, reduced_dof_count(level.plan)) for level in levels]
@@ -268,12 +260,10 @@ function _compile_multigrid_level(plan::AssemblyPlan{D,T}) where {D,T<:AbstractF
   operator = _ReducedAffineOperator(plan, workspace)
   jacobi = _compile_preconditioner(JacobiPreconditioner(), operator)
   n = reduced_dof_count(plan)
-  return _MultigridLevel(plan, workspace, operator, jacobi, zeros(T, n), zeros(T, n),
-                         zeros(T, n))
+  return _MultigridLevel(plan, workspace, operator, jacobi, zeros(T, n), zeros(T, n), zeros(T, n))
 end
 
-function _compile_coarse_solver(level::_MultigridLevel{T},
-                                solver::GeometricMultigridPreconditioner,
+function _compile_coarse_solver(level::_MultigridLevel{T}, solver::GeometricMultigridPreconditioner,
                                 operator_class::AbstractOperatorClass) where {T<:AbstractFloat}
   n = reduced_dof_count(level.plan)
   0 < n <= solver.coarse_direct_dof_limit || return _KrylovCoarseSolver()
@@ -358,8 +348,7 @@ end
 function _coarsened_degree_tuple(degrees::NTuple{D,Int}, continuity::NTuple{D,Symbol},
                                  min_degree::Int, sequence::Symbol) where {D}
   return ntuple(axis -> begin
-                  lower = min(degrees[axis],
-                              max(min_degree, continuity[axis] === :cg ? 1 : 0))
+                  lower = min(degrees[axis], max(min_degree, continuity[axis] === :cg ? 1 : 0))
                   _coarsened_degree(degrees[axis], lower, sequence)
                 end, D)
 end
@@ -391,13 +380,11 @@ function _space_with_degrees(source::HpSpace, active, degrees)
   return _space_with_snapshot_and_degrees(source, target_snapshot, degrees)
 end
 
-function _space_with_snapshot_and_degrees(source::HpSpace, target_snapshot::GridSnapshot,
-                                         degrees)
+function _space_with_snapshot_and_degrees(source::HpSpace, target_snapshot::GridSnapshot, degrees)
   active = target_snapshot.active_leaves
   degree_policy = StoredDegrees(domain(source), active, degrees)
   options = SpaceOptions(basis=basis_family(source), degree=degree_policy,
-                         quadrature=source.quadrature_policy,
-                         continuity=continuity_policy(source))
+                         quadrature=source.quadrature_policy, continuity=continuity_policy(source))
   return _compile_snapshot_space(domain(source), target_snapshot, options)
 end
 
@@ -422,8 +409,8 @@ function _h_coarsened_space(space::HpSpace{D}) where {D}
   end
 
   active = Int[]
-  sizehint!(active, length(source_snapshot.active_leaves) - length(child_to_parent) +
-                    length(candidates))
+  sizehint!(active,
+            length(source_snapshot.active_leaves) - length(child_to_parent) + length(candidates))
 
   for leaf in source_snapshot.active_leaves
     parent = get(child_to_parent, leaf, NONE)
@@ -479,8 +466,7 @@ function _multigrid_level_fields(fine_fields::Tuple, spaces::Vector)
   finest_index = length(spaces)
   return [level_index == finest_index ? fine_fields :
           ntuple(field_index -> _field_on_space(fine_fields[field_index], spaces[level_index]),
-                 length(fine_fields))
-          for level_index in eachindex(spaces)]
+                 length(fine_fields)) for level_index in eachindex(spaces)]
 end
 
 function _field_on_space(field::ScalarField, space::HpSpace)
@@ -535,9 +521,8 @@ function _append_field_reduced_transfer_entries!(entries::Dict{Tuple{Int,Int},T}
                                                  fine_plan::AssemblyPlan{D,T},
                                                  coarse_field::AbstractField,
                                                  fine_field::AbstractField,
-                                                 local_entries::Vector{_LocalTransferEntry{D,T}}) where {
-                                                                                                      D,
-                                                                                                      T<:AbstractFloat}
+                                                 local_entries::Vector{_LocalTransferEntry{D,T}}) where {D,
+                                                                                                         T<:AbstractFloat}
   _field_id(coarse_field) == _field_id(fine_field) ||
     throw(ArgumentError("multigrid transfer requires matching field identities"))
   component_count(coarse_field) == component_count(fine_field) ||
@@ -548,8 +533,8 @@ function _append_field_reduced_transfer_entries!(entries::Dict{Tuple{Int,Int},T}
   fine_map = _reduced_map(fine_plan)
 
   for component in 1:component_count(coarse_field)
-    coarse_offset = first(field_component_range(field_layout(coarse_plan), coarse_field,
-                                                component)) - 1
+    coarse_offset = first(field_component_range(field_layout(coarse_plan), coarse_field, component)) -
+                    1
     fine_offset = first(field_component_range(field_layout(fine_plan), fine_field, component)) - 1
     source_expansions = Dict{Tuple{Int,NTuple{D,Int}},Vector{Pair{Int,T}}}()
     target_expansions = Dict{Tuple{Int,NTuple{D,Int}},Dict{Int,T}}()
@@ -557,8 +542,8 @@ function _append_field_reduced_transfer_entries!(entries::Dict{Tuple{Int,Int},T}
     for entry in local_entries
       coarse_key = (entry.coarse_leaf, entry.coarse_mode)
       source = get!(source_expansions, coarse_key) do
-        _local_mode_reduced_expansion(coarse_map, coarse_space, coarse_offset,
-                                      entry.coarse_leaf, entry.coarse_mode)
+        _local_mode_reduced_expansion(coarse_map, coarse_space, coarse_offset, entry.coarse_leaf,
+                                      entry.coarse_mode)
       end
       target_key = (entry.fine_leaf, entry.fine_mode)
       target = get!(target_expansions, target_key) do
@@ -594,9 +579,8 @@ function _compile_local_transfer_entries(coarse_space::HpSpace{D,T},
 
   for coarse_leaf in snapshot(coarse_space).active_leaves
     for fine_leaf in _fine_leaves_under_coarse_leaf(coarse_space, fine_space, coarse_leaf)
-      matrices = ntuple(axis -> _axis_transfer_matrix!(restriction_cache, coarse_space,
-                                                       fine_space, coarse_leaf, fine_leaf, axis),
-                        D)
+      matrices = ntuple(axis -> _axis_transfer_matrix!(restriction_cache, coarse_space, fine_space,
+                                                       coarse_leaf, fine_leaf, axis), D)
 
       for coarse_mode in local_modes(coarse_space, coarse_leaf)
         for fine_mode in local_modes(fine_space, fine_leaf)
@@ -635,10 +619,8 @@ function _fine_leaves_under_coarse_leaf(coarse_space::HpSpace, fine_space::HpSpa
   return children
 end
 
-function _axis_transfer_matrix!(cache::Dict{NTuple{4,Int},Matrix{T}},
-                                coarse_space::HpSpace{D,T},
-                                fine_space::HpSpace{D,T},
-                                coarse_leaf::Int, fine_leaf::Int,
+function _axis_transfer_matrix!(cache::Dict{NTuple{4,Int},Matrix{T}}, coarse_space::HpSpace{D,T},
+                                fine_space::HpSpace{D,T}, coarse_leaf::Int, fine_leaf::Int,
                                 axis::Int) where {D,T<:AbstractFloat}
   source_degree = cell_degrees(coarse_space, coarse_leaf)[axis]
   target_degree = cell_degrees(fine_space, fine_leaf)[axis]
@@ -680,10 +662,8 @@ function _tensor_mode_transfer_coefficient(matrices::NTuple{D,Matrix{T}},
   return coefficient
 end
 
-function _local_mode_reduced_expansion(map::_ReducedOperatorMap{T},
-                                       space::HpSpace{D,T},
-                                       field_offset::Int,
-                                       leaf::Int,
+function _local_mode_reduced_expansion(map::_ReducedOperatorMap{T}, space::HpSpace{D,T},
+                                       field_offset::Int, leaf::Int,
                                        mode::NTuple{D,Int}) where {D,T<:AbstractFloat}
   compiled = _compiled_leaf(space, leaf)
   mode_index = _mode_lookup(compiled, mode)
@@ -704,10 +684,8 @@ function _local_mode_reduced_expansion(map::_ReducedOperatorMap{T},
   return Pair{Int,T}[pair for pair in expansion]
 end
 
-function _fine_mode_reduced_coordinate(fine_map::_ReducedOperatorMap{T},
-                                       fine_space::HpSpace{D,T},
-                                       field_offset::Int,
-                                       leaf::Int,
+function _fine_mode_reduced_coordinate(fine_map::_ReducedOperatorMap{T}, fine_space::HpSpace{D,T},
+                                       field_offset::Int, leaf::Int,
                                        mode::NTuple{D,Int}) where {D,T<:AbstractFloat}
   compiled = _compiled_leaf(fine_space, leaf)
   mode_index = _mode_lookup(compiled, mode)
@@ -723,8 +701,7 @@ function _fine_mode_reduced_coordinate(fine_map::_ReducedOperatorMap{T},
   return reduced_index => inv(term_coefficient)
 end
 
-function _accumulate_transfer_value!(target::Dict{K,T}, key::K, value::T) where {K,
-                                                                                 T<:AbstractFloat}
+function _accumulate_transfer_value!(target::Dict{K,T}, key::K, value::T) where {K,T<:AbstractFloat}
   iszero(value) && return target
   target[key] = get(target, key, zero(T)) + value
   return target
@@ -750,8 +727,7 @@ function _accumulate_transfer_entry!(entries::Dict{Tuple{Int,Int},T}, coarse_dof
   return entries
 end
 
-function _compile_preconditioner(::GeometricMultigridPreconditioner,
-                                 ::_ReducedAffineOperator)
+function _compile_preconditioner(::GeometricMultigridPreconditioner, ::_ReducedAffineOperator)
   throw(ArgumentError("GeometricMultigridPreconditioner requires the original AffineProblem so every level can rediscretize the weak form; call solve(problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner())) for SPD systems or solve(problem; solver=FGMRESSolver(preconditioner=GeometricMultigridPreconditioner())) for general systems"))
 end
 
@@ -810,17 +786,13 @@ function _coarse_solve!(solution::AbstractVector{T}, ::_KrylovCoarseSolver,
                         level::_MultigridLevel{T}, rhs::AbstractVector{T},
                         mg::_CompiledGeometricMultigridPreconditioner{T}) where {T<:AbstractFloat}
   coarse_solution = if _is_spd_operator_class(mg.operator_class)
-    _cg_solve(level.operator, rhs, level.jacobi;
-              relative_tolerance=mg.coarse_relative_tolerance,
-              absolute_tolerance=mg.coarse_absolute_tolerance,
-              maxiter=mg.coarse_maxiter,
+    _cg_solve(level.operator, rhs, level.jacobi; relative_tolerance=mg.coarse_relative_tolerance,
+              absolute_tolerance=mg.coarse_absolute_tolerance, maxiter=mg.coarse_maxiter,
               initial_solution=nothing)
   else
-    _fgmres_solve(level.operator, rhs, level.jacobi;
-                  restart=max(1, min(30, length(rhs))),
+    _fgmres_solve(level.operator, rhs, level.jacobi; restart=max(1, min(30, length(rhs))),
                   relative_tolerance=mg.coarse_relative_tolerance,
-                  absolute_tolerance=mg.coarse_absolute_tolerance,
-                  maxiter=mg.coarse_maxiter,
+                  absolute_tolerance=mg.coarse_absolute_tolerance, maxiter=mg.coarse_maxiter,
                   initial_solution=nothing)
   end
   copyto!(solution, coarse_solution)
@@ -842,16 +814,15 @@ function _smooth_jacobi!(solution::AbstractVector{T}, level::_MultigridLevel{T},
   return solution
 end
 
-function _prolongate_reduced_add!(fine_reduced::AbstractVector{T},
-                                  transfer::_ReducedTransfer{T},
+function _prolongate_reduced_add!(fine_reduced::AbstractVector{T}, transfer::_ReducedTransfer{T},
                                   coarse_reduced::AbstractVector{T}) where {T<:AbstractFloat}
   _require_length(coarse_reduced, reduced_dof_count(transfer.coarse_plan),
                   "coarse multigrid vector")
   _require_length(fine_reduced, reduced_dof_count(transfer.fine_plan), "fine multigrid vector")
 
   @inbounds for index in eachindex(transfer.coefficients)
-    fine_reduced[transfer.fine_indices[index]] +=
-      transfer.coefficients[index] * coarse_reduced[transfer.coarse_indices[index]]
+    fine_reduced[transfer.fine_indices[index]] += transfer.coefficients[index] *
+                                                  coarse_reduced[transfer.coarse_indices[index]]
   end
 
   return fine_reduced
@@ -865,8 +836,8 @@ function _restrict_reduced!(coarse_reduced::AbstractVector{T}, transfer::_Reduce
   fill!(coarse_reduced, zero(T))
 
   @inbounds for index in eachindex(transfer.coefficients)
-    coarse_reduced[transfer.coarse_indices[index]] +=
-      transfer.coefficients[index] * fine_reduced[transfer.fine_indices[index]]
+    coarse_reduced[transfer.coarse_indices[index]] += transfer.coefficients[index] *
+                                                      fine_reduced[transfer.fine_indices[index]]
   end
 
   return coarse_reduced

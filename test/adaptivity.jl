@@ -296,10 +296,11 @@ end
                                    operator = Grico._ReducedAffineOperator(A, kwargs[:workspace])
                                    solver = Grico.CGSolver(preconditioner=Grico.JacobiPreconditioner())
                                    return Grico._solve_reduced_system(solver, operator, b;
-                                                                       relative_tolerance=sqrt(eps(T)),
-                                                                       absolute_tolerance=zero(T),
-                                                                       maxiter=max(1_000, 2 * length(b)),
-                                                                       initial_solution=nothing)
+                                                                      relative_tolerance=sqrt(eps(T)),
+                                                                      absolute_tolerance=zero(T),
+                                                                      maxiter=max(1_000,
+                                                                                  2 * length(b)),
+                                                                      initial_solution=nothing)
                                  end
                                  return A \ b
                                end)
