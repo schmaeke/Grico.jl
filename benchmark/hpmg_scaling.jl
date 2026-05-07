@@ -17,6 +17,21 @@ using Printf
 
 const HPMG_DEFAULT_OUTPUT = joinpath(@__DIR__, "output", "hpmg_scaling.csv")
 
+struct HpmgLaplaceMass end
+struct HpmgNonsymmetricLaplaceMass end
+
+function Grico.cell_accumulate(::HpmgLaplaceMass, q, trial, test_component)
+  return TestChannels(value(trial), gradient(trial))
+end
+
+Grico.cell_rhs_accumulate(::HpmgLaplaceMass, q, test_component) = 1.0
+
+function Grico.cell_accumulate(::HpmgNonsymmetricLaplaceMass, q, trial, test_component)
+  return TestChannels(value(trial) + 0.05 * gradient(trial)[1], gradient(trial))
+end
+
+Grico.cell_rhs_accumulate(::HpmgNonsymmetricLaplaceMass, q, test_component) = 1.0
+
 function _option(args, name, default)
   prefix = string(name, "=")
 
@@ -147,19 +162,9 @@ function _laplace_mass_problem(; dim::Int=2, depth::Int=6, degree::Int=4, nonsym
   u = ScalarField(space; name=nonsymmetric ? :w : :u)
   problem = AffineProblem(u; operator_class=nonsymmetric ? NonsymmetricOperator() : SPD())
 
-  if nonsymmetric
-    add_cell_bilinear!(problem, u, u) do q, v, w
-      inner(grad(v), grad(w)) + value(v) * value(w) + 0.05 * value(v) * grad(w)[1]
-    end
-  else
-    add_cell_bilinear!(problem, u, u) do q, v, w
-      inner(grad(v), grad(w)) + value(v) * value(w)
-    end
-  end
-
-  add_cell_linear!(problem, u) do q, v
-    value(v)
-  end
+  operator = nonsymmetric ? HpmgNonsymmetricLaplaceMass() : HpmgLaplaceMass()
+  add_cell_accumulator!(problem, u, u, operator)
+  add_cell_accumulator!(problem, u, operator)
 
   return problem
 end

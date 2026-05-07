@@ -14,6 +14,14 @@ using Printf
 
 const DEEP_HP_DEFAULT_OUTPUT = joinpath(@__DIR__, "output", "deep_hp_scaling.csv")
 
+struct DeepHpLaplaceMass end
+
+function Grico.cell_accumulate(::DeepHpLaplaceMass, q, trial, test_component)
+  return TestChannels(value(trial), gradient(trial))
+end
+
+Grico.cell_rhs_accumulate(::DeepHpLaplaceMass, q, test_component) = 1.0
+
 function _option(args, name, default)
   prefix = string(name, "=")
 
@@ -109,12 +117,8 @@ function _deep_hp_problem(; dim::Int=2, root_cells::Int=1, depth::Int=10, degree
   u = ScalarField(space; name=:u)
   problem = AffineProblem(u; operator_class=SPD())
 
-  add_cell_bilinear!(problem, u, u) do q, v, w
-    inner(grad(v), grad(w)) + value(v) * value(w)
-  end
-  add_cell_linear!(problem, u) do q, v
-    value(v)
-  end
+  add_cell_accumulator!(problem, u, u, DeepHpLaplaceMass())
+  add_cell_accumulator!(problem, u, DeepHpLaplaceMass())
 
   return problem, u
 end

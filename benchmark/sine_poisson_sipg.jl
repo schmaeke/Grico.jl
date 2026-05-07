@@ -21,7 +21,7 @@ function sine_interface_sipg_problem(field, options)
   return problem
 end
 
-# The weak form below uses the convention [w] = w⁻ - w⁺ with the interface
+# The SIPG operator below uses the convention [w] = w⁻ - w⁺ with the interface
 # normal pointing from the minus leaf to the plus leaf.
 @inline _trace_jump_sign(is_plus::Bool) = is_plus ? -1.0 : 1.0
 

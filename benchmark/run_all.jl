@@ -23,11 +23,7 @@ const BENCHMARKS = (;
                     hpmg_scaling=(script="hpmg_scaling.jl",
                                   description="uniform hp geometric multigrid scaling"),
                     deep_hp_scaling=(script="deep_hp_scaling.jl",
-                                     description="deep locally graded hp multigrid scaling"),
-                    vector_weakforms=(script="vector_weakform_sumfactorization.jl",
-                                      description="vector-valued cell weak-form kernels"),
-                    trace_weakforms=(script="trace_weakform_sumfactorization.jl",
-                                     description="boundary, interface, and surface weak-form kernels"))
+                                     description="deep locally graded hp multigrid scaling"))
 
 const SHARED_VALUE_OPTIONS = Set(["--cycles", "--root-cells", "--degree", "--quadrature-extra",
                                   "--max-h-level", "--tolerance", "--smoothness-threshold"])
