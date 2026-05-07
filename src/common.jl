@@ -50,12 +50,14 @@ end
 # assume non-negativity, positivity, or bounds validity without repeating the
 # same checks.
 @inline function _checked_nonnegative(value::Integer, name::AbstractString)
+  value isa Bool && throw(ArgumentError("$name must be an integer, not Bool"))
   0 <= value <= typemax(Int) ||
     throw(ArgumentError("$name must be a non-negative Int-representable integer"))
   return Int(value)
 end
 
 @inline function _checked_positive(value::Integer, name::AbstractString)
+  value isa Bool && throw(ArgumentError("$name must be an integer, not Bool"))
   1 <= value <= typemax(Int) ||
     throw(ArgumentError("$name must be a positive Int-representable integer"))
   return Int(value)
@@ -66,6 +68,7 @@ end
 end
 
 @inline function _require_index(index::Integer, upper::Integer, name::AbstractString)
+  index isa Bool && throw(ArgumentError("$name must be an integer index, not Bool"))
   1 <= index <= upper || _throw_index_error(index, upper, name)
   return Int(index)
 end
@@ -79,6 +82,19 @@ end
 function _require_length(buffer::AbstractVector, length_required::Int, name::AbstractString)
   length(buffer) >= length_required ||
     throw(ArgumentError("$name must have length at least $length_required"))
+  return buffer
+end
+
+function _require_one_based_vector(buffer::AbstractVector, name::AbstractString)
+  axes(buffer, 1) == Base.OneTo(length(buffer)) ||
+    throw(ArgumentError("$name must use one-based indexing"))
+  return buffer
+end
+
+function _require_one_based_matrix(buffer::AbstractMatrix, name::AbstractString)
+  axes(buffer, 1) == Base.OneTo(size(buffer, 1)) &&
+  axes(buffer, 2) == Base.OneTo(size(buffer, 2)) ||
+    throw(ArgumentError("$name must use one-based indexing"))
   return buffer
 end
 

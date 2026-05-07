@@ -7,9 +7,10 @@ using CairoMakie
 
 function run_poisson_1d_makie_example(; cell_count=2, degree=8, sample_subdivisions=4,
                                       sample_degree=degree,
-                                      output_directory=joinpath(@__DIR__, "output"))
+                                      output_directory=joinpath(@__DIR__, "output"),
+                                      solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   domain = Domain((0.0,), (1.0,), (cell_count,))
-  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(degree)))
   u = ScalarField(space; name=:u)
 
   problem = AffineProblem(u; operator_class=SPD())
@@ -22,8 +23,7 @@ function run_poisson_1d_makie_example(; cell_count=2, degree=8, sample_subdivisi
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, LOWER), 0.0))
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 0.0))
 
-  plan = compile(problem)
-  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
+  state = solve(problem; solver)
   figure = poisson_figure(state, u; sample_subdivisions, sample_degree)
 
   mkpath(output_directory)
@@ -31,7 +31,7 @@ function run_poisson_1d_makie_example(; cell_count=2, degree=8, sample_subdivisi
   CairoMakie.save(figure_path, figure)
   println("poisson_1d_makie/driver.jl")
   println("  figure $figure_path")
-  return (; domain, space, field=u, plan, state, figure_path)
+  return (; domain, space, field=u, state, figure_path)
 end
 
 function poisson_figure(state, field; sample_subdivisions, sample_degree)

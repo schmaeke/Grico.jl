@@ -29,9 +29,8 @@ using WriteVTK
 # Directory organization:
 #
 # - `driver.jl` selects the annulus parameters and loads the mathematical pieces.
-# - `problem.jl` defines the volume Laplace form and symmetric Nitsche boundary terms.
 # - `geometry.jl` builds the polygonal circle meshes used for the embedded boundary.
-# - `problem.jl` assembles the unfitted physical-domain problem description.
+# - `problem.jl` defines the weak forms and assembles the unfitted problem.
 # - `solve_and_export.jl` solves, verifies, prints a summary, and optionally writes VTK output.
 
 # ---------------------------------------------------------------------------

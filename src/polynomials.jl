@@ -123,10 +123,10 @@ end
 Write Legendre values and/or derivatives at `x` into preallocated buffers.
 
 At least one of `values` or `derivatives` must be provided. When present, each
-buffer must have length at least `degree + 1`. The method signature also
-requires the buffers to have the same floating-point element type as `x`, so
-callers can reuse scratch storage in hot loops without hidden promotions or
-allocations.
+buffer must use one-based indexing and have length at least `degree + 1`. The
+method signature also requires the buffers to have the same floating-point
+element type as `x`, so callers can reuse scratch storage in hot loops without
+hidden promotions or allocations.
 
 The indexing convention matches [`legendre_values`](@ref): entry `n + 1`
 corresponds to polynomial degree `n`. This routine is the allocation-free core
@@ -159,8 +159,9 @@ buffers.
 
 This is the allocation-free counterpart of [`integrated_legendre_values`](@ref)
 and [`integrated_legendre_derivatives`](@ref). At least one output buffer must
-be provided, every supplied buffer must have length at least `degree + 1`, and
-the buffers must share the same floating-point element type as `x`.
+be provided, every supplied buffer must use one-based indexing and have length
+at least `degree + 1`, and the buffers must share the same floating-point
+element type as `x`.
 
 Like the nonmutating interface, the function writes the full family
 `ψ₀, …, ψ_degree` using the `n + 1 ↔ n` indexing convention.
@@ -258,14 +259,17 @@ end
   return x
 end
 
-# Buffer element types are enforced by method dispatch. Aliasing is rejected
-# because the recurrence kernels use output buffers as temporary polynomial
-# storage before writing the requested family.
+# Buffer element types are enforced by method dispatch. One-based indexing is
+# required because the recurrence kernels write degree `n` at entry `n + 1`.
+# Aliasing is rejected because those same kernels use output buffers as
+# temporary polynomial storage before writing the requested family.
 @inline function _check_polynomial_outputs(degree::Int, values::Union{Nothing,AbstractVector},
                                            derivatives::Union{Nothing,AbstractVector})
   values === nothing &&
     derivatives === nothing &&
     throw(ArgumentError("at least one output buffer is required"))
+  values === nothing || _require_one_based_vector(values, "values")
+  derivatives === nothing || _require_one_based_vector(derivatives, "derivatives")
   values === nothing || _require_length(values, degree + 1, "values")
   derivatives === nothing || _require_length(derivatives, degree + 1, "derivatives")
   values === nothing ||

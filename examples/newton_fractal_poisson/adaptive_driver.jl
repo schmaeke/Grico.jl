@@ -2,13 +2,11 @@ function _format_level_histogram(histogram)
   return join(("$(level):$(count)" for (level, count) in histogram), ",")
 end
 
-# The solver policy remains a keyword argument so large deep-tree runs can
-# replace the default matrix-free policy without changing the example setup.
-
 # Run the solve-estimate-adapt loop on a single scalar field. Each iteration
-# compiles the current mesh, solves the manufactured Poisson problem, records
-# `L²` error and refinement diagnostics, optionally writes high-order VTK
-# output, and then transfers the field descriptor to the adapted `hp` space.
+# solves the manufactured Poisson problem with the problem-level linear solver
+# API, records `L²` error and refinement diagnostics, optionally writes
+# high-order VTK output, and then transfers the field descriptor to the adapted
+# `hp` space.
 function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_steps=max_h_level,
                                             initial_degree=INITIAL_DEGREE, min_degree=MIN_DEGREE,
                                             max_degree=MAX_DEGREE,
@@ -22,7 +20,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
                                             residual_contrast=NEWTON_RESIDUAL_CONTRAST,
                                             derivative_regularization=NEWTON_DERIVATIVE_REGULARIZATION,
                                             difference_step=NEWTON_DIFFERENCE_STEP,
-                                            solver=AutoLinearSolver(),
+                                            solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()),
                                             output_directory=joinpath(@__DIR__, "output"),
                                             write_vtk=WRITE_VTK, sample_degree=EXPORT_DEGREE,
                                             print_summary=true)
@@ -39,7 +37,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
   vtk_steps = Int[]
   vtk_path = nothing
   pvd_path = nothing
-  final_plan = nothing
+  final_problem = nothing
   final_state = nothing
   final_error = NaN
 
@@ -52,9 +50,8 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
 
   for step in 0:adaptive_steps
     problem = build_newton_fractal_poisson_problem(u, context)
-    assembly_plan = compile(problem)
-    state = solve(assembly_plan; solver)
-    error_value = relative_l2_error(state, u, context.exact_solution; plan=assembly_plan,
+    state = solve(problem; solver)
+    error_value = relative_l2_error(state, u, context.exact_solution;
                                     extra_points=VERIFICATION_EXTRA_POINTS)
 
     current_space = field_space(u)
@@ -126,7 +123,7 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
       push!(vtk_steps, step)
     end
 
-    final_plan = assembly_plan
+    final_problem = problem
     final_state = state
     final_error = error_value
 
@@ -144,5 +141,5 @@ function run_newton_fractal_poisson_example(; max_h_level=MAX_H_LEVEL, adaptive_
     u = adapted_field(space_transition, u)
   end
 
-  return (; context..., u, final_plan, final_state, final_error, history, vtk_path, pvd_path)
+  return (; context..., u, final_problem, final_state, final_error, history, vtk_path, pvd_path)
 end

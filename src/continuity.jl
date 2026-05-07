@@ -685,7 +685,7 @@ end
 # prevents the elimination phase from carrying along numerical noise that should
 # be interpreted as exact cancellation.
 function _cleanup_boundary_row!(row::_ConstraintRow{T}, ::Type{T}) where {T<:AbstractFloat}
-  tolerance = _constraint_tolerance(T)
+  tolerance = _constraint_tolerance(row, T)
   index = 1
 
   while index <= length(row.variables)
@@ -1086,10 +1086,12 @@ function _dyadic_restriction_coefficient!(restriction_cache::Dict{NTuple{4,Int},
                                           source_upper::Int, target_lower::Int, target_upper::Int,
                                           source_index::Int, source_degree::Int, target_degree::Int,
                                           target_index::Int, axis::Int) where {D,T<:AbstractFloat}
-  source_index <= source_degree ||
-    throw(ArgumentError("source index must not exceed the source degree"))
-  source_degree <= target_degree ||
+  0 <= source_degree <= target_degree ||
     throw(ArgumentError("target degree must represent the source trace exactly"))
+  0 <= source_index <= source_degree ||
+    throw(ArgumentError("source index must lie in 0:source_degree"))
+  0 <= target_index <= target_degree ||
+    throw(ArgumentError("target index must lie in 0:target_degree"))
   delta, relative = _relative_interval_position(source_lower, source_upper, target_lower,
                                                 target_upper, state.finest_levels[axis])
   matrix = get!(restriction_cache, (source_degree, target_degree, delta, relative)) do
@@ -1106,12 +1108,17 @@ end
 # offset of the target inside the subdivided source interval.
 function _relative_interval_position(source_lower::Int, source_upper::Int, target_lower::Int,
                                      target_upper::Int, finest_level::Int)
+  source_lower <= target_lower && target_upper <= source_upper ||
+    throw(ArgumentError("target interval must be contained in source interval"))
   source_level, source_coord = _interval_level_and_coord(source_lower, source_upper, finest_level)
   target_level, target_coord = _interval_level_and_coord(target_lower, target_upper, finest_level)
   delta = target_level - source_level
   delta >= 0 || throw(ArgumentError("target interval must not be coarser than source interval"))
   relative_value = Int128(target_coord) - (Int128(source_coord) << delta)
-  0 <= relative_value <= typemax(Int) ||
+  subinterval_count = Int128(1) << delta
+  0 <= relative_value < subinterval_count ||
+    throw(ArgumentError("target interval must be contained in source interval"))
+  relative_value <= typemax(Int) ||
     throw(ArgumentError("relative dyadic interval offset must be Int-representable"))
   relative = Int(relative_value)
   return delta, relative
@@ -1121,9 +1128,17 @@ end
 # the common finest lattice. The interval length is always a power of two in
 # this code path, so trailing zeros identify the coarser dyadic level exactly.
 function _interval_level_and_coord(lower::Int, upper::Int, finest_level::Int)
+  finest_level >= 0 || throw(ArgumentError("finest level must be non-negative"))
+  0 <= lower < upper ||
+    throw(ArgumentError("dyadic interval bounds must be ordered and non-negative"))
   length_interval = upper - lower
-  level = finest_level - trailing_zeros(length_interval)
-  coord = lower >>> trailing_zeros(length_interval)
+  ispow2(length_interval) || throw(ArgumentError("dyadic interval length must be a power of two"))
+  shift = trailing_zeros(length_interval)
+  shift <= finest_level ||
+    throw(ArgumentError("dyadic interval is coarser than the finest lattice"))
+  lower % length_interval == 0 || throw(ArgumentError("dyadic interval lower bound is misaligned"))
+  level = finest_level - shift
+  coord = lower >>> shift
   return level, coord
 end
 
@@ -1192,8 +1207,21 @@ end
 end
 
 # Numerical tolerance used only to remove roundoff-level cancellation from sparse
-# constraint rows after accumulation and substitution.
-@inline _constraint_tolerance(::Type{T}) where {T<:AbstractFloat} = 1000 * eps(T)
+# constraint rows after accumulation and substitution. Keep this deliberately
+# close to machine precision: valid hanging restriction coefficients can be small
+# on deeply refined Float32 meshes.
+const _CONSTRAINT_TOLERANCE_EPS_FACTOR = 4
+
+function _constraint_tolerance(row::_ConstraintRow{T}, ::Type{T}) where {T<:AbstractFloat}
+  scale = zero(T)
+
+  for coefficient in row.coefficients
+    scale = max(scale, abs(coefficient))
+  end
+
+  return T(_CONSTRAINT_TOLERANCE_EPS_FACTOR) * eps(T) * max(scale, one(T))
+end
+
 # A tensor-product mode is a boundary mode if at least one one-dimensional factor
 # is an endpoint mode of the integrated Legendre basis.
 @inline _is_boundary_mode(mode) = any(index <= 1 for index in mode)

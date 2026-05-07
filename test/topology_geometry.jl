@@ -3,6 +3,15 @@ using Grico
 
 const TOPOLOGY_TOL = 1.0e-12
 
+struct _TopologyZeroBasedVector{T} <: AbstractVector{T}
+  data::Vector{T}
+end
+
+Base.size(buffer::_TopologyZeroBasedVector) = size(buffer.data)
+Base.axes(buffer::_TopologyZeroBasedVector) = (0:(length(buffer.data)-1),)
+Base.getindex(buffer::_TopologyZeroBasedVector, index::Int) = buffer.data[index+1]
+Base.setindex!(buffer::_TopologyZeroBasedVector, value, index::Int) = (buffer.data[index+1] = value)
+
 function _topology_access_allocation(grid)
   value = 0
 
@@ -102,6 +111,22 @@ end
   @test Grico.stored_cell_count(grid) == 4
   Grico.derefine!(grid, 1)
   @test Grico.check_topology(grid) === nothing
+
+  axis_block_reuse = Grico.CartesianGrid((1, 1))
+  x_first = Grico.refine!(axis_block_reuse, 1, 1)
+  Grico.derefine!(axis_block_reuse, 1)
+  y_first = Grico.refine!(axis_block_reuse, 1, 2)
+  @test y_first != x_first
+  @test Grico.stored_cell_count(axis_block_reuse) == 5
+  @test Grico.level(axis_block_reuse, y_first) == (0, 1)
+  @test Grico.level(axis_block_reuse, y_first + 1) == (0, 1)
+  @test Grico.active_leaves(axis_block_reuse) == [y_first, y_first + 1]
+  @test Grico.check_topology(axis_block_reuse) === nothing
+  Grico.derefine!(axis_block_reuse, 1)
+  @test Grico.refine!(axis_block_reuse, 1, 1) == x_first
+  Grico.derefine!(axis_block_reuse, 1)
+  @test Grico.refine!(axis_block_reuse, 1, 2) == y_first
+  @test Grico.check_topology(axis_block_reuse) === nothing
 
   nested_reuse = Grico.CartesianGrid((1,))
   child_first = Grico.refine!(nested_reuse, 1, 1)
@@ -544,4 +569,7 @@ end
                                                                          one_dimensional_grid, 1)
   @test_throws ArgumentError Grico.map_from_biunit_cube!(zeros(2), two_dimensional_geometry,
                                                          one_dimensional_grid, 1, (0.0, 0.0))
+  @test_throws ArgumentError Grico.map_from_biunit_cube!(_TopologyZeroBasedVector(zeros(2)),
+                                                         two_dimensional_geometry,
+                                                         two_dimensional_grid, 1, (0.0, 0.0))
 end

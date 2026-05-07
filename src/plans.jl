@@ -91,12 +91,14 @@ end
 struct _KernelBatch
   item_indices::Vector{Int}
   local_dof_count::Int
+  color_ranges::Vector{UnitRange{Int}}
 end
 
 struct _FilteredKernelBatch
   item_indices::Vector{Int}
   local_dof_count::Int
   operator_indices::Vector{Int}
+  color_ranges::Vector{UnitRange{Int}}
 end
 
 struct _TraversalPlan
@@ -126,8 +128,8 @@ The plan is tied to the current field layout, active-leaf set, and current
 constraint data. If the mesh, space, or problem definition changes, a new plan
 must be compiled.
 """
-struct AssemblyPlan{D,T<:AbstractFloat,CO<:Tuple,BO<:Tuple,IO<:Tuple,SO<:Tuple,I,
-                    OC<:AbstractOperatorClass,S}
+struct AssemblyPlan{D,T<:AbstractFloat,CO<:Tuple,BO<:Tuple,IO<:Tuple,SO<:Tuple,I,OC<:_OperatorClass,
+                    S}
   layout::FieldLayout{D,T}
   cell_operators::CO
   boundary_operators::BO
@@ -160,10 +162,10 @@ selected field. This is what allows the later operator layer to eliminate
 strong boundary data in a basis-agnostic way, even on hanging interfaces and
 high-order trace spaces.
 
-The returned plan is immutable in the sense that its mesh, fields, operators,
-constraints, and traversal data are fixed. Some operation-specific symbolic
-runtime structures may be compiled lazily and cached inside the plan when an
-operation such as tangent application is first requested.
+The returned plan fixes its mesh, fields, operators, constraints, traversal
+data, and reduced-space maps. Runtime workspaces are separate objects, so a
+plan can be reused for repeated evaluations without mutating its compiled
+problem data.
 """
 compile(problem::AffineProblem) = _compile_problem_description(problem, Val(:affine))
 
@@ -217,7 +219,6 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                                        compiled_mean_constraints)
   traversal_plan = _compile_traversal_plan(dimension(layout), integration, boundary_operators,
                                            interface_operators, surface_operators)
-  T = eltype(origin(field_space(layout.slots[1].field)))
   assembly_structure = _compile_assembly_structure(assembly_kind, layout, cell_operators,
                                                    boundary_operators, interface_operators,
                                                    surface_operators, integration,
@@ -229,7 +230,9 @@ function _compile_problem(fields, cell_operators, boundary_operators, interface_
                       assembly_structure)
 end
 
-# Compile serial traversal metadata for operator and nonlinear evaluation.
+# Compile traversal metadata for operator and nonlinear evaluation. Items are
+# batched by local kernel signature and then greedily colored so each color can
+# scatter directly into the global vector without write conflicts.
 function _compile_traversal_plan(dimension::Int, integration::_CompiledIntegration,
                                  boundary_operators, interface_operators, surface_operators)
   boundary_lookup = _boundary_operator_lookup(dimension, boundary_operators)
@@ -318,8 +321,14 @@ function _compile_kernel_batches(items, signature_fn)
     push!(batch_indices[batch_index], item_index)
   end
 
-  return [_KernelBatch(batch_indices[index], batch_local_dofs[index])
-          for index in eachindex(batch_indices)]
+  batches = _KernelBatch[]
+
+  for index in eachindex(batch_indices)
+    colored_indices, color_ranges = _color_item_indices(items, batch_indices[index])
+    push!(batches, _KernelBatch(colored_indices, batch_local_dofs[index], color_ranges))
+  end
+
+  return batches
 end
 
 function _compile_filtered_batches(items, signature_fn, operators_fn)
@@ -344,8 +353,74 @@ function _compile_filtered_batches(items, signature_fn, operators_fn)
     push!(batch_indices[batch_index], item_index)
   end
 
-  return [_FilteredKernelBatch(batch_indices[index], batch_local_dofs[index],
-                               batch_operator_indices[index]) for index in eachindex(batch_indices)]
+  batches = _FilteredKernelBatch[]
+
+  for index in eachindex(batch_indices)
+    colored_indices, color_ranges = _color_item_indices(items, batch_indices[index])
+    push!(batches,
+          _FilteredKernelBatch(colored_indices, batch_local_dofs[index],
+                               batch_operator_indices[index], color_ranges))
+  end
+
+  return batches
+end
+
+function _color_item_indices(items, item_indices::Vector{Int})
+  color_dofs = BitSet[]
+  color_items = Vector{Int}[]
+
+  for item_index in item_indices
+    item = @inbounds items[item_index]
+    color_index = _find_disjoint_color(color_dofs, item)
+
+    if color_index == 0
+      push!(color_dofs, BitSet())
+      push!(color_items, Int[])
+      color_index = length(color_items)
+    end
+
+    _add_item_dofs!(color_dofs[color_index], item)
+    push!(color_items[color_index], item_index)
+  end
+
+  colored_indices = Int[]
+  color_ranges = UnitRange{Int}[]
+
+  for indices in color_items
+    first_index = length(colored_indices) + 1
+    append!(colored_indices, indices)
+    push!(color_ranges, first_index:length(colored_indices))
+  end
+
+  return colored_indices, color_ranges
+end
+
+function _find_disjoint_color(color_dofs::Vector{BitSet}, item::_AssemblyValues)
+  for color_index in eachindex(color_dofs)
+    _item_dofs_are_disjoint(color_dofs[color_index], item) && return color_index
+  end
+
+  return 0
+end
+
+function _item_dofs_are_disjoint(dofs::BitSet, item::_AssemblyValues)
+  for local_dof in 1:item.local_dof_count
+    for term_index in _local_term_range(item, local_dof)
+      item.term_indices[term_index] in dofs && return false
+    end
+  end
+
+  return true
+end
+
+function _add_item_dofs!(dofs::BitSet, item::_AssemblyValues)
+  for local_dof in 1:item.local_dof_count
+    for term_index in _local_term_range(item, local_dof)
+      push!(dofs, item.term_indices[term_index])
+    end
+  end
+
+  return dofs
 end
 
 @inline function _field_kernel_signature(data::_FieldValues)
@@ -595,8 +670,6 @@ function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::Abstract
                               slot_range::UnitRange{Int}, slot_to_compact::Vector{Int},
                               item::_AssemblyValues, local_matrix::AbstractMatrix{T},
                               local_rhs::AbstractVector{T}) where {T<:AbstractFloat}
-  tolerance = 1000 * eps(T)
-
   for local_row in 1:item.local_dof_count
     rhs_value = local_rhs[local_row]
 
@@ -606,18 +679,21 @@ function _scatter_projection!(matrix_data::AbstractMatrix{T}, rhs_data::Abstract
       row = slot_to_compact[row_slot]
       row == 0 && continue
       row_coefficient = item.term_coefficients[row_term]
-      abs(rhs_value) > tolerance && (rhs_data[row] += row_coefficient * rhs_value)
+      iszero(row_coefficient) && continue
+      iszero(rhs_value) || (rhs_data[row] += row_coefficient * rhs_value)
 
       for local_col in 1:item.local_dof_count
         coefficient = local_matrix[local_row, local_col]
-        abs(coefficient) > tolerance || continue
+        iszero(coefficient) && continue
 
         for col_term in _local_term_range(item, local_col)
           col_slot = _slot_index(slot_range, item.term_indices[col_term])
           col_slot == 0 && continue
           col = slot_to_compact[col_slot]
           col == 0 && continue
-          matrix_data[row, col] += row_coefficient * coefficient * item.term_coefficients[col_term]
+          col_coefficient = item.term_coefficients[col_term]
+          iszero(col_coefficient) && continue
+          matrix_data[row, col] += row_coefficient * coefficient * col_coefficient
         end
       end
     end
@@ -651,7 +727,7 @@ end
 
 function _dirichlet_component_value(data, x, component::Int, components::Tuple{Vararg{Int}},
                                     component_total::Int, ::Type{T}) where {T<:AbstractFloat}
-  value = data isa Function ? data(x) : data
+  value = applicable(data, x) ? data(x) : data
   selected_total = length(components)
   selected_index = _selected_component_index(components, component)
 
@@ -791,11 +867,14 @@ function _face_projection_rhs!(local_rhs, operator::_DirichletProjection{F,C,G},
 end
 
 # Numerical rank tolerance for the boundary projection Gram matrix. The cutoff
-# should identify algebraic null modes of the trace basis, not discard small but
-# valid positive modes on deep hp boundary meshes.
+# is relative to the actual matrix scale. Physical boundary measures may be
+# very small, and a fixed absolute floor would turn valid trace constraints into
+# apparent null modes merely because the domain has small units.
 function _boundary_projection_rank_tolerance(::Type{T}, scale::T,
                                              dimension::Integer) where {T<:AbstractFloat}
-  return 1000 * eps(T) * max(scale, one(T)) * max(Int(dimension), 1)
+  relative_scale = abs(scale)
+  iszero(relative_scale) && return zero(T)
+  return 1000 * eps(T) * relative_scale * max(Int(dimension), 1)
 end
 
 # Convert the projected boundary system to either explicitly fixed dofs or affine
@@ -925,30 +1004,4 @@ end
 
 @inline function _field_term_range(data::_FieldValues, local_dof::Int)
   return data.term_offsets[local_dof]:(data.term_offsets[local_dof+1]-1)
-end
-
-# Interpret a scalar or vector mean target with the correct component count.
-@noinline function _throw_mean_target_conversion_error(value, ::Type{T}) where {T<:AbstractFloat}
-  throw(ArgumentError("mean target entries must be convertible to $T; got $(typeof(value))"))
-end
-
-function _mean_target_value(value, ::Type{T}) where {T<:AbstractFloat}
-  try
-    return T(value)
-  catch
-    _throw_mean_target_conversion_error(value, T)
-  end
-end
-
-function _mean_targets(target, component_total::Int, ::Type{T}) where {T<:AbstractFloat}
-  if component_total == 1
-    return (_mean_target_value(target, T),)
-  end
-
-  target isa Tuple ||
-    target isa AbstractVector ||
-    throw(ArgumentError("vector-valued mean target must be a tuple or vector"))
-  length(target) == component_total ||
-    throw(ArgumentError("mean target must match the field component count"))
-  return ntuple(index -> _mean_target_value(target[index], T), component_total)
 end

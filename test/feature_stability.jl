@@ -1,10 +1,42 @@
 using Test
 using Grico
-import Grico: default_tangent_linear_solve, implicit_surface_quadrature, sample_mesh_skeleton
+import Grico: JacobiPreconditioner, add_cell!, default_tangent_linear_solve,
+              implicit_surface_quadrature, local_dof_index, local_mode_count, point_count,
+              sample_mesh_skeleton, shape_value
 
 struct _StabilityQuadraticReaction{F,T}
   field::F
   target::T
+end
+
+struct _StabilityScaledAffine{T}
+  scale::T
+  rhs::T
+end
+
+function Grico.cell_apply!(local_result, operator::_StabilityScaledAffine, values,
+                           local_coefficients)
+  for index in eachindex(local_coefficients)
+    local_result[index] += operator.scale * local_coefficients[index]
+  end
+
+  return nothing
+end
+
+function Grico.cell_diagonal!(local_diagonal, operator::_StabilityScaledAffine, values)
+  for index in eachindex(local_diagonal)
+    local_diagonal[index] += operator.scale
+  end
+
+  return nothing
+end
+
+function Grico.cell_rhs!(local_rhs, operator::_StabilityScaledAffine, values)
+  for index in eachindex(local_rhs)
+    local_rhs[index] += operator.rhs
+  end
+
+  return nothing
 end
 
 function Grico.cell_residual!(local_residual, operator::_StabilityQuadraticReaction, values, state)
@@ -121,5 +153,36 @@ end
     _throws_argument_message(() -> default_tangent_linear_solve(plan, state, [0.0];
                                                                 preconditioner=JacobiPreconditioner()),
                              "tangent preconditioning is not implemented")
+    _throws_argument_message(() -> solve(plan; solver=FGMRESSolver(), initial_state=state),
+                             "residual solves use linear_solve")
+    _throws_argument_message(() -> solve(plan; initial_state=state,
+                                         linear_solve=(args...; kwargs...) -> [1.0, 99.0]),
+                             "Newton correction must have length 1")
+  end
+
+  @testset "Scaled Linear Solve Contracts" begin
+    domain = Domain((0.0,), (1.0,), (1,))
+    space = HpSpace(domain, SpaceOptions(degree=UniformDegree(0), continuity=:dg))
+    u = ScalarField(space; name=:u)
+
+    tiny_rhs_problem = AffineProblem(u)
+    add_cell!(tiny_rhs_problem, _StabilityScaledAffine(1.0, 1.0e-14))
+    @test only(coefficients(solve(tiny_rhs_problem))) == 1.0e-14
+
+    tiny_jacobi_problem = AffineProblem(u)
+    add_cell!(tiny_jacobi_problem, _StabilityScaledAffine(1.0e-14, 1.0e-14))
+    jacobi_state = solve(tiny_jacobi_problem;
+                         solver=CGSolver(preconditioner=JacobiPreconditioner()))
+    @test only(coefficients(jacobi_state)) ≈ 1.0
+
+    tiny_fgmres_problem = AffineProblem(u; operator_class=NonsymmetricOperator())
+    add_cell!(tiny_fgmres_problem, _StabilityScaledAffine(1.0e-14, 1.0e-14))
+    fgmres_state = solve(tiny_fgmres_problem; solver=FGMRESSolver())
+    @test only(coefficients(fgmres_state)) ≈ 1.0
+
+    _throws_argument_message(() -> solve(tiny_rhs_problem; relative_tolerance=-1.0),
+                             "relative_tolerance")
+    _throws_argument_message(() -> solve(tiny_rhs_problem; absolute_tolerance=Inf),
+                             "absolute_tolerance")
   end
 end

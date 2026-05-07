@@ -38,6 +38,8 @@ using Grico
       include("postprocess.jl")
     end
 
+    include("makie.jl")
+
     @testset "VTK" begin
       include("vtk.jl")
     end

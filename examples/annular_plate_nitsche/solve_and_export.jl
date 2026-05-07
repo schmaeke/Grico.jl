@@ -1,9 +1,10 @@
 # Human-facing solve routine for direct execution and interactive exploration.
-function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=true, kwargs...)
+function run_annular_plate_nitsche_example(;
+                                           solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()),
+                                           write_vtk=WRITE_VTK, print_summary=true, kwargs...)
   context = build_annular_plate_nitsche_context(; kwargs...)
-  plan = compile(context.problem)
-  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
-  error_value = relative_l2_error(state, context.u, context.exact_solution; plan=plan)
+  state = solve(context.problem; solver)
+  error_value = relative_l2_error(state, context.u, context.exact_solution)
   vtk_path = nothing
 
   if write_vtk
@@ -33,5 +34,5 @@ function run_annular_plate_nitsche_example(; write_vtk=WRITE_VTK, print_summary=
     @printf("  relative l2 error   : %.6e\n", error_value)
   end
 
-  return (; context..., plan, state, error_value, vtk_path)
+  return (; context..., state, error_value, vtk_path)
 end

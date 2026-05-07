@@ -53,13 +53,11 @@ function refine!(grid::CartesianGrid, cell::Integer, axis::Integer)
   return first
 end
 
-# Apply one local midpoint split without rebuilding derived topology data.
-# Batched adaptivity uses this primitive to perform several local edits before
-# one final rebuild.
+# Apply one local midpoint split before rebuilding the active-frontier data.
 function _split_leaf!(grid::CartesianGrid, checked_cell::Int, checked_axis::Int)
   _require_active_leaf(grid, checked_cell)
   child_level = _require_refinable_axis(grid, checked_cell, checked_axis)
-  first = _ensure_child_block!(grid, checked_cell)
+  first = _ensure_child_block!(grid, checked_cell, checked_axis)
 
   for child in _midpoint_child_block(first)
     retained_first = _first_child(grid, child)
@@ -73,6 +71,7 @@ function _split_leaf!(grid::CartesianGrid, checked_cell::Int, checked_axis::Int)
                                 child_offset)
   end
 
+  _activate_child_block!(grid, checked_cell, first)
   return first
 end
 
@@ -281,18 +280,41 @@ function _set_parent_split_state!(grid::CartesianGrid, checked_cell::Int, active
   return nothing
 end
 
-function _ensure_child_block!(grid::CartesianGrid, checked_cell::Int)
-  first = _first_child(grid, checked_cell)
+function _ensure_child_block!(grid::CartesianGrid, checked_cell::Int, checked_axis::Int)
+  # Child storage is persistent across derefinement. Reuse a retained block only
+  # when it represents the requested split axis; otherwise append a new retained
+  # block for this axis.
+  first = _find_child_block(grid, checked_cell, checked_axis)
+  first != NONE && return _require_reusable_child_block(grid, checked_cell, first)
+  return _append_child_block!(grid)
+end
 
-  # Child storage is persistent across derefinement. If this cell was refined
-  # before, we can reuse the existing child block instead of allocating again.
-  if first == NONE
-    first = _append_child_block!(grid)
+function _activate_child_block!(grid::CartesianGrid, checked_cell::Int, first::Int)
+  _require_child_block_owner(grid, checked_cell, first)
+  current_first = _first_child(grid, checked_cell)
+  current_first == first && return first
+
+  if current_first == NONE
     grid.first_child[checked_cell] = first
+    grid.next_child_block[first] = NONE
     return first
   end
 
-  return _require_reusable_child_block(grid, checked_cell, first)
+  previous = NONE
+  current = current_first
+
+  while current != NONE && current != first
+    previous = current
+    current = _next_child_block(grid, current)
+  end
+
+  if current == first
+    grid.next_child_block[previous] = _next_child_block(grid, first)
+  end
+
+  grid.next_child_block[first] = current_first
+  grid.first_child[checked_cell] = first
+  return first
 end
 
 function _require_child_block_owner(grid::CartesianGrid, checked_cell::Int, first::Int)

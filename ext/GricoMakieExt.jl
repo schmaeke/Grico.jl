@@ -8,6 +8,8 @@ using Makie
 # only chooses a plot primitive and converts Grico's sampled arrays to the
 # coordinate and connectivity layouts expected by Makie.
 
+const _MakieArrayData = Union{AbstractVector,AbstractMatrix}
+
 # The high-level plotting methods follow the same contract as VTK export:
 # sample a state/reference pair through Grico's backend-neutral postprocessing
 # API, then hand the sampled arrays to the small Makie adapter below.
@@ -20,6 +22,7 @@ function Grico.plot_field(reference::Union{Grico.HpSpace{D,T},Grico.AbstractDoma
                           state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
                           cell_data=(), field_data=(), subdivisions=1, sample_degree=1, mesh=false,
                           kwargs...) where {D,T<:AbstractFloat}
+  _require_makie_dimension(Val(D))
   data = _makie_sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                    cell_data=cell_data, field_data=field_data,
                                    subdivisions=subdivisions, sample_degree=sample_degree)
@@ -35,13 +38,13 @@ function Grico.plot_field(data::Grico.SampledPostprocess, name::Union{Symbol,Abs
                           component=nothing, mesh=false, figure=(;), axis=(;), colorbar=true,
                           colorbar_label=String(name), mesh_color=:white, kwargs...)
   sampled_mesh = data.mesh
-  _require_makie_dimension(sampled_mesh)
+  _require_makie_sampled_postprocess(data)
+  mesh_overlay = _makie_field_overlay(mesh, sampled_mesh)
   figure_object = Makie.Figure(; figure...)
   axis_object = _makie_field_axis(figure_object[1, 1], sampled_mesh, String(name), axis)
   plot_object = Grico.plot_field!(axis_object, data, name; component=component, kwargs...)
 
-  mesh === false ||
-    _plot_mesh_overlay!(axis_object, mesh === true ? sampled_mesh : mesh, mesh_color)
+  mesh_overlay === false || _plot_mesh_overlay!(axis_object, mesh_overlay, mesh_color)
   colorbar &&
     _makie_field_has_colorbar(sampled_mesh) &&
     Makie.Colorbar(figure_object[1, 2], plot_object; label=colorbar_label)
@@ -61,10 +64,17 @@ function Grico.plot_field!(axis, reference::Union{Grico.HpSpace{D,T},Grico.Abstr
                            state::Union{Nothing,Grico.State}=nothing, fields=nothing, point_data=(),
                            cell_data=(), field_data=(), subdivisions=1, sample_degree=1,
                            kwargs...) where {D,T<:AbstractFloat}
+  _require_makie_dimension(Val(D))
   data = _makie_sample_postprocess(reference; state=state, fields=fields, point_data=point_data,
                                    cell_data=cell_data, field_data=field_data,
                                    subdivisions=subdivisions, sample_degree=sample_degree)
   return Grico.plot_field!(axis, data, name; kwargs...)
+end
+
+function Grico.plot_field!(axis, data::Grico.SampledPostprocess, name::Union{Symbol,AbstractString};
+                           kwargs...)
+  _require_makie_sampled_postprocess(data)
+  throw(ArgumentError("Makie postprocessing currently supports one- and two-dimensional samples"))
 end
 
 # In one dimension, the sampled point order is already the physical line order
@@ -72,18 +82,21 @@ end
 function Grico.plot_field!(axis, data::Grico.SampledPostprocess{1},
                            name::Union{Symbol,AbstractString}; component=nothing, color=:black,
                            linewidth=2.0, kwargs...)
+  _require_makie_sampled_postprocess(data)
   values = _makie_point_values(data, String(name), component)
   return Makie.lines!(axis, vec(data.mesh.points[1, :]), values; color=color, linewidth=linewidth,
                       kwargs...)
 end
 
-# In two dimensions, the sampled tensor-product cells are rendered as triangles.
-# The triangulation deliberately keeps duplicate interface points so discontinuous
-# hp fields are not visually smoothed across active-leaf boundaries.
+# In two dimensions, every interval of the sampled tensor-product point grid is
+# rendered as two triangles. The triangulation deliberately keeps duplicate
+# interface points so discontinuous hp fields are not visually smoothed across
+# active-leaf boundaries.
 function Grico.plot_field!(axis, data::Grico.SampledPostprocess{2},
                            name::Union{Symbol,AbstractString}; component=nothing, colormap=:RdBu,
                            kwargs...)
   sampled_mesh = data.mesh
+  _require_makie_sampled_postprocess(data)
   values = _makie_point_values(data, String(name), component)
   vertices = _makie_vertices(sampled_mesh)
   faces = _makie_triangle_faces(sampled_mesh)
@@ -95,6 +108,7 @@ end
 # field plot.
 function Grico.plot_mesh(reference::Union{Grico.HpSpace{D,T},Grico.AbstractDomain{D,T}};
                          kwargs...) where {D,T<:AbstractFloat}
+  _require_makie_dimension(Val(D))
   return Grico.plot_mesh(Grico.sample_mesh_skeleton(reference); kwargs...)
 end
 
@@ -103,7 +117,7 @@ function Grico.plot_mesh(state::Grico.State; kwargs...)
 end
 
 function Grico.plot_mesh(skeleton::Grico.SampledMeshSkeleton; figure=(;), axis=(;), kwargs...)
-  _require_makie_dimension(skeleton)
+  _require_makie_sampled_skeleton(skeleton)
   figure_object = Makie.Figure(; figure...)
   axis_object = _makie_mesh_axis(figure_object[1, 1], skeleton, axis)
   Grico.plot_mesh!(axis_object, skeleton; kwargs...)
@@ -112,7 +126,7 @@ function Grico.plot_mesh(skeleton::Grico.SampledMeshSkeleton; figure=(;), axis=(
 end
 
 function Grico.plot_mesh(mesh::Grico.SampledMesh; figure=(;), axis=(;), kwargs...)
-  _require_makie_dimension(mesh)
+  _require_makie_sampled_mesh(mesh)
   figure_object = Makie.Figure(; figure...)
   axis_object = _makie_mesh_axis(figure_object[1, 1], mesh, axis)
   Grico.plot_mesh!(axis_object, mesh; kwargs...)
@@ -122,6 +136,7 @@ end
 
 function Grico.plot_mesh!(axis, reference::Union{Grico.HpSpace{D,T},Grico.AbstractDomain{D,T}};
                           kwargs...) where {D,T<:AbstractFloat}
+  _require_makie_dimension(Val(D))
   return Grico.plot_mesh!(axis, Grico.sample_mesh_skeleton(reference); kwargs...)
 end
 
@@ -131,13 +146,13 @@ end
 
 function Grico.plot_mesh!(axis, skeleton::Grico.SampledMeshSkeleton; color=:black, linewidth=0.75,
                           kwargs...)
-  _require_makie_dimension(skeleton)
+  _require_makie_sampled_skeleton(skeleton)
   return Makie.linesegments!(axis, _makie_segments(skeleton); color=color, linewidth=linewidth,
                              kwargs...)
 end
 
 function Grico.plot_mesh!(axis, mesh::Grico.SampledMesh; color=:black, linewidth=0.5, kwargs...)
-  _require_makie_dimension(mesh)
+  _require_makie_sampled_mesh(mesh)
   return Makie.linesegments!(axis, _makie_segments(mesh); color=color, linewidth=linewidth,
                              kwargs...)
 end
@@ -172,10 +187,145 @@ end
 # Makie can render the sampled representation directly for one- and
 # two-dimensional domains. Higher-dimensional sampled data remains useful for
 # file export, but it has no canonical scalar field plot here.
-function _require_makie_dimension(mesh::Union{Grico.SampledMesh{D},Grico.SampledMeshSkeleton{D}}) where {D}
+function _require_makie_dimension(::Val{D}) where {D}
   1 <= D <= 2 ||
     throw(ArgumentError("Makie postprocessing currently supports one- and two-dimensional samples"))
   return nothing
+end
+
+function _require_makie_dimension(mesh::Union{Grico.SampledMesh{D},Grico.SampledMeshSkeleton{D}}) where {D}
+  return _require_makie_dimension(Val(D))
+end
+
+function _require_makie_sampled_postprocess(data::Grico.SampledPostprocess)
+  mesh = data.mesh
+  _require_makie_sampled_mesh(mesh)
+  _require_makie_datasets(data.point_data, size(mesh.points, 2), "point")
+  _require_makie_datasets(data.cell_data, length(mesh.cell_leaves), "cell")
+  return data
+end
+
+function _require_makie_sampled_mesh(mesh::Grico.SampledMesh{D}) where {D}
+  _require_makie_dimension(Val(D))
+  mesh.subdivisions > 0 || throw(ArgumentError("sampled Makie mesh subdivisions must be positive"))
+  mesh.sample_degree > 0 ||
+    throw(ArgumentError("sampled Makie mesh sample_degree must be positive"))
+  leaf_count = length(mesh.leaf_data)
+  leaf_count > 0 || throw(ArgumentError("sampled Makie mesh must contain at least one leaf"))
+  point_resolution = _makie_checked_product(mesh.subdivisions, mesh.sample_degree,
+                                            "sampled Makie mesh")
+  expected_point_stride = _makie_checked_increment(point_resolution, "sampled Makie mesh")
+  mesh.point_stride == expected_point_stride ||
+    throw(ArgumentError("sampled Makie mesh point_stride does not match subdivisions and sample_degree"))
+  local_point_count = _makie_checked_power(mesh.point_stride, D, "sampled Makie mesh")
+  expected_cells_per_leaf = _makie_checked_power(mesh.subdivisions, D, "sampled Makie mesh")
+  mesh.cells_per_leaf == expected_cells_per_leaf ||
+    throw(ArgumentError("sampled Makie mesh cells_per_leaf does not match subdivisions"))
+  expected_points = _makie_checked_product(leaf_count, local_point_count, "sampled Makie mesh")
+  expected_cells = _makie_checked_product(leaf_count, mesh.cells_per_leaf, "sampled Makie mesh")
+  size(mesh.points) == (D, expected_points) ||
+    throw(ArgumentError("sampled Makie mesh points must have size ($D, $expected_points)"))
+  length(mesh.point_leaves) == expected_points ||
+    throw(ArgumentError("sampled Makie mesh point_leaves must have length $expected_points"))
+  size(mesh.point_references) == (D, expected_points) ||
+    throw(ArgumentError("sampled Makie mesh point_references must have size ($D, $expected_points)"))
+  length(mesh.cell_leaves) == expected_cells ||
+    throw(ArgumentError("sampled Makie mesh cell_leaves must have length $expected_cells"))
+  size(mesh.cell_references) == (D, expected_cells) ||
+    throw(ArgumentError("sampled Makie mesh cell_references must have size ($D, $expected_cells)"))
+  size(mesh.cell_centers) == (D, expected_cells) ||
+    throw(ArgumentError("sampled Makie mesh cell_centers must have size ($D, $expected_cells)"))
+  return mesh
+end
+
+function _require_makie_sampled_skeleton(skeleton::Grico.SampledMeshSkeleton{D}) where {D}
+  _require_makie_dimension(Val(D))
+  point_count = size(skeleton.points, 2)
+  edge_count = size(skeleton.edges, 2)
+  size(skeleton.points, 1) == D ||
+    throw(ArgumentError("sampled Makie mesh skeleton points must have $D coordinate rows"))
+  size(skeleton.edges, 1) == 2 ||
+    throw(ArgumentError("sampled Makie mesh skeleton edges must have two rows"))
+
+  for edge_index in axes(skeleton.edges, 2), endpoint in 1:2
+    vertex = skeleton.edges[endpoint, edge_index]
+    1 <= vertex <= point_count ||
+      throw(ArgumentError("sampled Makie mesh skeleton edge indices must refer to skeleton points"))
+  end
+
+  _require_makie_datasets(skeleton.cell_data, edge_count, "mesh-skeleton cell")
+  return skeleton
+end
+
+function _require_makie_datasets(datasets, tuple_count::Int, location::AbstractString)
+  for (name, data) in datasets
+    _makie_tuple_count(data) == tuple_count ||
+      throw(ArgumentError("$location dataset $name must have $tuple_count tuples"))
+    _require_makie_array_values(data, "$location dataset $name")
+  end
+
+  return datasets
+end
+
+_makie_tuple_count(data::AbstractVector) = length(data)
+_makie_tuple_count(data::AbstractMatrix) = size(data, 2)
+
+function _require_makie_array_values(data::_MakieArrayData, context::AbstractString)
+  data isa AbstractMatrix &&
+    size(data, 1) == 0 &&
+    throw(ArgumentError("$context must contain at least one component"))
+
+  for value in data
+    value isa Real && !(value isa Bool) ||
+      throw(ArgumentError("$context must contain finite real values"))
+    isfinite(value) || throw(ArgumentError("$context must contain finite values"))
+  end
+
+  return data
+end
+
+@noinline function _throw_makie_work_overflow(context::AbstractString)
+  throw(ArgumentError("$context creates too many Makie samples"))
+end
+
+@inline function _makie_checked_product(left::Int, right::Int, context::AbstractString)
+  (left == 0 || right <= typemax(Int) ÷ left) || _throw_makie_work_overflow(context)
+  return left * right
+end
+
+@inline function _makie_checked_increment(value::Int, context::AbstractString)
+  value < typemax(Int) || _throw_makie_work_overflow(context)
+  return value + 1
+end
+
+function _makie_checked_power(base::Int, exponent::Int, context::AbstractString)
+  result = 1
+
+  for _ in 1:exponent
+    result = _makie_checked_product(result, base, context)
+  end
+
+  return result
+end
+
+_makie_field_overlay(mesh::Bool, sampled_mesh::Grico.SampledMesh) = mesh ? sampled_mesh : false
+
+function _makie_field_overlay(mesh::Grico.SampledMesh{S},
+                              sampled_mesh::Grico.SampledMesh{D}) where {S,D}
+  S == D ||
+    throw(ArgumentError("mesh overlay dimension $S does not match sampled field dimension $D"))
+  return _require_makie_sampled_mesh(mesh)
+end
+
+function _makie_field_overlay(mesh::Grico.SampledMeshSkeleton{S},
+                              sampled_mesh::Grico.SampledMesh{D}) where {S,D}
+  S == D ||
+    throw(ArgumentError("mesh overlay dimension $S does not match sampled field dimension $D"))
+  return _require_makie_sampled_skeleton(mesh)
+end
+
+function _makie_field_overlay(_, ::Grico.SampledMesh)
+  throw(ArgumentError("mesh overlay must be false, true, SampledMesh, or SampledMeshSkeleton"))
 end
 
 function _makie_field_axis(position, mesh::Grico.SampledMesh{1}, name::String, axis)
@@ -228,9 +378,15 @@ function _makie_dataset(datasets, name::String)
 end
 
 function _makie_component(component::Integer, component_count::Int, name::String)
+  component isa Bool &&
+    throw(ArgumentError("component for point dataset $name must be an integer, not Bool"))
   1 <= component <= component_count ||
     throw(ArgumentError("component for point dataset $name must be in 1:$component_count"))
   return Int(component)
+end
+
+function _makie_component(_, ::Int, name::String)
+  throw(ArgumentError("component for point dataset $name must be an integer"))
 end
 
 # Makie accepts two-dimensional vertex coordinates as an `N × 2` array here,
@@ -247,29 +403,25 @@ function _makie_vertices(mesh::Grico.SampledMesh{2,T}) where {T}
   return vertices
 end
 
-# Split every sampled quadrilateral subcell into two triangles. The leaf-wise
-# point numbering is duplicated across interfaces, which lets Makie show DG
-# jumps without accidentally interpolating across neighboring leaves.
+# Split every adjacent sampled-point square into two triangles. This preserves
+# the high-order sampling density instead of reducing each exported cell to a
+# single corner-only bilinear patch.
 function _makie_triangle_faces(mesh::Grico.SampledMesh{2})
-  faces = Matrix{Int}(undef, 2 * length(mesh.cell_leaves), 3)
   point_stride = mesh.point_stride
+  interval_count = point_stride - 1
   local_point_count = point_stride^2
-  cell_indices = CartesianIndices((mesh.subdivisions, mesh.subdivisions))
+  faces = Matrix{Int}(undef, 2 * length(mesh.leaf_data) * interval_count^2, 3)
   row = 1
 
   for leaf_index in eachindex(mesh.leaf_data)
     point_offset = (leaf_index - 1) * local_point_count
 
-    for I in cell_indices
-      start = ((I[1] - 1) * mesh.sample_degree + 1, (I[2] - 1) * mesh.sample_degree + 1)
+    for j in 1:interval_count, i in 1:interval_count
+      start = (i, j)
       lower_left = _makie_local_point(point_offset, point_stride, start)
-      lower_right = _makie_local_point(point_offset, point_stride,
-                                       (start[1] + mesh.sample_degree, start[2]))
-      upper_right = _makie_local_point(point_offset, point_stride,
-                                       (start[1] + mesh.sample_degree,
-                                        start[2] + mesh.sample_degree))
-      upper_left = _makie_local_point(point_offset, point_stride,
-                                      (start[1], start[2] + mesh.sample_degree))
+      lower_right = _makie_local_point(point_offset, point_stride, (i + 1, j))
+      upper_right = _makie_local_point(point_offset, point_stride, (i + 1, j + 1))
+      upper_left = _makie_local_point(point_offset, point_stride, (i, j + 1))
       faces[row, 1] = lower_left
       faces[row, 2] = lower_right
       faces[row, 3] = upper_right

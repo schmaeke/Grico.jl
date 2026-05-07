@@ -1,5 +1,6 @@
 # Human-facing adaptive driver for the solve-estimate-adapt loop.
 function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
+                                                solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()),
                                                 write_vtk=WRITE_VTK, print_summary=true)
   context = build_origin_singularity_poisson_context()
   u = context.u
@@ -8,7 +9,7 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
   vtk_steps = Int[]
   vtk_path = nothing
   pvd_path = nothing
-  final_plan = nothing
+  final_problem = nothing
   final_state = nothing
   final_error = NaN
 
@@ -22,9 +23,8 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
 
   for step in 0:adaptive_steps
     problem = build_origin_singularity_problem(u, context)
-    plan = compile(problem)
-    state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
-    error_value = relative_l2_error(state, u, context.exact_solution; plan=plan,
+    state = solve(problem; solver)
+    error_value = relative_l2_error(state, u, context.exact_solution;
                                     extra_points=VERIFICATION_EXTRA_POINTS)
 
     if step == adaptive_steps
@@ -64,7 +64,7 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
       push!(vtk_steps, step)
     end
 
-    final_plan = plan
+    final_problem = problem
     final_state = state
     final_error = error_value
 
@@ -82,5 +82,5 @@ function run_origin_singularity_poisson_example(; adaptive_steps=ADAPTIVE_STEPS,
     u = adapted_field(space_transition, u)
   end
 
-  return (; context..., u, final_plan, final_state, final_error, history, vtk_path, pvd_path)
+  return (; context..., u, final_problem, final_state, final_error, history, vtk_path, pvd_path)
 end

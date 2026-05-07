@@ -57,19 +57,32 @@ end
 
 @inline _all_dirichlet_components(field::AbstractField) = ntuple(identity, component_count(field))
 
-function _checked_dirichlet_components(field::AbstractField, components::Tuple{Vararg{Integer}})
+function _checked_dirichlet_component(component, component_total::Int)
+  component isa Integer ||
+    throw(ArgumentError("Dirichlet component selector must be an integer; got $(typeof(component))"))
+  component isa Bool &&
+    throw(ArgumentError("Dirichlet component selector must be an integer, not Bool"))
+  1 <= component <= component_total ||
+    throw(ArgumentError("Dirichlet component selector $component must lie in 1:$component_total"))
+  return Int(component)
+end
+
+function _checked_dirichlet_components(field::AbstractField, component::Integer)
+  return (_checked_dirichlet_component(component, component_count(field)),)
+end
+
+function _checked_dirichlet_components(field::AbstractField, components)
+  (components isa Tuple || components isa AbstractVector) ||
+    throw(ArgumentError("Dirichlet component selectors must be an integer, tuple, or vector"))
   isempty(components) && throw(ArgumentError("Dirichlet component selectors must not be empty"))
   component_total = component_count(field)
   previous = 0
   checked = Vector{Int}(undef, length(components))
 
   for index in eachindex(components)
-    component = components[index]
-    1 <= component <= component_total ||
-      throw(ArgumentError("Dirichlet component selector $component must lie in 1:$component_total"))
-    component > previous ||
+    checked_component = _checked_dirichlet_component(components[index], component_total)
+    checked_component > previous ||
       throw(ArgumentError("Dirichlet component selectors must be strictly increasing and unique"))
-    checked_component = Int(component)
     checked[index] = checked_component
     previous = checked_component
   end
@@ -91,11 +104,11 @@ data onto the active trace degrees of freedom and then eliminates those dofs
 from the global affine or residual problem.
 
 When the component selector is omitted, the constraint applies to every
-component of `field`. When one component index or a tuple of indices is given,
-the data are interpreted relative to that selected subset. For convenience,
-vector-valued data that match the full field component count are also accepted,
-in which case the selected entries are extracted by their absolute component
-indices.
+component of `field`. When one component index, a tuple, or a vector of indices
+is given, the data are interpreted relative to that selected subset. For
+convenience, vector-valued data that match the full field component count are
+also accepted, in which case the selected entries are extracted by their absolute
+component indices.
 
 As in the rest of the boundary machinery, Dirichlet constraints are only valid
 on non-periodic boundary faces whose normal axis uses `:cg` continuity in the
@@ -113,8 +126,7 @@ struct Dirichlet
   components::Tuple{Vararg{Int}}
   data
 
-  function Dirichlet(field::AbstractField, boundary::BoundaryFace,
-                     components::Tuple{Vararg{Integer}}, data)
+  function Dirichlet(field::AbstractField, boundary::BoundaryFace, components, data)
     return new(field, boundary, _checked_dirichlet_components(field, components), data)
   end
 end
@@ -124,6 +136,38 @@ function Dirichlet(field::AbstractField, boundary::BoundaryFace, data)
 end
 function Dirichlet(field::AbstractField, boundary::BoundaryFace, component::Integer, data)
   Dirichlet(field, boundary, (component,), data)
+end
+
+@noinline function _throw_mean_target_conversion_error(value, ::Type{T}) where {T<:AbstractFloat}
+  throw(ArgumentError("mean target entries must be convertible to $T; got $(typeof(value))"))
+end
+
+function _mean_target_value(value, ::Type{T}) where {T<:AbstractFloat}
+  try
+    return T(value)
+  catch
+    _throw_mean_target_conversion_error(value, T)
+  end
+end
+
+function _mean_targets(target, component_total::Int, ::Type{T}) where {T<:AbstractFloat}
+  if component_total == 1
+    return (_mean_target_value(target, T),)
+  end
+
+  target isa Tuple ||
+    target isa AbstractVector ||
+    throw(ArgumentError("vector-valued mean target must be a tuple or vector"))
+  target_values = target isa Tuple ? target : Tuple(target)
+  length(target_values) == component_total ||
+    throw(ArgumentError("mean target must match the field component count"))
+  return ntuple(index -> _mean_target_value(target_values[index], T), component_total)
+end
+
+function _checked_mean_target(field::AbstractField, target)
+  value_type = eltype(origin(field_space(field)))
+  targets = _mean_targets(target, component_count(field), value_type)
+  return component_count(field) == 1 ? first(targets) : targets
 end
 
 """
@@ -146,10 +190,13 @@ the selected field over the whole physical domain.
 struct MeanValue
   field::AbstractField
   target
+
+  MeanValue(field::AbstractField, target) = new(field, _checked_mean_target(field, target))
 end
 
-# Operator classification.
-
+# Internal closed supertype for problem operator-class declarations. The public
+# API is the small concrete set below; arbitrary user subtypes are not accepted as
+# solver policy.
 abstract type AbstractOperatorClass end
 
 """
@@ -187,7 +234,19 @@ CG-based geometric multigrid.
 struct SPD <: AbstractOperatorClass end
 
 _is_spd_operator_class(::SPD) = true
-_is_spd_operator_class(::AbstractOperatorClass) = false
+_is_spd_operator_class(::Union{GeneralOperator,NonsymmetricOperator,IndefiniteOperator}) = false
+
+const _OperatorClass = Union{GeneralOperator,NonsymmetricOperator,IndefiniteOperator,SPD}
+
+_checked_operator_class(operator_class::_OperatorClass) = operator_class
+
+function _checked_operator_class(operator_class)
+  throw(ArgumentError("operator_class must be GeneralOperator(), NonsymmetricOperator(), IndefiniteOperator(), or SPD(); got $(typeof(operator_class))"))
+end
+
+function _is_spd_operator_class(operator_class::AbstractOperatorClass)
+  throw(ArgumentError("unsupported operator_class $(typeof(operator_class)); use GeneralOperator(), NonsymmetricOperator(), IndefiniteOperator(), or SPD()"))
+end
 
 # Internal symbolic selector used by tagged embedded-surface attachments and
 # operators. `nothing` denotes the untagged wildcard behavior "all embedded
@@ -224,14 +283,12 @@ struct _CellQuadratureAttachment{Q<:AbstractQuadrature}
   quadrature::Q
 end
 
-# Internal storage used by both affine and residual problem wrappers.
-
 # Shared mutable storage behind the public affine and residual problem wrappers.
 # The two problem kinds expose the same editable collections and differ only in
 # which operator callbacks later evaluation routines use.
 mutable struct _ProblemData
   fields::Vector{AbstractField}
-  operator_class::AbstractOperatorClass
+  operator_class::_OperatorClass
   cell_operators::Vector{Any}
   boundary_operators::Vector{_BoundaryContribution}
   interface_operators::Vector{Any}
@@ -241,16 +298,17 @@ mutable struct _ProblemData
   dirichlet_constraints::Vector{Dirichlet}
   mean_constraints::Vector{MeanValue}
 
-  function _ProblemData(fields::Vector{AbstractField}, operator_class::AbstractOperatorClass)
-    return new(_checked_problem_fields(fields), operator_class, Any[], _BoundaryContribution[],
-               Any[], _SurfaceContribution[], _CellQuadratureAttachment[], _SurfaceAttachment[],
-               Dirichlet[], MeanValue[])
+  function _ProblemData(fields::Vector{AbstractField}, operator_class)
+    checked_operator_class = _checked_operator_class(operator_class)
+    return new(_checked_problem_fields(fields), checked_operator_class, Any[],
+               _BoundaryContribution[], Any[], _SurfaceContribution[], _CellQuadratureAttachment[],
+               _SurfaceAttachment[], Dirichlet[], MeanValue[])
   end
 end
 
 abstract type _AbstractProblem end
 
-function _empty_problem_data(operator_class::AbstractOperatorClass, fields::AbstractField...)
+function _empty_problem_data(operator_class, fields::AbstractField...)
   length(fields) >= 1 || throw(ArgumentError("at least one field is required"))
   return _ProblemData(AbstractField[fields...], operator_class)
 end
@@ -313,14 +371,13 @@ plans.
 struct AffineProblem <: _AbstractProblem
   _data::_ProblemData
 
-  function AffineProblem(fields::AbstractField...;
-                         operator_class::AbstractOperatorClass=GeneralOperator())
+  function AffineProblem(fields::AbstractField...; operator_class=GeneralOperator())
     return new(_empty_problem_data(operator_class, fields...))
   end
 end
 
 """
-    ResidualProblem(fields...)
+    ResidualProblem(fields...; operator_class=GeneralOperator())
 
 Container for nonlinear residual/tangent operators and constraints.
 
@@ -330,6 +387,10 @@ tangent callbacks such as [`cell_residual!`](@ref) and
 [`cell_tangent_apply!`](@ref), and the operator is interpreted as a nonlinear
 residual equation together with its local linearizations.
 
+`operator_class` declares the algebraic class of the Newton tangent operator.
+The default tangent solve uses CG for [`SPD`](@ref) residual problems and FGMRES
+otherwise.
+
 The internal storage layout is intentionally the same as for
 [`AffineProblem`](@ref). The distinction between the two problem types only
 appears later when operator evaluation dispatches to affine versus nonlinear
@@ -338,7 +399,9 @@ operator callbacks.
 struct ResidualProblem <: _AbstractProblem
   _data::_ProblemData
 
-  ResidualProblem(fields::AbstractField...) = new(_empty_problem_data(GeneralOperator(), fields...))
+  function ResidualProblem(fields::AbstractField...; operator_class=GeneralOperator())
+    return new(_empty_problem_data(operator_class, fields...))
+  end
 end
 
 """
@@ -431,6 +494,7 @@ end
 
 function _check_problem_constraint(fields::AbstractVector{<:AbstractField}, constraint::MeanValue)
   _check_problem_field(fields, constraint.field, "mean-value constraint")
+  _checked_mean_target(constraint.field, constraint.target)
   return constraint
 end
 
@@ -548,15 +612,6 @@ function add_constraint!(problem::_AbstractProblem, constraint::Union{Dirichlet,
   return problem
 end
 
-"""
-    constrain!(problem, constraint)
-
-Alias for [`add_constraint!`](@ref).
-"""
-function constrain!(problem::_AbstractProblem, constraint::Union{Dirichlet,MeanValue})
-  add_constraint!(problem, constraint)
-end
-
 # Operator extension surface.
 
 """
@@ -668,9 +723,8 @@ Accumulate the local affine cell matrix of `operator` into `local_matrix`.
 
 The default implementation derives the local matrix by applying
 [`cell_apply!`](@ref) to local basis vectors. This probing is intentionally
-local to one integration item and is a compatibility path for low-level
-callbacks; first-party weak-form operators provide analytic local-matrix
-lowerings.
+local to one integration item and supports advanced low-level callbacks;
+first-party weak-form operators provide analytic local-matrix lowerings.
 """
 function cell_matrix!(local_matrix, operator, values)
   cell_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))

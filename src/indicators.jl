@@ -16,6 +16,7 @@ function _local_mode_energy(component_coefficients, compiled::_CompiledLeaf{D,T}
     energy += amplitude * amplitude
   end
 
+  isfinite(energy) || throw(ArgumentError("modal indicator energies must be finite"))
   return energy
 end
 
@@ -50,8 +51,12 @@ function _axis_layer_energies(component_coefficients, compiled::_CompiledLeaf{D,
         upper = _local_mode_amplitude(compiled, component_coefficients[component], upper_index)
         constant = half * (lower + upper)
         linear = half * (upper - lower)
-        previous_energy += constant * constant
-        top_energy += linear * linear
+        constant_energy = constant * constant
+        linear_energy = linear * linear
+        isfinite(constant_energy) && isfinite(linear_energy) ||
+          throw(ArgumentError("modal indicator energies must be finite"))
+        previous_energy += constant_energy
+        top_energy += linear_energy
       end
     end
 
@@ -132,28 +137,15 @@ end
                                     plus_compiled.quadrature_shape[current_axis]), D)
 end
 
-function _interface_jump_quadratures(::Type{T}, space::HpSpace{D}, specs) where {D,T<:AbstractFloat}
-  cache = Dict{Tuple{Int,NTuple{D-1,Int}},TensorQuadrature{D-1,T}}()
-  quadratures = Vector{TensorQuadrature{D-1,T}}(undef, length(specs))
-
-  for spec_index in eachindex(specs)
-    spec = specs[spec_index]
-    minus_leaf, axis, plus_leaf = spec
-    minus_compiled = @inbounds space.compiled_leaves[snapshot(space).leaf_to_index[minus_leaf]]
-    plus_compiled = @inbounds space.compiled_leaves[snapshot(space).leaf_to_index[plus_leaf]]
-    shape = _interface_jump_shape(minus_compiled, plus_compiled, axis)
-    key = (axis, _face_tangential_shape(shape, axis))
-
-    if haskey(cache, key)
-      quadratures[spec_index] = cache[key]
-    else
-      quadrature = TensorQuadrature(T, key[2])
-      cache[key] = quadrature
-      quadratures[spec_index] = quadrature
-    end
+function _interface_jump_quadrature!(cache::Dict{Tuple{Int,NTuple{D1,Int}},TensorQuadrature{D1,T}},
+                                     ::Type{T}, minus_compiled::_CompiledLeaf{D},
+                                     plus_compiled::_CompiledLeaf{D},
+                                     axis::Int) where {D,D1,T<:AbstractFloat}
+  shape = _interface_jump_shape(minus_compiled, plus_compiled, axis)
+  key = (axis, _face_tangential_shape(shape, axis))
+  return get!(cache, key) do
+    TensorQuadrature(T, key[2])
   end
-
-  return quadratures
 end
 
 @inline _face_tangential_index(axis::Int, face_axis::Int) = axis < face_axis ? axis : axis - 1
@@ -256,25 +248,27 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
   D = dimension(space)
   active_leaf_total = active_leaf_count(space)
   space_snapshot = snapshot(space)
-  specs = [(space_snapshot.interface_minus[index], Int(space_snapshot.interface_axis[index]),
-            space_snapshot.interface_plus[index]) for index in 1:interface_count(space_snapshot)]
-  isempty(specs) && return [ntuple(_ -> zero(T), D) for _ in 1:active_leaf_total]
+  interface_total = interface_count(space_snapshot)
+  interface_total == 0 && return [ntuple(_ -> zero(T), D) for _ in 1:active_leaf_total]
   domain_data = domain(space)
   component_coefficients = _component_coefficient_views(state, field)
-  quadratures = _interface_jump_quadratures(T, space, specs)
+  quadrature_cache = Dict{Tuple{Int,NTuple{D-1,Int}},TensorQuadrature{D-1,T}}()
   scratch = _InterfaceJumpScratch(T, Val(D), active_leaf_total)
 
-  for spec_index in eachindex(specs)
-    spec = specs[spec_index]
-    minus_leaf, axis, plus_leaf = spec
-    minus_leaf_index = @inbounds snapshot(space).leaf_to_index[minus_leaf]
-    plus_leaf_index = @inbounds snapshot(space).leaf_to_index[plus_leaf]
+  for interface_index in 1:interface_total
+    minus_leaf = @inbounds space_snapshot.interface_minus[interface_index]
+    axis = Int(@inbounds space_snapshot.interface_axis[interface_index])
+    plus_leaf = @inbounds space_snapshot.interface_plus[interface_index]
+    minus_leaf_index = @inbounds space_snapshot.leaf_to_index[minus_leaf]
+    plus_leaf_index = @inbounds space_snapshot.leaf_to_index[plus_leaf]
     minus_compiled = @inbounds space.compiled_leaves[minus_leaf_index]
     plus_compiled = @inbounds space.compiled_leaves[plus_leaf_index]
-    quadrature = quadratures[spec_index]
+    quadrature = _interface_jump_quadrature!(quadrature_cache, T, minus_compiled, plus_compiled,
+                                             axis)
     jump_energy = _interface_jump_energy(component_coefficients, minus_compiled, plus_compiled,
                                          domain_data, minus_leaf, plus_leaf, axis, quadrature,
                                          scratch)
+    isfinite(jump_energy) || throw(ArgumentError("interface jump indicators must be finite"))
     minus_scale = ((minus_compiled.degrees[axis] + 1)^2) / cell_size(domain_data, minus_leaf, axis)
     plus_scale = ((plus_compiled.degrees[axis] + 1)^2) / cell_size(domain_data, plus_leaf, axis)
     scratch.indicators[minus_leaf_index, axis] += minus_scale * jump_energy
@@ -282,8 +276,14 @@ function interface_jump_indicators(state::State{T}, field::AbstractField) where 
   end
 
   indicators = scratch.indicators
-  return [ntuple(axis -> sqrt(indicators[leaf_index, axis]), D)
-          for leaf_index in 1:active_leaf_total]
+  return [ntuple(axis -> begin
+                   value = indicators[leaf_index, axis]
+                   isfinite(value) ||
+                     throw(ArgumentError("interface jump indicators must be finite"))
+                   value >= zero(T) ||
+                     throw(ArgumentError("interface jump indicators must be non-negative"))
+                   sqrt(value)
+                 end, D) for leaf_index in 1:active_leaf_total]
 end
 
 """
@@ -380,6 +380,16 @@ function _checked_nonnegative_threshold(value::Real, name::AbstractString)
   return checked
 end
 
+function _require_finite_axis_indicator_data(values, name::AbstractString)
+  for leaf_values in values
+    for axis in eachindex(leaf_values)
+      isfinite(leaf_values[axis]) || throw(ArgumentError("$name must be finite"))
+    end
+  end
+
+  return values
+end
+
 function _active_leaf_index(space::HpSpace, leaf::Integer)
   checked_leaf = _checked_cell(grid(space), leaf)
   index = @inbounds snapshot(space).leaf_to_index[checked_leaf]
@@ -425,49 +435,87 @@ function _projection_shape_value(modes::AbstractVector{<:NTuple{D,Int}},
   return value
 end
 
-# Precompute the parent reference mass matrix and basis modes for a given target
-# degree tuple. Candidate scoring repeatedly solves projection systems with the
-# same parent degrees, so caching the Cholesky factor avoids redundant dense
-# assembly.
-function _reference_projection_data(space::HpSpace{D,T}, degrees::NTuple{D,Int},
-                                    cache::Dict{NTuple{D,Int},
-                                                Tuple{Vector{NTuple{D,Int}},Cholesky{T,Matrix{T}}}}) where {D,
-                                                                                                            T<:AbstractFloat}
-  haskey(cache, degrees) && return cache[degrees]
-  modes = collect(basis_modes(basis_family(space), degrees))
+# Indicator volume integrals use the same reference-cell measure convention as
+# assembly: full Cartesian cells fall back to tensor Gauss rules, while physical
+# cut cells use the domain's physical or finite-cell quadrature.
+function _cached_tensor_cell_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}},
+                                         ::Type{T}, shape::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  return get!(cache, shape) do
+    TensorQuadrature(T, shape)
+  end
+end
+
+function _indicator_cell_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, ::Type{T},
+                                     domain::Domain{D,T}, leaf::Int,
+                                     shape::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  return _cached_tensor_cell_quadrature!(cache, T, shape)
+end
+
+function _indicator_cell_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, ::Type{T},
+                                     domain::PhysicalDomain{D,T}, leaf::Int,
+                                     shape::NTuple{D,Int}) where {D,T<:AbstractFloat}
+  _classify_leaf(domain.region, domain, leaf) === :outside && return nothing
+  quadrature = _assembly_cell_quadrature(domain, leaf, shape)
+  return quadrature === nothing ? _cached_tensor_cell_quadrature!(cache, T, shape) : quadrature
+end
+
+_uses_full_cell_reference_measure(::Domain, leaf::Int) = true
+
+function _uses_full_cell_reference_measure(domain::PhysicalDomain{D,T},
+                                           leaf::Int) where {D,T<:AbstractFloat}
+  _classify_leaf(domain.region, domain, leaf) === :inside && return true
+  measure = _cell_measure(domain)
+  return measure isa FiniteCellExtension && T(measure.alpha) == one(T)
+end
+
+function _projection_mass_factor(::Type{T}, degrees::NTuple{D,Int},
+                                 modes::AbstractVector{<:NTuple{D,Int}},
+                                 quadrature::AbstractQuadrature{D,T}) where {D,T<:AbstractFloat}
   mode_count = length(modes)
-  quadrature = TensorQuadrature(T,
-                                ntuple(axis -> minimum_gauss_legendre_points(2 * degrees[axis]), D))
-  shape_values = Matrix{T}(undef, mode_count, point_count(quadrature))
   mass = zeros(T, mode_count, mode_count)
   basis_values = ntuple(axis -> Vector{T}(undef, degrees[axis] + 1), D)
+  shape_values = Vector{T}(undef, mode_count)
 
   for point_index in 1:point_count(quadrature)
     ξ = point(quadrature, point_index)
     _fill_leaf_basis!(basis_values, degrees, ξ)
-
-    for mode_index in 1:mode_count
-      shape_values[mode_index, point_index] = _projection_shape_value(modes, basis_values,
-                                                                      mode_index)
-    end
-  end
-
-  for point_index in 1:point_count(quadrature)
+    _fill_projection_shape_values!(shape_values, modes, basis_values)
     weighted = weight(quadrature, point_index)
 
     for row_index in 1:mode_count
-      shape_row = shape_values[row_index, point_index]
+      shape_row = shape_values[row_index]
 
       for column_index in 1:row_index
-        contribution = shape_row * shape_values[column_index, point_index] * weighted
+        contribution = shape_row * shape_values[column_index] * weighted
         mass[row_index, column_index] += contribution
         row_index == column_index || (mass[column_index, row_index] += contribution)
       end
     end
   end
 
-  data = (modes, cholesky(Hermitian(mass)))
-  cache[degrees] = data
+  return cholesky(Hermitian(mass))
+end
+
+# Precompute the parent projection mass matrix and basis modes for one
+# h-coarsening candidate. Full-cell masses are cached by degree tuple; cut-cell
+# masses depend on the candidate leaf geometry and are factored per candidate.
+function _reference_projection_data(space::HpSpace{D,T}, candidate::HCoarseningCandidate{D},
+                                    cache::Dict{NTuple{D,Int},
+                                                Tuple{Vector{NTuple{D,Int}},Cholesky{T,Matrix{T}}}},
+                                    quadrature_cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}) where {D,
+                                                                                                        T<:AbstractFloat}
+  degrees = candidate.target_degrees
+  full_reference_measure = _uses_full_cell_reference_measure(domain(space), candidate.cell)
+  full_reference_measure && haskey(cache, degrees) && return cache[degrees]
+  modes = collect(basis_modes(basis_family(space), degrees))
+  shape = ntuple(axis -> minimum_gauss_legendre_points(2 * degrees[axis]), D)
+  quadrature = _indicator_cell_quadrature!(quadrature_cache, T, domain(space), candidate.cell,
+                                           shape)
+  quadrature === nothing &&
+    throw(ArgumentError("h coarsening candidate parent $(candidate.cell) has no active integration measure"))
+  factor = _projection_mass_factor(T, degrees, modes, quadrature)
+  data = (modes, factor)
+  full_reference_measure && (cache[degrees] = data)
   return data
 end
 
@@ -475,15 +523,17 @@ end
 # repeated target degree tuples. The returned maximum mode count sizes the
 # scratch buffers used during candidate scoring.
 function _projection_reference_table(space::HpSpace{D,T},
-                                     candidates::AbstractVector{HCoarseningCandidate{D}}) where {D,
-                                                                                                 T<:AbstractFloat}
+                                     candidates::AbstractVector{HCoarseningCandidate{D}},
+                                     quadrature_cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}) where {D,
+                                                                                                         T<:AbstractFloat}
   reference_type = Tuple{Vector{NTuple{D,Int}},Cholesky{T,Matrix{T}}}
   cache = Dict{NTuple{D,Int},reference_type}()
   references = Vector{reference_type}(undef, length(candidates))
   max_mode_count = 0
 
   for candidate_index in eachindex(candidates)
-    reference = _reference_projection_data(space, candidates[candidate_index].target_degrees, cache)
+    reference = _reference_projection_data(space, candidates[candidate_index], cache,
+                                           quadrature_cache)
     references[candidate_index] = reference
     max_mode_count = max(max_mode_count, length(reference[1]))
   end
@@ -535,35 +585,6 @@ function _fill_projection_shape_values!(shape_values::AbstractVector{T},
   return shape_values
 end
 
-function _projection_quadratures(::Type{T}, space::HpSpace{D},
-                                 candidates::AbstractVector{HCoarseningCandidate{D}}) where {D,
-                                                                                             T<:AbstractFloat}
-  cache = Dict{Tuple{NTuple{D,Int},NTuple{D,Int}},TensorQuadrature{D,T}}()
-  quadratures = Vector{NTuple{_MIDPOINT_CHILD_COUNT,TensorQuadrature{D,T}}}(undef,
-                                                                            length(candidates))
-
-  for candidate_index in eachindex(candidates)
-    candidate = candidates[candidate_index]
-    quadratures[candidate_index] = ntuple(child_index -> begin
-                                            child = candidate.children[child_index]
-                                            key = (candidate.target_degrees,
-                                                   cell_degrees(space, child))
-
-                                            if haskey(cache, key)
-                                              cache[key]
-                                            else
-                                              quadrature = TensorQuadrature(T,
-                                                                            _projection_quadrature_shape(candidate.target_degrees,
-                                                                                                         key[2]))
-                                              cache[key] = quadrature
-                                              quadrature
-                                            end
-                                          end, _MIDPOINT_CHILD_COUNT)
-  end
-
-  return quadratures
-end
-
 """
     projection_coarsening_indicators(state, field, candidates)
 
@@ -586,15 +607,16 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
   checked_candidates = _checked_h_coarsening_candidates(space, candidates)
   indicators = Vector{T}(undef, length(checked_candidates))
   isempty(checked_candidates) && return indicators
+  D = dimension(space)
   components = component_count(field)
   component_coefficients = _component_coefficient_views(state, field)
-  references, max_mode_count = _projection_reference_table(space, checked_candidates)
-  quadratures = _projection_quadratures(T, space, checked_candidates)
-  scratch = _ProjectionIndicatorScratch(T, Val(dimension(space)), max_mode_count, components)
+  quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
+  references, max_mode_count = _projection_reference_table(space, checked_candidates,
+                                                           quadrature_cache)
+  scratch = _ProjectionIndicatorScratch(T, Val(D), max_mode_count, components)
 
   for candidate_index in eachindex(checked_candidates)
     candidate = checked_candidates[candidate_index]
-    candidate_quadratures = quadratures[candidate_index]
     modes, factor = references[candidate_index]
     mode_count = length(modes)
     rhs = @view scratch.rhs[1:mode_count, 1:components]
@@ -607,7 +629,12 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
     for child_index in eachindex(candidate.children)
       child = candidate.children[child_index]
       child_compiled = _compiled_leaf(space, child)
-      quadrature = candidate_quadratures[child_index]
+      quadrature_shape = _projection_quadrature_shape(candidate.target_degrees,
+                                                      child_compiled.degrees)
+      quadrature = _indicator_cell_quadrature!(quadrature_cache, T, domain(space), child,
+                                               quadrature_shape)
+      quadrature === nothing &&
+        throw(ArgumentError("h coarsening candidate child $child has no active integration measure"))
       child_jacobian = jacobian_determinant_from_biunit_cube(domain(space), child)
 
       for point_index in 1:point_count(quadrature)
@@ -632,6 +659,9 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
       end
     end
 
+    isfinite(fine_norm) || throw(ArgumentError("h coarsening fine norms must be finite"))
+    fine_norm >= zero(T) || throw(ArgumentError("h coarsening fine norms must be non-negative"))
+
     if fine_norm == zero(T)
       indicators[candidate_index] = zero(T)
       continue
@@ -652,7 +682,11 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
       end
     end
 
-    indicators[candidate_index] = sqrt(max(zero(T), fine_norm - projection_norm) / fine_norm)
+    isfinite(projection_norm) ||
+      throw(ArgumentError("h coarsening projection norms must be finite"))
+    defect = sqrt(max(zero(T), fine_norm - projection_norm) / fine_norm)
+    isfinite(defect) || throw(ArgumentError("h coarsening indicators must be finite"))
+    indicators[candidate_index] = defect
   end
 
   return indicators
@@ -678,12 +712,10 @@ function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T
 
   for (leaf_index, leaf) in enumerate(snapshot(space).active_leaves)
     compiled = space.compiled_leaves[leaf_index]
-    if haskey(quadrature_cache, compiled.quadrature_shape)
-      quadrature = quadrature_cache[compiled.quadrature_shape]
-    else
-      quadrature = TensorQuadrature(T, compiled.quadrature_shape)
-      quadrature_cache[compiled.quadrature_shape] = quadrature
-    end
+    quadrature = _indicator_cell_quadrature!(quadrature_cache, T, domain(space), leaf,
+                                             compiled.quadrature_shape)
+    quadrature === nothing &&
+      throw(ArgumentError("active leaf $leaf has no active integration measure"))
 
     jacobian = jacobian_determinant_from_biunit_cube(domain(space), leaf)
     energy = zero(T)
@@ -701,6 +733,8 @@ function _field_cell_l2_energies(state::State{T}, field::AbstractField) where {T
       end
     end
 
+    isfinite(energy) || throw(ArgumentError("cell L2 indicator energies must be finite"))
+    energy >= zero(T) || throw(ArgumentError("cell L2 indicator energies must be non-negative"))
     energies[leaf_index] = energy
   end
 
@@ -712,6 +746,7 @@ end
 # while still scaling with the magnitude of the represented field.
 function _cell_l2_denominators(energies::AbstractVector{T}) where {T<:AbstractFloat}
   global_energy = sum(energies)
+  isfinite(global_energy) || throw(ArgumentError("cell L2 indicator energies must be finite"))
   floor_energy = max(global_energy * eps(T), eps(T)^2)
   return [sqrt(max(energy, floor_energy)) for energy in energies]
 end
@@ -731,6 +766,7 @@ function _normalized_interface_jump_indicators(state::State{T}, field::AbstractF
                                         denominators[leaf_index], dimension(space))
   end
 
+  _require_finite_axis_indicator_data(result, "normalized interface jump indicators")
   return result
 end
 
@@ -784,6 +820,10 @@ function _multiresolution_refinement_data(state::State{T},
   p_detail = modal.detail
   h_refinement_detail = _continuity_refinement_detail(state, field, p_detail)
   refinement_detail = _combined_refinement_detail(space, p_detail, h_refinement_detail)
+  _require_finite_axis_indicator_data(p_detail, "modal refinement indicators")
+  _require_finite_axis_indicator_data(modal.decay, "modal decay indicators")
+  _require_finite_axis_indicator_data(h_refinement_detail, "h refinement indicators")
+  _require_finite_axis_indicator_data(refinement_detail, "refinement indicators")
   return (; p_detail, modal_decay=modal.decay, h_refinement_detail, refinement_detail)
 end
 

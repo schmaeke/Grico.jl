@@ -3,6 +3,16 @@ using Grico
 
 const SPACE_TOL = 1.0e-12
 
+struct _SpaceZeroBasedVector <: AbstractVector{Float64}
+  data::Vector{Float64}
+end
+
+Base.size(vector::_SpaceZeroBasedVector) = size(vector.data)
+Base.axes(vector::_SpaceZeroBasedVector) = (0:(length(vector.data)-1),)
+Base.IndexStyle(::Type{_SpaceZeroBasedVector}) = IndexLinear()
+Base.getindex(vector::_SpaceZeroBasedVector, index::Int) = vector.data[index+1]
+Base.setindex!(vector::_SpaceZeroBasedVector, value, index::Int) = (vector.data[index+1] = value)
+
 function _space_value(space, leaf, ξ, coefficients)
   one_dimensional = ntuple(axis -> Grico._fe_basis_values(ξ[axis],
                                                           Grico.cell_degrees(space, leaf)[axis]),
@@ -38,16 +48,28 @@ end
   @test Grico.AxisDegrees((0, 1)) isa Grico.AxisDegrees{2}
   @test Grico.AxisDegrees{2}((0, 1)) isa Grico.AxisDegrees{2}
   too_large = big(typemax(Int)) + 1
+  @test_throws ArgumentError Grico.UniformDegree(true)
+  @test_throws ArgumentError Grico.AxisDegrees((true,))
+  @test_throws ArgumentError Grico.AxisDegrees(())
+  @test_throws ArgumentError Grico.AxisDegrees{0}(())
+  @test_throws ArgumentError Grico.ByLeafDegrees(1)
+  @test_throws ArgumentError Grico.DegreePlusQuadrature(true)
   @test_throws ArgumentError Grico.UniformDegree(too_large)
   @test_throws ArgumentError Grico.AxisDegrees((too_large,))
   @test_throws ArgumentError Grico.DegreePlusQuadrature(too_large)
   @test_throws ArgumentError Grico.DegreePlusQuadrature(-1)
+  @test_throws ArgumentError Grico.SpaceOptions(basis=1)
+  @test_throws ArgumentError Grico.SpaceOptions(degree=1)
+  @test_throws ArgumentError Grico.SpaceOptions(quadrature=1)
   @test_throws ArgumentError Grico.SpaceOptions(continuity=:foo)
   @test_throws ArgumentError Grico.SpaceOptions(continuity=(:cg, :foo))
   @test_throws ArgumentError Grico.SpaceOptions(continuity=())
   @test_throws ArgumentError Grico.SpaceOptions(continuity=(:cg, 1))
 
   domain = Grico.Domain((0.0,), (1.0,), (1,))
+  @test_throws ArgumentError Grico.HpSpace(domain,
+                                           Grico.SpaceOptions(degree=Grico.ByLeafDegrees(identity)))
+  @test_throws ArgumentError Grico._quadrature_shape(Grico.DegreePlusQuadrature(1), (typemax(Int),))
   space = Grico.HpSpace(domain, Grico.SpaceOptions(degree=Grico.UniformDegree(2)))
   compiled = only(space.compiled_leaves)
   space.compiled_leaves[1] = Grico._CompiledLeaf(compiled.leaf, compiled.degrees,
@@ -195,11 +217,14 @@ end
   u = Grico.ScalarField(space; name=:u)
   v = Grico.VectorField(space, 2; name=:v)
   layout = Grico.FieldLayout((u,))
+  single_layout = Grico.FieldLayout(u)
   mixed_layout = Grico.FieldLayout((u, v))
   slot = only(layout.slots)
   state = Grico.State(layout, [0.1, -0.2, 0.3])
   mixed_state = Grico.State(mixed_layout, collect(0.1:0.1:0.9))
 
+  @test Grico.fields(single_layout) == (u,)
+  @test Grico.field_dof_count(single_layout, u) == Grico.field_dof_count(u)
   @test Grico.field_dof_range(mixed_layout, u) == 1:3
   @test Grico.field_dof_range(mixed_layout, v) == 4:9
   @test Grico.field_component_range(mixed_layout, v, 1) == 4:6
@@ -209,6 +234,9 @@ end
 
   too_large = big(typemax(Int)) + 1
   @test_throws ArgumentError Grico.VectorField(space, too_large)
+  @test_throws ArgumentError Grico.VectorField(space, typemax(Int))
+  @test_throws ArgumentError Grico.ScalarField(1, space, :u)
+  @test_throws ArgumentError Grico.VectorField(1, space, 1, :v)
   @test_throws ArgumentError Grico.VectorField(1, space, too_large, :v)
   @test_throws ArgumentError Grico.VectorField(1, space, 0, :v)
   @test_throws ArgumentError Grico.FieldLayout((1,))
@@ -220,8 +248,17 @@ end
                                                               slot.dof_count)], slot.dof_count)
   @test_throws ArgumentError Grico.State(layout, [1, 2, 3])
   @test_throws ArgumentError typeof(state)(layout, [0.1, -0.2])
+  @test_throws ArgumentError Grico.State(layout, _SpaceZeroBasedVector([0.1, -0.2, 0.3]))
   @test_throws ArgumentError Grico.field_dof_range(layout, v)
   @test_throws ArgumentError Grico.field_values(state, v)
+
+  x_roots = Grico.Domain((0.0, 0.0), (1.0, 1.0), (2, 1))
+  y_roots = Grico.Domain((0.0, 0.0), (1.0, 1.0), (1, 2))
+  x_field = Grico.ScalarField(Grico.HpSpace(x_roots); name=:x)
+  y_field = Grico.ScalarField(Grico.HpSpace(y_roots); name=:y)
+  @test Grico.active_leaves(Grico.field_space(x_field)) ==
+        Grico.active_leaves(Grico.field_space(y_field))
+  @test_throws ArgumentError Grico.FieldLayout((x_field, y_field))
 
   first_region = Grico.ImplicitRegion(x -> x[1] - 0.25; subdivision_depth=1)
   second_region = Grico.ImplicitRegion(x -> x[1] - 0.75; subdivision_depth=1)
@@ -483,6 +520,14 @@ end
   @test constant_restriction isa Matrix{Float32}
   @test constant_restriction == ones(Float32, 1, 1)
 
+  small_row = Grico._ConstraintRow{Float32}([1, 2], Float32[1.0, ldexp(1.0f0, -16)])
+  Grico._cleanup_boundary_row!(small_row, Float32)
+  @test small_row.variables == [1, 2]
+
+  noise_row = Grico._ConstraintRow{Float32}([1, 2], Float32[1.0, eps(Float32)])
+  Grico._cleanup_boundary_row!(noise_row, Float32)
+  @test noise_row.variables == [1]
+
   domain = Grico.Domain((0.0f0, 0.0f0), (2.0f0, 1.0f0), (2, 1))
   grid = Grico.grid(domain)
   first_child = Grico.refine!(grid, 2, 2)
@@ -503,6 +548,20 @@ end
   for y in Float32[-0.75, -0.25, 0.25, 0.75]
     @test _space_value(space, 1, (1.0f0, y), coefficients) ≈ wrapped_value(y, coefficients) atol = 5.0e-5
   end
+
+  @test Grico._relative_interval_position(0, 4, 2, 3, 2) == (2, 2)
+  @test_throws ArgumentError Grico._relative_interval_position(0, 4, 4, 5, 2)
+  @test_throws ArgumentError Grico._relative_interval_position(0, 4, 1, 3, 2)
+  @test_throws ArgumentError Grico._relative_interval_position(0, 4, 0, 2, 1)
+
+  one_dimensional = Grico.Domain((0.0,), (1.0,), (1,))
+  state = Grico._build_space_state(one_dimensional, Grico.snapshot(Grico.grid(one_dimensional)),
+                                   Grico.FullTensorBasis(), [(1,)])
+  restriction_cache = Dict{NTuple{4,Int},Matrix{Float64}}()
+  @test_throws ArgumentError Grico._dyadic_restriction_coefficient!(restriction_cache, state, 0, 1,
+                                                                    0, 1, -1, 1, 1, 0, 1)
+  @test_throws ArgumentError Grico._dyadic_restriction_coefficient!(restriction_cache, state, 0, 1,
+                                                                    0, 1, 0, 1, 1, 2, 1)
 end
 
 @testset "Periodic Continuity" begin

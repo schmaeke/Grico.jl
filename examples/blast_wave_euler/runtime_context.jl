@@ -337,7 +337,8 @@ function build_blast_wave_euler_context(; root_counts=ROOT_COUNTS, degree=POLYDE
   conserved = VectorField(space, 4; name=:conserved)
   initial_state = project_initial_condition(conserved,
                                             x -> blast_wave_initial_condition(x; gamma,
-                                                                              center=BLAST_CENTER))
+                                                                              center=BLAST_CENTER);
+                                            solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   return blast_wave_context(conserved, initial_state; gamma, cfl, degree)
 end
 

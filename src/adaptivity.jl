@@ -64,6 +64,7 @@ function _adaptivity_limit_tuple(value, D::Int, name::AbstractString, check)
 end
 
 @inline function _checked_int_representable(value::Integer, name::AbstractString)
+  value isa Bool && throw(ArgumentError("$name must be an integer, not Bool"))
   typemin(Int) <= value <= typemax(Int) ||
     throw(ArgumentError("$name must be an Int-representable integer"))
   return Int(value)
@@ -252,6 +253,19 @@ end
 # Every active target leaf must satisfy the user-specified `h`/`p` bounds. This
 # check is applied both when a plan is constructed from raw arrays and after
 # derived plan-generation routines have assembled a tentative target state.
+function _target_leaf_within_limits(grid_data::CartesianGrid{D}, leaf::Int, degrees::NTuple{D,Int},
+                                    limits::AdaptivityLimits{D}) where {D}
+  for axis in 1:D
+    leaf_level = level(grid_data, leaf, axis)
+    leaf_level >= limits.min_h_level[axis] || return false
+    leaf_level <= limits.max_h_level[axis] || return false
+    degrees[axis] >= limits.min_p[axis] || return false
+    degrees[axis] <= limits.max_p[axis] || return false
+  end
+
+  return true
+end
+
 function _check_target_leaf(grid_data::CartesianGrid{D}, leaf::Int, degrees::NTuple{D,Int},
                             limits::AdaptivityLimits{D}) where {D}
   for axis in 1:D
@@ -535,9 +549,9 @@ function _filter_target_snapshot!(target_domain::AbstractDomain{D},
   return _snapshot(grid(target_domain), active)
 end
 
-# Snapshot source degrees before batched topology edits. The dictionary form is
-# temporary and intentionally mirrors the target-grid cell numbers while splits
-# and collapses insert or remove leaves.
+# Snapshot source degrees before batched topology edits. The transient
+# dictionary mirrors the target-grid cell numbers while splits and collapses
+# insert or remove leaves.
 function _source_degree_map(space::HpSpace{D}) where {D}
   mapping = Dict{Int,NTuple{D,Int}}()
   sizehint!(mapping, active_leaf_count(space))
@@ -843,24 +857,27 @@ Enumerate admissible immediate `h`-coarsening candidates on `space`.
 
 Only immediate parent cells whose two children are both active leaves are
 returned. The candidates therefore correspond exactly to derefinement moves that
-can be applied without first collapsing deeper descendants.
+can be applied without first collapsing deeper descendants. `limits` are applied
+to the merged parent level and canonical merged degree, so returned candidates
+can be passed directly to batched plan construction under the same bounds.
 """
 function h_coarsening_candidates(space::HpSpace{D}; limits=AdaptivityLimits(space)) where {D}
   checked_limits = _checked_limits(limits, space)
   candidates = HCoarseningCandidate{D}[]
+  grid_data = grid(space)
   space_snapshot = snapshot(space)
 
-  for cell in 1:stored_cell_count(grid(space))
+  for cell in 1:stored_cell_count(grid_data)
     is_expanded(space_snapshot, cell) || continue
     axis = _snapshot_structural_split_axis(space_snapshot, cell)
-    level(grid(space), cell, axis) >= checked_limits.min_h_level[axis] || continue
     first = _snapshot_first_child(space_snapshot, cell)
     first == NONE && continue
     children = ntuple(offset -> first + offset - 1, _MIDPOINT_CHILD_COUNT)
     all(child -> is_active_leaf(space_snapshot, child) && space_snapshot.leaf_to_index[child] != 0,
         children) || continue
-    push!(candidates,
-          HCoarseningCandidate(cell, axis, children, _candidate_target_degrees(space, children)))
+    target_degrees = _candidate_target_degrees(space, children)
+    _target_leaf_within_limits(grid_data, cell, target_degrees, checked_limits) || continue
+    push!(candidates, HCoarseningCandidate(cell, axis, children, target_degrees))
   end
 
   return candidates
@@ -1006,7 +1023,8 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
   descendants = Int[]
   _collect_active_descendants!(descendants, target_snapshot(plan), leaf)
   h_axes = fill(false, D)
-  p_degree_changes = fill(typemin(Int), D)
+  p_positive_changes = fill(0, D)
+  p_negative_changes = fill(0, D)
   p_refined = false
   p_derefined = false
   has_target_descendant = false
@@ -1021,7 +1039,8 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
     for axis in 1:D
       h_axes[axis] |= target_levels[axis] > source_levels[axis]
       change = target_degrees[axis] - source_degrees[axis]
-      p_degree_changes[axis] = max(p_degree_changes[axis], change)
+      change > 0 && (p_positive_changes[axis] = max(p_positive_changes[axis], change))
+      change < 0 && (p_negative_changes[axis] = min(p_negative_changes[axis], change))
       p_refined |= change > 0
       p_derefined |= change < 0
     end
@@ -1030,7 +1049,8 @@ function _source_leaf_change(plan::AdaptivityPlan{D}, leaf::Int) where {D}
   has_target_descendant ||
     return _SourceLeafChange(ntuple(_ -> false, D), ntuple(_ -> 0, D), false, false)
   return _SourceLeafChange(ntuple(axis -> h_axes[axis], D),
-                           ntuple(axis -> p_degree_changes[axis], D), p_refined, p_derefined)
+                           ntuple(axis -> p_positive_changes[axis] > 0 ? p_positive_changes[axis] :
+                                          p_negative_changes[axis], D), p_refined, p_derefined)
 end
 
 function _source_refinement_axes(plan::AdaptivityPlan{D}, leaf::Int) where {D}
@@ -1056,12 +1076,14 @@ end
 """
     p_degree_change(plan, leaf)
 
-Return the maximum per-axis target degree change over the active target
+Return a compact per-axis target degree-change direction over the active target
 descendants of one source active leaf.
 
-Positive entries indicate `p`-refinement somewhere below the source leaf,
-negative entries indicate `p`-derefinement, and zero indicates that no target
-descendant changes the degree on that axis.
+Positive entries indicate `p`-refinement somewhere below the source leaf. If no
+descendant is `p`-refined on an axis, negative entries report the strongest
+`p`-derefinement; zero means all target descendants preserve the source degree
+on that axis. [`adaptivity_summary`](@ref) reports refinement and derefinement
+counts independently.
 """
 function p_degree_change(plan::AdaptivityPlan{D}, leaf::Integer) where {D}
   checked_leaf = _checked_cell(grid(source_space(plan)), leaf)

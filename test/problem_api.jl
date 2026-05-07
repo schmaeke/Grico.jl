@@ -1,7 +1,18 @@
 using Test
 using Grico
+import Grico: AbstractField, PointQuadrature, SurfaceQuadrature, add_boundary!, add_cell!,
+              add_surface!, add_surface_quadrature!, local_dof_index, local_mode_count, point_count,
+              shape_value
 
 struct _ProblemApiBoundaryMarker end
+
+struct _ProblemApiOperatorClass <: Grico.AbstractOperatorClass end
+
+struct _ProblemApiDirichletFunctor{T}
+  value::T
+end
+
+(data::_ProblemApiDirichletFunctor)(x) = data.value
 
 struct _ProblemApiSurfaceLoad{F,T}
   field::F
@@ -46,6 +57,7 @@ end
     @test fields(problem) == (u,)
     @test field_count(problem) == 1
     @test operator_class(AffineProblem(u; operator_class=SPD())) isa SPD
+    @test operator_class(ResidualProblem(u; operator_class=SPD())) isa SPD
     @test propertynames(problem) == ()
     _throws_problem_argument_message(() -> getproperty(problem, :cell_operators), "problem storage")
     _throws_problem_argument_message(() -> setproperty!(problem, :fields, AbstractField[]),
@@ -64,6 +76,20 @@ end
     @test_throws ArgumentError AffineProblem()
     @test_throws ArgumentError AffineProblem(u, u)
     @test_throws ArgumentError AffineProblem(u, w)
+    @test_throws ArgumentError AffineProblem(u; operator_class=:spd)
+    @test_throws ArgumentError AffineProblem(u; operator_class=_ProblemApiOperatorClass())
+
+    boundary = BoundaryFace(1, LOWER)
+    @test Dirichlet(u, boundary, [1], 0.0).components == (1,)
+    @test_throws ArgumentError Dirichlet(u, boundary, true, 0.0)
+    @test_throws ArgumentError Dirichlet(u, boundary, [true], 0.0)
+    @test_throws ArgumentError Dirichlet(u, boundary, Int[], 0.0)
+    @test MeanValue(u, 2).target === 2.0
+    @test_throws ArgumentError MeanValue(u, "bad")
+
+    vector_field = VectorField(space, 2; name=:vector)
+    @test MeanValue(vector_field, [1, 2]).target === (1.0, 2.0)
+    @test_throws ArgumentError MeanValue(vector_field, [1.0])
 
     problem = AffineProblem(u)
     @test add_cell!(problem, _ProblemApiBoundaryMarker()) === problem
@@ -83,6 +109,19 @@ end
     dg_field = ScalarField(dg_space; name=:dg)
     @test_throws ArgumentError add_constraint!(AffineProblem(dg_field),
                                                Dirichlet(dg_field, BoundaryFace(1, LOWER), 0.0))
+
+    functor_problem = AffineProblem(u)
+    add_constraint!(functor_problem, Dirichlet(u, boundary, _ProblemApiDirichletFunctor(1.25)))
+    functor_plan = compile(functor_problem)
+    @test !isempty(functor_plan.dirichlet.fixed_dofs) || !isempty(functor_plan.dirichlet.rows)
+
+    thin_domain = Domain((0.0, 0.0), (1.0, 1.0e-16), (1, 1))
+    thin_space = HpSpace(thin_domain, SpaceOptions(degree=UniformDegree(1)))
+    thin_field = ScalarField(thin_space; name=:thin)
+    thin_problem = AffineProblem(thin_field)
+    add_constraint!(thin_problem, Dirichlet(thin_field, BoundaryFace(1, LOWER), 2.0))
+    thin_plan = compile(thin_problem)
+    @test !isempty(thin_plan.dirichlet.fixed_dofs) || !isempty(thin_plan.dirichlet.rows)
   end
 
   @testset "Contribution Types And Surface Tags" begin

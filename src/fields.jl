@@ -35,7 +35,9 @@
 """
     AbstractField
 
-Abstract supertype for unknowns that live on an [`HpSpace`](@ref).
+Internal supertype for unknowns that live on an [`HpSpace`](@ref). The
+supported user-facing field descriptors are [`ScalarField`](@ref) and
+[`VectorField`](@ref).
 
 Fields describe the semantic blocks that appear in a discretized problem, for
 example a scalar pressure, a concentration, or a vector-valued velocity. A
@@ -58,9 +60,19 @@ const _FIELD_ID_COUNTER = Base.RefValue{UInt64}(0)
 # problems use this identifier rather than names to decide field equality, so
 # two distinct fields may legitimately share a descriptive name without being
 # mistaken for one another.
-@inline function _next_field_id()
+struct _FieldIdentity
+  value::UInt64
+
+  function _FieldIdentity(value::UInt64)
+    value != 0 || throw(ArgumentError("field id must be positive"))
+    return new(value)
+  end
+end
+
+@inline function _next_field_identity()
+  _FIELD_ID_COUNTER[] != typemax(UInt64) || throw(ArgumentError("field id counter overflowed"))
   _FIELD_ID_COUNTER[] += 1
-  return _FIELD_ID_COUNTER[]
+  return _FieldIdentity(_FIELD_ID_COUNTER[])
 end
 
 """
@@ -77,11 +89,15 @@ struct ScalarField <: AbstractField
   id::UInt64
   space::HpSpace
   name::Symbol
+
+  function ScalarField(identity::_FieldIdentity, space::HpSpace, name::Symbol)
+    return new(identity.value, space, name)
+  end
 end
 
-ScalarField(space::HpSpace; name::Symbol=:field) = ScalarField(_next_field_id(), space, name)
+ScalarField(space::HpSpace; name::Symbol=:field) = ScalarField(_next_field_identity(), space, name)
 function ScalarField(id::Integer, space::HpSpace, name::Symbol)
-  return ScalarField(UInt64(_checked_positive(id, "id")), space, name)
+  throw(ArgumentError("field identities are internal; use ScalarField(space; name=...)"))
 end
 
 """
@@ -104,22 +120,19 @@ struct VectorField <: AbstractField
   components::Int
   name::Symbol
 
-  function VectorField(id::UInt64, space::HpSpace, components::Int, name::Symbol)
-    return new(id, space, _checked_positive(components, "components"), name)
+  function VectorField(identity::_FieldIdentity, space::HpSpace, components::Int, name::Symbol)
+    checked_components = _checked_positive(components, "components")
+    _checked_field_dof_count(checked_components, scalar_dof_count(space))
+    return new(identity.value, space, checked_components, name)
   end
 end
 
 function VectorField(space::HpSpace, components::Integer; name::Symbol=:field)
-  return VectorField(_next_field_id(), space, _checked_positive(components, "components"), name)
+  return VectorField(_next_field_identity(), space, _checked_positive(components, "components"),
+                     name)
 end
 function VectorField(id::Integer, space::HpSpace, components::Integer, name::Symbol)
-  return VectorField(UInt64(_checked_positive(id, "id")), space,
-                     _checked_positive(components, "components"), name)
-end
-
-scalar_field(space::HpSpace; name::Symbol=:field) = ScalarField(space; name)
-function vector_field(space::HpSpace, components::Integer; name::Symbol=:field)
-  VectorField(space, components; name)
+  throw(ArgumentError("field identities are internal; use VectorField(space, components; name=...)"))
 end
 
 """
@@ -168,10 +181,53 @@ For a validated [`FieldLayout`](@ref), the two-argument form returns the size of
 the block occupied by `field` within that particular global layout.
 """
 function field_dof_count(field::AbstractField)
-  component_count(field) * scalar_dof_count(field_space(field))
+  return _checked_field_dof_count(component_count(field), scalar_dof_count(field_space(field)))
 end
 
 @inline _field_id(field::AbstractField) = field.id
+@inline _field_identity(field::AbstractField) = _FieldIdentity(_field_id(field))
+
+function _field_with_identity(field::ScalarField, space::HpSpace, name::Symbol=field_name(field))
+  return ScalarField(_field_identity(field), space, name)
+end
+
+function _field_with_identity(field::VectorField, space::HpSpace, name::Symbol=field_name(field))
+  return VectorField(_field_identity(field), space, component_count(field), name)
+end
+
+@inline function _checked_field_dof_count(components::Int, scalar_count::Int)
+  components >= 1 || throw(ArgumentError("field component count must be positive"))
+  return _checked_nonnegative_dof_product(components, scalar_count, "field dof count")
+end
+
+@inline function _checked_nonnegative_dof_product(factor::Int, scalar_count::Int,
+                                                  name::AbstractString)
+  factor >= 0 || throw(ArgumentError("$name factor must be non-negative"))
+  scalar_count >= 0 || throw(ArgumentError("scalar dof count must be non-negative"))
+  total = Int128(factor) * Int128(scalar_count)
+  total <= typemax(Int) || throw(ArgumentError("$name must be Int-representable"))
+  return Int(total)
+end
+
+@inline function _checked_layout_dof_sum(current::Int, increment::Int)
+  current >= 0 && increment >= 0 || throw(ArgumentError("layout dof counts must be non-negative"))
+  total = Int128(current) + Int128(increment)
+  total <= typemax(Int) || throw(ArgumentError("layout dof count must be Int-representable"))
+  return Int(total)
+end
+
+@inline function _checked_layout_offset(current_dofs::Int)
+  offset = Int128(current_dofs) + 1
+  offset <= typemax(Int) || throw(ArgumentError("field slot offset must be Int-representable"))
+  return Int(offset)
+end
+
+@inline function _checked_index_range(first::Int, count::Int, name::AbstractString)
+  count >= 0 || throw(ArgumentError("$name length must be non-negative"))
+  last = Int128(first) + Int128(count) - 1
+  last <= typemax(Int) || throw(ArgumentError("$name end index must be Int-representable"))
+  return first:Int(last)
+end
 
 # Field layouts.
 
@@ -229,7 +285,7 @@ function _validate_field_layout(slots::Vector{_FieldSlot{D,T}},
   seen_ids = Set{UInt64}()
   first_slot = slots[1]
   reference = _field_layout_reference(first_slot.space)
-  expected_offset = 1
+  expected_dofs = 0
 
   for slot in slots
     field = slot.field
@@ -239,19 +295,21 @@ function _validate_field_layout(slots::Vector{_FieldSlot{D,T}},
     field_space(field) === space ||
       throw(ArgumentError("field slots must store the owning field space"))
     _check_field_layout_space(space, reference)
-    slot.offset == expected_offset ||
+    slot.offset == _checked_layout_offset(expected_dofs) ||
       throw(ArgumentError("field slots must use contiguous one-based offsets"))
     scalar_dof_count(space) == slot.scalar_dof_count ||
       throw(ArgumentError("field slot scalar-dof counts must match the owning space"))
-    component_count(field) * slot.scalar_dof_count == slot.dof_count ||
+    _checked_field_dof_count(component_count(field), slot.scalar_dof_count) == slot.dof_count ||
       throw(ArgumentError("field slot dof counts must match the field component count"))
-    expected_offset += slot.dof_count
+    expected_dofs = _checked_layout_dof_sum(expected_dofs, slot.dof_count)
   end
 
-  layout_dof_count == expected_offset - 1 ||
+  layout_dof_count == expected_dofs ||
     throw(ArgumentError("layout dof count must match the field slots"))
   return nothing
 end
+
+FieldLayout(field::AbstractField) = FieldLayout((field,))
 
 function FieldLayout(fields)
   field_vector = _checked_layout_fields(fields)
@@ -279,7 +337,7 @@ function _field_layout(field_vector::Vector{AbstractField})
   first_field = field_vector[1]
   first_space = field_space(first_field)
   reference = _field_layout_reference(first_space)
-  offset = 1
+  total_dofs = 0
   seen_ids = Set{UInt64}()
   slots = _FieldSlot{dimension(first_space),eltype(reference.origin)}[]
 
@@ -287,22 +345,24 @@ function _field_layout(field_vector::Vector{AbstractField})
     _register_layout_field!(seen_ids, field)
     space = field_space(field)
     _check_field_layout_space(space, reference)
-    slot = _field_slot(field, offset)
+    slot = _field_slot(field, _checked_layout_offset(total_dofs))
     push!(slots, slot)
-    offset += slot.dof_count
+    total_dofs = _checked_layout_dof_sum(total_dofs, slot.dof_count)
   end
 
-  return FieldLayout{dimension(first_space),eltype(reference.origin)}(slots, offset - 1)
+  return FieldLayout{dimension(first_space),eltype(reference.origin)}(slots, total_dofs)
 end
 
 # Shared reference data that all fields in one layout must match exactly. The
 # active-leaf set, physical box, periodic axes, and physical-region identity
 # together identify the common discrete and geometric setting in which all field
 # blocks are interpreted.
-struct _FieldLayoutReference{L,O,E,P,R,M}
+struct _FieldLayoutReference{L,S,C,O,E,P,R,M}
   dimension::Int
   scalar_type::DataType
   active_leaves::L
+  active_signatures::S
+  root_counts::C
   origin::O
   extent::E
   periodic::P
@@ -311,8 +371,11 @@ struct _FieldLayoutReference{L,O,E,P,R,M}
 end
 
 @inline function _field_layout_reference(space::HpSpace)
+  space_snapshot = snapshot(space)
   return _FieldLayoutReference(dimension(space), eltype(origin(space)),
-                               snapshot(space).active_leaves, origin(space), extent(space),
+                               space_snapshot.active_leaves,
+                               _active_leaf_signatures(space_snapshot),
+                               root_cell_counts(grid(space)), origin(space), extent(space),
                                periodic_axes(space), _physical_region(domain(space)),
                                _cell_measure(domain(space)))
 end
@@ -323,8 +386,12 @@ function _check_field_layout_space(space::HpSpace, reference::_FieldLayoutRefere
     throw(ArgumentError("all fields must use the same dimension"))
   eltype(origin(space)) == reference.scalar_type ||
     throw(ArgumentError("all fields must use the same scalar type"))
+  root_cell_counts(grid(space)) == reference.root_counts ||
+    throw(ArgumentError("all fields must share the same root-cell topology"))
   snapshot(space).active_leaves == reference.active_leaves ||
     throw(ArgumentError("all fields must share the same active-leaf topology"))
+  _active_leaf_signatures(snapshot(space)) == reference.active_signatures ||
+    throw(ArgumentError("all fields must share the same active-leaf geometry"))
   origin(space) == reference.origin && extent(space) == reference.extent ||
     throw(ArgumentError("all fields must share the same physical domain"))
   periodic_axes(space) == reference.periodic ||
@@ -370,7 +437,7 @@ fields(layout::FieldLayout) = Tuple(slot.field for slot in layout.slots)
 function _field_slot(field::AbstractField, offset::Int)
   space = field_space(field)
   scalar_count = scalar_dof_count(space)
-  slot_dof_count = component_count(field) * scalar_count
+  slot_dof_count = _checked_field_dof_count(component_count(field), scalar_count)
   return _FieldSlot(field, space, offset, scalar_count, slot_dof_count)
 end
 
@@ -394,12 +461,15 @@ end
   return @inbounds layout.slots[_field_slot_index(layout, field)]
 end
 
-@inline _field_slot_range(slot::_FieldSlot) = slot.offset:(slot.offset+slot.dof_count-1)
+@inline _field_slot_range(slot::_FieldSlot) = _checked_index_range(slot.offset, slot.dof_count,
+                                                                   "field slot range")
 
 @inline function _field_component_range(slot::_FieldSlot, field::AbstractField, component::Integer)
   checked_component = _require_index(component, component_count(field), "field component")
-  first = slot.offset + (checked_component - 1) * slot.scalar_dof_count
-  return first:(first+slot.scalar_dof_count-1)
+  local_offset = _checked_nonnegative_dof_product(checked_component - 1, slot.scalar_dof_count,
+                                                  "field component offset")
+  first = _checked_layout_dof_sum(slot.offset - 1, local_offset) + 1
+  return _checked_index_range(first, slot.scalar_dof_count, "field component range")
 end
 
 """
@@ -464,6 +534,7 @@ struct State{T<:AbstractFloat,V<:AbstractVector{T},L<:FieldLayout}
                                                 L<:FieldLayout}
     length(coefficients) == dof_count(layout) ||
       throw(ArgumentError("coefficient vector length must match the layout dof count"))
+    _require_one_based_vector(coefficients, "coefficient vector")
     return new{T,V,L}(layout, coefficients)
   end
 end

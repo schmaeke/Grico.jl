@@ -138,14 +138,40 @@ end
   @test Grico.l2_error(state, u, [1.0]) ≈ 1.0 atol = VERIFICATION_TOL
   @test_throws ArgumentError Grico.l2_error(state, u, (1.0, 2.0))
   @test_throws ArgumentError Grico.l2_error(state, u, [1.0, 2.0])
+  @test_throws ArgumentError Grico.l2_error(state, u, "bad")
+  @test_throws ArgumentError Grico.l2_error(state, u, NaN)
   @test Grico.relative_l2_error(state, u, 0.0) == 0.0
   Grico.coefficients(state) .= 1.0
   @test Grico.relative_l2_error(state, u, 0.0) == Inf
+  Grico.coefficients(state) .= NaN
+  @test_throws ArgumentError Grico.l2_error(state, u, 0.0)
+  Grico.coefficients(state) .= 0.0
   @test_throws ArgumentError Grico.l2_error(state, u, 1.0;
                                             cell_quadratures=(1 => quadrature, 1 => quadrature))
   @test_throws ArgumentError Grico.l2_error(state, u, 1.0; cell_quadratures=(1.5 => quadrature,))
   wrong_dimension = Grico.PointQuadrature([(0.0, 0.0)], [1.0])
   @test_throws ArgumentError Grico.l2_error(state, u, 1.0; cell_quadratures=(1 => wrong_dimension,))
+  negative_weight = Grico.PointQuadrature([(0.0,)], [-2.0])
+  @test_throws ArgumentError Grico.l2_error(state, u, 1.0; cell_quadratures=(1 => negative_weight,))
+  @test_throws ArgumentError Grico.l2_error(state, u, 1.0; extra_points=typemax(Int))
+end
+
+@testset "Vector Reference Evaluation" begin
+  domain = Grico.Domain((0.0,), (1.0,), (1,))
+  space = Grico.HpSpace(domain,
+                        Grico.SpaceOptions(basis=Grico.FullTensorBasis(),
+                                           degree=Grico.UniformDegree(1)))
+  v = Grico.VectorField(space, 2; name=:v)
+  state = Grico.State(Grico.FieldLayout((v,)))
+  quadrature = Grico.PointQuadrature([(-0.5,), (0.5,)], [1.0, 1.0])
+  calls = Ref(0)
+  exact = x -> begin
+    calls[] += 1
+    return (1.0, 2.0)
+  end
+
+  @test Grico.l2_error(state, v, exact; cell_quadratures=(1 => quadrature,)) ≈ sqrt(5.0) atol = VERIFICATION_TOL
+  @test calls[] == Grico.point_count(quadrature)
 end
 
 @testset "Physical Verification Quadrature Enrichment" begin

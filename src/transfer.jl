@@ -7,14 +7,18 @@ struct _TransferMass{F}
   field::F
 end
 
-# The transfer source operator evaluates the old state on target quadrature
-# points and injects those values into the right-hand side of the projection
-# system. Together with `_TransferMass` this yields the Galerkin `L²`
-# projection from the source field to the target field.
-struct _TransferSource{F,C,TR}
+# The transfer source operator evaluates the old state over source-target
+# overlap quadrature and injects those values into the right-hand side of the
+# projection system. Together with `_TransferMass` this yields the Galerkin
+# `L²` projection from the source field to the target field.
+struct _TransferSource{F,C,TR,B,P,W}
   field::F
   old_coefficients::C
   transition::TR
+  source_basis::B
+  target_basis::B
+  reference_points::P
+  reference_weights::W
 end
 
 # Compiled setup for the fully-DG transfer path. It mirrors the affine fallback
@@ -45,25 +49,33 @@ mutable struct _CellwiseDGTransferScratch{D,T<:AbstractFloat}
   matrix::Matrix{T}
   rhs::Vector{T}
   source_basis::NTuple{D,Vector{T}}
+  target_basis::NTuple{D,Vector{T}}
+  reference_points::Vector{NTuple{D,T}}
+  reference_weights::Vector{T}
 end
 
 function _CellwiseDGTransferScratch(::Type{T}, ::Val{D},
                                     local_dof_count::Int) where {D,T<:AbstractFloat}
   return _CellwiseDGTransferScratch{D,T}(Matrix{T}(undef, local_dof_count, local_dof_count),
-                                         Vector{T}(undef, local_dof_count), ntuple(_ -> T[], D))
+                                         Vector{T}(undef, local_dof_count), ntuple(_ -> T[], D),
+                                         ntuple(_ -> T[], D), NTuple{D,T}[], T[])
 end
 
 mutable struct _LocalProjectionTransferScratch{D,T<:AbstractFloat}
   matrix::Matrix{T}
   rhs::Vector{T}
   source_basis::NTuple{D,Vector{T}}
+  target_basis::NTuple{D,Vector{T}}
+  reference_points::Vector{NTuple{D,T}}
+  reference_weights::Vector{T}
 end
 
 function _LocalProjectionTransferScratch(::Type{T}, ::Val{D},
                                          local_dof_count::Int) where {D,T<:AbstractFloat}
   return _LocalProjectionTransferScratch{D,T}(Matrix{T}(undef, local_dof_count, local_dof_count),
                                               Vector{T}(undef, local_dof_count),
-                                              ntuple(_ -> T[], D))
+                                              ntuple(_ -> T[], D), ntuple(_ -> T[], D),
+                                              NTuple{D,T}[], T[])
 end
 
 # Assemble the element-local mass matrix
@@ -125,90 +137,227 @@ function cell_apply!(local_result, operator::_TransferMass, values::CellValues, 
   return nothing
 end
 
-# State transfer repeatedly asks whether a target quadrature point belongs to a
-# candidate source leaf. The tolerance keeps roundoff near shared faces from
-# creating spurious "point not found" failures.
-@inline function _point_in_cell(domain_data::AbstractDomain{D,T}, leaf::Int, x::NTuple{D,<:Real};
-                                tolerance::T=T(1.0e-12)) where {D,T<:AbstractFloat}
-  lower = cell_lower(domain_data, leaf)
-  upper = cell_upper(domain_data, leaf)
-
-  @inbounds for axis in 1:D
-    coordinate = T(x[axis])
-    (lower[axis] - tolerance <= coordinate <= upper[axis] + tolerance) || return false
-  end
-
-  return true
-end
-
-# Locate the source leaf that supplies a value at a target quadrature point.
-# The transition precomputes the small overlap set, so this search is local to
-# one target leaf instead of scanning the full source mesh.
-function _source_leaf_at_point(transition::SpaceTransition{D,T}, target_leaf::Int,
-                               x::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  return _source_leaf_at_point(transition, domain(source_space(transition)), target_leaf, x)
-end
-
-function _source_leaf_at_point(transition::SpaceTransition{D,T}, source_domain::AbstractDomain{D,T},
-                               target_leaf::Int, x::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
-  first, count = _source_leaf_range_unchecked(transition, target_leaf)
-
-  for index in first:(first+count-1)
-    leaf = @inbounds transition.source_leaf_data[index]
-    _point_in_cell(source_domain, leaf, x; tolerance=T(1.0e-12)) && return leaf
-  end
-
-  throw(ArgumentError("point $x does not lie in any source leaf for target leaf $target_leaf"))
-end
-
 # Evaluate the projection right-hand side
 #   b_i = ∫_K u_old φ_i dΩ
-# by sampling the old state at the physical target quadrature points.
-function _add_transfer_rhs_at_point!(local_rhs, values::CellValues, old_coefficients,
-                                     new_field::AbstractField, source_compiled::_CompiledLeaf{D,T},
-                                     source_basis::NTuple{D,Vector{T}}, point_index::Int,
-                                     weighted) where {D,T<:AbstractFloat}
-  mode_count = local_mode_count(values, new_field)
+# over exact source-target overlap boxes. This is essential for h-coarsening:
+# a target cell can cover several source leaves, and the old state may only be
+# piecewise polynomial on that target cell.
+@inline function _compiled_leaf_shape_value(compiled::_CompiledLeaf{D,T},
+                                            basis_values::NTuple{D,Vector{T}},
+                                            mode_index::Int) where {D,T<:AbstractFloat}
+  mode = @inbounds compiled.local_modes[mode_index]
+  value = one(T)
 
-  for component in 1:component_count(new_field)
-    old_value = _leaf_component_value(source_compiled, old_coefficients[component], source_basis)
-    weighted_value = old_value * weighted
+  @inbounds for axis in 1:D
+    value *= basis_values[axis][mode[axis]+1]
+  end
 
-    for mode_index in 1:mode_count
-      shape = shape_value(values, new_field, point_index, mode_index)
-      shape == 0 && continue
-      row = local_dof_index(values, new_field, component, mode_index)
-      local_rhs[row] += weighted_value * shape
+  return value
+end
+
+function _target_overlap_reference_bounds(target_domain::AbstractDomain{D,T}, target_leaf::Int,
+                                          source_domain::AbstractDomain{D,T},
+                                          source_leaf::Int) where {D,T<:AbstractFloat}
+  lower = ntuple(axis -> max(cell_lower(target_domain, target_leaf, axis),
+                             cell_lower(source_domain, source_leaf, axis)), D)
+  upper = ntuple(axis -> min(cell_upper(target_domain, target_leaf, axis),
+                             cell_upper(source_domain, source_leaf, axis)), D)
+
+  for axis in 1:D
+    upper[axis] > lower[axis] || return nothing
+  end
+
+  return map_to_biunit_cube(target_domain, target_leaf, lower),
+         map_to_biunit_cube(target_domain, target_leaf, upper)
+end
+
+function _transfer_overlap_quadrature_shape(source_space_data::HpSpace{D}, source_leaf::Int,
+                                            target_space_data::HpSpace{D},
+                                            target_leaf::Int) where {D}
+  source_shape = cell_quadrature_shape(source_space_data, source_leaf)
+  target_shape = cell_quadrature_shape(target_space_data, target_leaf)
+  return ntuple(axis -> max(source_shape[axis], target_shape[axis]), D)
+end
+
+function _append_reference_subcell_tensor_quadrature!(points::Vector{NTuple{D,T}},
+                                                      weights::Vector{T}, ::Type{T},
+                                                      shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                      upper::NTuple{D,T},
+                                                      weight_scale::T) where {D,T<:AbstractFloat}
+  quadrature = TensorQuadrature(T, shape)
+  center = ntuple(axis -> T(0.5) * (lower[axis] + upper[axis]), D)
+  half_size = ntuple(axis -> T(0.5) * (upper[axis] - lower[axis]), D)
+  scale = weight_scale * prod(half_size)
+
+  for point_index in 1:point_count(quadrature)
+    η = point(quadrature, point_index)
+    ξ = ntuple(axis -> muladd(half_size[axis], η[axis], center[axis]), D)
+    push!(points, ξ)
+    push!(weights, T(weight(quadrature, point_index)) * scale)
+  end
+
+  return nothing
+end
+
+function _append_physical_overlap_reference_quadrature!(points::Vector{NTuple{D,T}},
+                                                        weights::Vector{T},
+                                                        domain::PhysicalDomain{D,T}, leaf::Int,
+                                                        shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                        upper::NTuple{D,T},
+                                                        weight_scale::T) where {D,T<:AbstractFloat}
+  classification = _classify_leaf(domain.region, domain, leaf)
+  classification == :outside && return nothing
+  if classification == :inside
+    _append_reference_subcell_tensor_quadrature!(points, weights, T, shape, lower, upper,
+                                                 weight_scale)
+    return nothing
+  end
+
+  base_quadrature = TensorQuadrature(T, shape)
+  first_point = length(points) + 1
+  _collect_finite_cell_candidates!(points, weights, _background_domain(domain), leaf,
+                                   domain.region.classifier, base_quadrature, lower, upper,
+                                   domain.region.subdivision_depth)
+
+  for index in first_point:length(weights)
+    weights[index] *= weight_scale
+  end
+
+  return nothing
+end
+
+function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,T}},
+                                                        weights::Vector{T},
+                                                        domain::AbstractDomain{D,T}, leaf::Int,
+                                                        shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                        upper::NTuple{D,T}) where {D,
+                                                                                   T<:AbstractFloat}
+  _append_reference_subcell_tensor_quadrature!(points, weights, T, shape, lower, upper, one(T))
+  return nothing
+end
+
+function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,T}},
+                                                        weights::Vector{T},
+                                                        domain::PhysicalDomain{D,T}, leaf::Int,
+                                                        shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                        upper::NTuple{D,T}) where {D,
+                                                                                   T<:AbstractFloat}
+  return _append_transfer_overlap_reference_quadrature!(points, weights, domain, leaf, shape, lower,
+                                                        upper, _cell_measure(domain))
+end
+
+function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,T}},
+                                                        weights::Vector{T},
+                                                        domain::PhysicalDomain{D,T}, leaf::Int,
+                                                        shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                        upper::NTuple{D,T},
+                                                        ::PhysicalMeasure) where {D,
+                                                                                  T<:AbstractFloat}
+  _append_physical_overlap_reference_quadrature!(points, weights, domain, leaf, shape, lower, upper,
+                                                 one(T))
+  return nothing
+end
+
+function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,T}},
+                                                        weights::Vector{T},
+                                                        domain::PhysicalDomain{D,T}, leaf::Int,
+                                                        shape::NTuple{D,Int}, lower::NTuple{D,T},
+                                                        upper::NTuple{D,T},
+                                                        measure::FiniteCellExtension) where {D,
+                                                                                             T<:AbstractFloat}
+  alpha = T(measure.alpha)
+  alpha == one(T) &&
+    return _append_reference_subcell_tensor_quadrature!(points, weights, T, shape, lower, upper,
+                                                        one(T))
+  alpha > zero(T) &&
+    _append_reference_subcell_tensor_quadrature!(points, weights, T, shape, lower, upper, alpha)
+  physical_scale = one(T) - alpha
+  physical_scale > zero(T) &&
+    _append_physical_overlap_reference_quadrature!(points, weights, domain, leaf, shape, lower,
+                                                   upper, physical_scale)
+  return nothing
+end
+
+function _add_transfer_rhs_at_reference_point!(local_rhs, values::CellValues, new_fields::Tuple,
+                                               source_coefficients,
+                                               source_compiled::_CompiledLeaf{D,T},
+                                               target_compiled::_CompiledLeaf{D,T},
+                                               source_basis::NTuple{D,Vector{T}},
+                                               target_basis::NTuple{D,Vector{T}},
+                                               weighted::T) where {D,T<:AbstractFloat}
+  for field_index in eachindex(new_fields)
+    new_field = new_fields[field_index]
+    old_coefficients = source_coefficients[field_index]
+    mode_count = local_mode_count(values, new_field)
+
+    for component in 1:component_count(new_field)
+      old_value = _leaf_component_value(source_compiled, old_coefficients[component], source_basis)
+      weighted_value = old_value * weighted
+
+      for mode_index in 1:mode_count
+        shape = _compiled_leaf_shape_value(target_compiled, target_basis, mode_index)
+        shape == zero(T) && continue
+        row = local_dof_index(values, new_field, component, mode_index)
+        local_rhs[row] += weighted_value * shape
+      end
     end
   end
 
   return local_rhs
 end
 
-function _assemble_transfer_rhs!(local_rhs, values::CellValues, transition::SpaceTransition{D,T},
-                                 new_field::AbstractField,
-                                 old_coefficients) where {D,T<:AbstractFloat}
+function _assemble_transfer_rhs!(local_rhs, values::CellValues{D,T},
+                                 transition::SpaceTransition{D,T}, new_fields::Tuple,
+                                 source_coefficients, source_basis::NTuple{D,Vector{T}},
+                                 target_basis::NTuple{D,Vector{T}},
+                                 reference_points::Vector{NTuple{D,T}},
+                                 reference_weights::Vector{T}) where {D,T<:AbstractFloat}
   source_space_data = source_space(transition)
+  target_space_data = target_space(transition)
   source_domain = domain(source_space_data)
-  source_basis = _LeafBasisScratch(T, Val(D)).values
+  target_domain = domain(target_space_data)
+  target_leaf = values.leaf
+  target_compiled = _compiled_leaf(target_space_data, target_leaf)
+  target_jacobian = jacobian_determinant_from_biunit_cube(target_domain, target_leaf)
+  first, count = _source_leaf_range_unchecked(transition, target_leaf)
 
-  for point_index in 1:point_count(values)
-    x = point(values, point_index)
-    source_leaf = _source_leaf_at_point(transition, source_domain, values.leaf, x)
-    ξ = map_to_biunit_cube(source_domain, source_leaf, x)
+  for source_row in first:(first+count-1)
+    source_leaf = @inbounds transition.source_leaf_data[source_row]
+    bounds = _target_overlap_reference_bounds(target_domain, target_leaf, source_domain,
+                                              source_leaf)
+    bounds === nothing && continue
+    lower, upper = bounds
+    shape = _transfer_overlap_quadrature_shape(source_space_data, source_leaf, target_space_data,
+                                               target_leaf)
+    empty!(reference_points)
+    empty!(reference_weights)
+    _append_transfer_overlap_reference_quadrature!(reference_points, reference_weights,
+                                                   target_domain, target_leaf, shape, lower, upper)
     source_compiled = _compiled_leaf(source_space_data, source_leaf)
-    _fill_leaf_basis!(source_basis, source_compiled.degrees, ξ)
-    weighted = weight(values, point_index)
-    _add_transfer_rhs_at_point!(local_rhs, values, old_coefficients, new_field, source_compiled,
-                                source_basis, point_index, weighted)
+
+    for point_index in eachindex(reference_points)
+      ξ_target = reference_points[point_index]
+      x = map_from_biunit_cube(target_domain, target_leaf, ξ_target)
+      ξ_source = map_to_biunit_cube(source_domain, source_leaf, x)
+      _fill_leaf_basis!(source_basis, source_compiled.degrees, ξ_source)
+      _fill_leaf_basis!(target_basis, target_compiled.degrees, ξ_target)
+      weighted = reference_weights[point_index] * target_jacobian
+      _add_transfer_rhs_at_reference_point!(local_rhs, values, new_fields, source_coefficients,
+                                            source_compiled, target_compiled, source_basis,
+                                            target_basis, weighted)
+    end
   end
 
   return local_rhs
 end
 
-function cell_rhs!(local_rhs, operator::_TransferSource, values::CellValues)
-  _assemble_transfer_rhs!(local_rhs, values, operator.transition, operator.field,
-                          operator.old_coefficients)
+function cell_rhs!(local_rhs, operator::_TransferSource{F,C,TR,B,P,W},
+                   values::CellValues{D,T}) where {D,T<:AbstractFloat,F,C,TR<:SpaceTransition{D,T},
+                                                   B,P,W}
+  _assemble_transfer_rhs!(local_rhs, values, operator.transition, (operator.field,),
+                          (operator.old_coefficients,), operator.source_basis,
+                          operator.target_basis, operator.reference_points,
+                          operator.reference_weights)
   return nothing
 end
 
@@ -273,12 +422,25 @@ function _checked_cellwise_transfer_solution(::Type{T}, solution,
   length(solution) == local_dofs ||
     throw(ArgumentError("linear_solve must return one value per local transfer dof"))
 
-  try
-    return solution isa AbstractVector{T} ? solution : Vector{T}(solution)
+  checked = try
+    solution isa AbstractVector{T} ? solution : Vector{T}(solution)
   catch error
     error isa InterruptException && rethrow()
     throw(ArgumentError("linear_solve must return values convertible to the transfer scalar type"))
   end
+
+  _require_one_based_vector(checked, "linear_solve result")
+  _require_finite_transfer_solution(checked, "linear_solve result")
+  return checked
+end
+
+function _require_finite_transfer_solution(solution::AbstractVector{T},
+                                           name::AbstractString) where {T<:AbstractFloat}
+  for index in eachindex(solution)
+    isfinite(solution[index]) || throw(ArgumentError("$name must contain only finite values"))
+  end
+
+  return solution
 end
 
 @inline function _cellwise_transfer_linear_solve(::Type{T}, local_matrix, local_rhs,
@@ -398,29 +560,10 @@ end
 function _assemble_cellwise_transfer_rhs!(local_rhs, cell::CellValues,
                                           plan::Union{_CellwiseDGTransferPlan{D,T},
                                                       _LocalProjectionTransferPlan{D,T}},
-                                          source_coefficients,
-                                          source_basis::NTuple{D,Vector{T}}) where {D,
-                                                                                    T<:AbstractFloat}
-  transition = plan.transition
-  source_space_data = source_space(transition)
-  source_domain = domain(source_space_data)
-
-  for point_index in 1:point_count(cell)
-    x = point(cell, point_index)
-    source_leaf = _source_leaf_at_point(transition, source_domain, cell.leaf, x)
-    ξ = map_to_biunit_cube(source_domain, source_leaf, x)
-    source_compiled = _compiled_leaf(source_space_data, source_leaf)
-    _fill_leaf_basis!(source_basis, source_compiled.degrees, ξ)
-    weighted = weight(cell, point_index)
-
-    for field_index in eachindex(plan.old_fields)
-      new_field = plan.new_fields[field_index]
-      _add_transfer_rhs_at_point!(local_rhs, cell, source_coefficients[field_index], new_field,
-                                  source_compiled, source_basis, point_index, weighted)
-    end
-  end
-
-  return local_rhs
+                                          source_coefficients, scratch) where {D,T<:AbstractFloat}
+  return _assemble_transfer_rhs!(local_rhs, cell, plan.transition, plan.new_fields,
+                                 source_coefficients, scratch.source_basis, scratch.target_basis,
+                                 scratch.reference_points, scratch.reference_weights)
 end
 
 # Solve one independent dense projection system per target DG cell and scatter
@@ -440,8 +583,7 @@ function _transfer_cellwise_dg_state(plan::_CellwiseDGTransferPlan{D,T}, state::
     fill!(matrix_view, zero(T))
     fill!(rhs_view, zero(T))
     _assemble_cellwise_transfer_matrix!(matrix_view, cell, plan.new_fields)
-    _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients,
-                                     scratch.source_basis)
+    _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients, scratch)
     local_solution = _cellwise_transfer_linear_solve(T, matrix_view, rhs_view, linear_solve)
 
     for local_dof in 1:local_dofs
@@ -605,8 +747,7 @@ function _transfer_local_projection_state(plan::_LocalProjectionTransferPlan{D,T
     fill!(matrix_view, zero(T))
     fill!(rhs_view, zero(T))
     _assemble_cellwise_transfer_matrix!(matrix_view, cell, plan.new_fields)
-    _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients,
-                                     scratch.source_basis)
+    _assemble_cellwise_transfer_rhs!(rhs_view, cell, plan, source_coefficients, scratch)
     _regularized_transfer_cholesky_solve!(matrix_view, rhs_view)
     _accumulate_transfer_normal_equation!(diagonal, rhs, couplings, adjacency, cell, rhs_view)
   end
@@ -615,16 +756,22 @@ function _transfer_local_projection_state(plan::_LocalProjectionTransferPlan{D,T
   return State(plan.layout, state_coefficients)
 end
 
-function _transfer_variational_state(transition::SpaceTransition, state::State, old_fields::Tuple,
-                                     new_fields::Tuple; linear_solve)
+function _transfer_variational_state(transition::SpaceTransition{D,T}, state::State{T},
+                                     old_fields::Tuple, new_fields::Tuple;
+                                     linear_solve) where {D,T<:AbstractFloat}
   problem = AffineProblem(new_fields...)
 
   for index in eachindex(old_fields)
     new_field = new_fields[index]
     add_cell!(problem, _TransferMass(new_field))
+    source_basis = _LeafBasisScratch(T, Val(D)).values
+    target_basis = _LeafBasisScratch(T, Val(D)).values
+    reference_points = NTuple{D,T}[]
+    reference_weights = T[]
     add_cell!(problem,
               _TransferSource(new_field, _component_coefficient_views(state, old_fields[index]),
-                              transition))
+                              transition, source_basis, target_basis, reference_points,
+                              reference_weights))
   end
 
   plan = compile(problem)
@@ -640,6 +787,10 @@ function _solve_variational_transfer_plan(plan::AssemblyPlan{D,T};
   reduced_rhs = zeros(T, reduced_dof_count(plan))
   _reduced_rhs!(reduced_rhs, plan, workspace)
   reduced_values = linear_solve(plan, reduced_rhs; workspace=workspace)
+  _require_exact_vector(reduced_values, reduced_dof_count(plan), "linear_solve result")
+  eltype(reduced_values) == T ||
+    throw(ArgumentError("linear_solve result element type must match the plan scalar type"))
+  _require_finite_transfer_solution(reduced_values, "linear_solve result")
   return _state_from_reduced_result(plan, reduced_values)
 end
 

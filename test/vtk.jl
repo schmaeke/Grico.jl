@@ -1,6 +1,7 @@
 using Test
 using Grico
 using WriteVTK
+import Grico: scalar_dof_count
 
 function vtk_xml_attribute(xml::AbstractString, name::AbstractString)
   match_data = match(Regex("$(name)=\"([^\"]+)\""), xml)
@@ -32,6 +33,20 @@ function throws_argument_message(f, needle::AbstractString)
 
   @test false
   return nothing
+end
+
+struct ShiftedVtkFileVector <: AbstractVector{String}
+  data::Vector{String}
+end
+
+Base.size(vector::ShiftedVtkFileVector) = size(vector.data)
+Base.axes(vector::ShiftedVtkFileVector) = (0:(length(vector.data)-1),)
+Base.IndexStyle(::Type{ShiftedVtkFileVector}) = IndexLinear()
+Base.getindex(vector::ShiftedVtkFileVector, index::Int) = vector.data[index+1]
+
+function Base.iterate(vector::ShiftedVtkFileVector, state::Int=1)
+  state > length(vector.data) && return nothing
+  return vector.data[state], state + 1
 end
 
 @testset "VTK Export" begin
@@ -145,6 +160,18 @@ end
            5, 23, 14] .- 1
   end
 
+  mktempdir() do directory
+    quad3_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+    path = write_vtk(joinpath(directory, "quad3"), quad3_domain; sample_degree=3, append=false,
+                     ascii=true)
+    xml = read(path, String)
+
+    @test vtk_xml_attribute(xml, "NumberOfCells") == "1"
+    @test vtk_data_array(xml, "types", Int) == [70]
+    @test vtk_data_array(xml, "connectivity", Int) ==
+          [1, 4, 16, 13, 2, 3, 8, 12, 14, 15, 5, 9, 6, 7, 10, 11] .- 1
+  end
+
   refined_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   refine!(grid(refined_domain), 1, 1)
   refined_space = HpSpace(refined_domain,
@@ -231,6 +258,11 @@ end
     @test occursin("timestep=\"0&lt;1\"", escaped_xml)
     @test occursin("file=\"series&amp;a.vtu\"", escaped_xml)
 
+    shifted_path = write_pvd(joinpath(directory, "shifted.pvd"), ShiftedVtkFileVector([paths[1]]))
+    shifted_xml = read(shifted_path, String)
+    @test occursin("timestep=\"0\"", shifted_xml)
+    @test occursin("series_0000.vtu", shifted_xml)
+
     mesh_path = write_vtk(joinpath(directory, "series_mesh_0000"), state; mesh=true, append=false,
                           ascii=true)
     mesh_pvd_path = write_pvd(joinpath(directory, "series_mesh.pvd"), [mesh_path]; timesteps=[0.0])
@@ -289,6 +321,12 @@ end
                                                    Pair{String,Any}[])
     skeleton2 = Grico.sample_mesh_skeleton(Domain((0.0, 0.0), (1.0, 1.0), (1, 1)))
     sampled1 = sample_postprocess(state)
+    bad_point_data = Pair{String,Union{AbstractVector,AbstractMatrix}}["bad" => [1.0, 2.0, 3.0]]
+    bad_sampled_data = Grico.SampledPostprocess{1,Float64}(sampled1.mesh, bad_point_data,
+                                                           sampled1.cell_data, sampled1.field_data)
+    bad_skeleton_data = Pair{String,Union{AbstractVector,AbstractMatrix}}["bad" => [1.0, 2.0]]
+    bad_skeleton = Grico.SampledMeshSkeleton{1,Float64}([0.0 1.0], reshape([1, 2], 2, 1),
+                                                        bad_skeleton_data)
 
     mktempdir() do directory
       throws_argument_message(() -> write_vtk(joinpath(directory, "unsupported"), domain4;
@@ -303,6 +341,13 @@ end
       throws_argument_message(() -> write_vtk(joinpath(directory, "wrong_mesh"), sampled1;
                                               mesh=true, skeleton=skeleton2, append=false,
                                               ascii=true), "skeleton dimension")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "bad_sampled"), bad_sampled_data;
+                                              append=false, ascii=true),
+                              "point dataset bad must have")
+      throws_argument_message(() -> write_vtk(joinpath(directory, "bad_skeleton"), sampled1;
+                                              mesh=true, skeleton=bad_skeleton, append=false,
+                                              ascii=true),
+                              "mesh-skeleton cell dataset bad must have")
       throws_argument_message(() -> write_vtk(joinpath(directory, "badsub"), domain;
                                               subdivisions=1.5, append=false, ascii=true),
                               "subdivisions must be a positive Int-representable integer")

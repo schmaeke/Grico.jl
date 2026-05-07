@@ -33,7 +33,7 @@ end
 function blast_wave_refinement_indicator_data(context; max_h_level=MAX_H_LEVEL)
   limits = blast_wave_adaptivity_limits(context; max_h_level=max_h_level)
   indicators = Grico.multiresolution_indicators(context.state, context.conserved; limits=limits)
-  axis_values = Matrix{Float64}(undef, dimension(context.space), length(indicators))
+  axis_values = Matrix{Float64}(undef, Grico.dimension(context.space), length(indicators))
   norms = Vector{Float64}(undef, length(indicators))
 
   for leaf_index in eachindex(indicators)

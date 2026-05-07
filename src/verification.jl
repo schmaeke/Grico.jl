@@ -25,10 +25,29 @@
 @inline _checked_verification_extra(extra_points::Integer) = _checked_nonnegative(extra_points,
                                                                                   "extra_points")
 
+@inline function _verification_axis_quadrature_count(layout::FieldLayout, leaf::Int, axis::Int,
+                                                     extra::Int)
+  base = maximum(cell_quadrature_shape(slot.space, leaf)[axis] for slot in layout.slots)
+  extra <= typemax(Int) - base ||
+    throw(ArgumentError("extra_points produces a non-Int-representable verification quadrature count on axis $axis"))
+  return base + extra
+end
+
 @inline function _verification_quadrature_shape(layout::FieldLayout{D}, leaf::Int,
                                                 extra::Int) where {D}
-  return ntuple(axis -> maximum(cell_quadrature_shape(slot.space, leaf)[axis]
-                                for slot in layout.slots) + extra, D)
+  return ntuple(axis -> _verification_axis_quadrature_count(layout, leaf, axis, extra), D)
+end
+
+function _check_verification_quadrature(quadrature::AbstractQuadrature{D,T}) where {D,
+                                                                                    T<:AbstractFloat}
+  _check_reference_quadrature(quadrature)
+
+  for point_index in 1:point_count(quadrature)
+    T(weight(quadrature, point_index)) >= zero(T) ||
+      throw(ArgumentError("verification quadrature weights must be non-negative"))
+  end
+
+  return quadrature
 end
 
 function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
@@ -67,7 +86,7 @@ function _verification_cell_overrides(layout::FieldLayout{D,T}, extra::Int,
       throw(ArgumentError("duplicate verification cell quadrature attachment for leaf $checked_leaf"))
     dimension(attachment.second) == D ||
       throw(ArgumentError("verification cell quadrature dimension must match the space dimension"))
-    _check_reference_quadrature(attachment.second)
+    _check_verification_quadrature(attachment.second)
     push!(explicit_overrides, checked_leaf)
     overrides[checked_leaf] = attachment.second
   end
@@ -127,27 +146,47 @@ end
 # verification.
 @inline _verification_reference_value(data, x) = applicable(data, x) ? data(x) : data
 
-function _verification_component_value(data, x, component::Int, component_total::Int,
-                                       ::Type{T}) where {T<:AbstractFloat}
-  value = _verification_reference_value(data, x)
-
+function _checked_verification_reference_data(value, component_total::Int)
   if component_total == 1
     if value isa Tuple || value isa AbstractVector
       length(value) == 1 ||
         throw(ArgumentError("scalar reference data must be scalar or contain exactly one value"))
-      return T(value[1])
+      return value
     end
 
-    return T(value)
+    value isa Real && !(value isa Bool) ||
+      throw(ArgumentError("scalar reference data must be a finite real value or contain exactly one value"))
+    return value
   end
 
   if value isa Tuple || value isa AbstractVector
     length(value) == component_total ||
       throw(ArgumentError("vector-valued reference data must match the field component count"))
-    return T(value[component])
+    return value
   end
 
   throw(ArgumentError("vector-valued reference data must return a tuple or vector"))
+end
+
+function _checked_verification_scalar(value, ::Type{T},
+                                      name::AbstractString) where {T<:AbstractFloat}
+  value isa Real && !(value isa Bool) || throw(ArgumentError("$name must be a finite real value"))
+  checked = T(value)
+  isfinite(checked) || throw(ArgumentError("$name must be finite"))
+  return checked
+end
+
+function _verification_component_value(value, component::Int, component_total::Int,
+                                       ::Type{T}) where {T<:AbstractFloat}
+  raw = value isa Tuple || value isa AbstractVector ? value[component] : value
+  name = component_total == 1 ? "scalar reference data" : "vector-valued reference data"
+  return _checked_verification_scalar(raw, T, name)
+end
+
+function _checked_l2_component(value::T, name::AbstractString) where {T<:AbstractFloat}
+  isfinite(value) || throw(ArgumentError("$name must be finite"))
+  value >= zero(T) || throw(ArgumentError("$name must be non-negative"))
+  return value
 end
 
 # Accumulation of absolute and relative `L2` error components.
@@ -173,10 +212,13 @@ function _l2_error_components(cells, state::State{T}, field::AbstractField,
     @inbounds for point_index in 1:point_count(cell)
       x = cell.points[point_index]
       weighted = cell.weights[point_index]
+      reference_data = _checked_verification_reference_data(_verification_reference_value(exact, x),
+                                                            component_total)
 
       for component in 1:component_total
         approximate = _field_value_component(data, state_coefficients, component, point_index)
-        reference = _verification_component_value(exact, x, component, component_total, T)
+        isfinite(approximate) || throw(ArgumentError("state values must be finite"))
+        reference = _verification_component_value(reference_data, component, component_total, T)
         difference = approximate - reference
         numerator += difference * difference * weighted
         denominator += reference * reference * weighted
@@ -191,7 +233,9 @@ function _verification_l2_components(state::State{T}, field::AbstractField, exac
                                      extra_points::Integer=0,
                                      cell_quadratures=()) where {T<:AbstractFloat}
   cells = _verification_cells(state, field, plan; extra_points, cell_quadratures=cell_quadratures)
-  return _l2_error_components(cells, state, field, exact)
+  numerator, denominator = _l2_error_components(cells, state, field, exact)
+  return _checked_l2_component(numerator, "L2 error numerator"),
+         _checked_l2_component(denominator, "L2 reference denominator")
 end
 
 # Public `L2` verification queries.

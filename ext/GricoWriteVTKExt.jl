@@ -41,11 +41,12 @@ end
 
 function Grico.write_vtk(path::AbstractString, data::Grico.SampledPostprocess; mesh::Bool=false,
                          skeleton=nothing, vtk_kwargs...)
-  _require_vtk_dimension(data.mesh)
+  _require_vtk_sampled_postprocess(data)
   grid_kwargs = _vtk_grid_kwargs(vtk_kwargs)
 
   if mesh
     skeleton = _require_vtk_skeleton(data, skeleton)
+    _require_vtk_sampled_skeleton(skeleton)
     return _write_vtk_multiblock(path, data, skeleton, grid_kwargs)
   end
 
@@ -93,6 +94,111 @@ function _require_vtk_skeleton(::Grico.SampledPostprocess, skeleton)
   skeleton === nothing &&
     throw(ArgumentError("mesh=true with sampled data requires skeleton=sample_mesh_skeleton(...)"))
   throw(ArgumentError("mesh=true with sampled data requires a SampledMeshSkeleton"))
+end
+
+function _require_vtk_sampled_postprocess(data::Grico.SampledPostprocess)
+  mesh = data.mesh
+  _require_vtk_sampled_mesh(mesh)
+  _require_vtk_datasets(data.point_data, size(mesh.points, 2), "point")
+  _require_vtk_datasets(data.cell_data, length(mesh.cell_leaves), "cell")
+  return data
+end
+
+function _require_vtk_sampled_mesh(mesh::Grico.SampledMesh{D}) where {D}
+  _require_vtk_dimension(mesh)
+  mesh.subdivisions > 0 || throw(ArgumentError("sampled VTK mesh subdivisions must be positive"))
+  mesh.sample_degree > 0 || throw(ArgumentError("sampled VTK mesh sample_degree must be positive"))
+  leaf_count = length(mesh.leaf_data)
+  leaf_count > 0 || throw(ArgumentError("sampled VTK mesh must contain at least one leaf"))
+  point_resolution = _vtk_checked_product(mesh.subdivisions, mesh.sample_degree, "sampled VTK mesh")
+  expected_point_stride = _vtk_checked_increment(point_resolution, "sampled VTK mesh")
+  mesh.point_stride == expected_point_stride ||
+    throw(ArgumentError("sampled VTK mesh point_stride does not match subdivisions and sample_degree"))
+  local_point_count = _vtk_checked_power(mesh.point_stride, D, "sampled VTK mesh")
+  expected_cells_per_leaf = _vtk_checked_power(mesh.subdivisions, D, "sampled VTK mesh")
+  mesh.cells_per_leaf == expected_cells_per_leaf ||
+    throw(ArgumentError("sampled VTK mesh cells_per_leaf does not match subdivisions"))
+  expected_points = _vtk_checked_product(leaf_count, local_point_count, "sampled VTK mesh")
+  expected_cells = _vtk_checked_product(leaf_count, mesh.cells_per_leaf, "sampled VTK mesh")
+  size(mesh.points) == (D, expected_points) ||
+    throw(ArgumentError("sampled VTK mesh points must have size ($D, $expected_points)"))
+  length(mesh.point_leaves) == expected_points ||
+    throw(ArgumentError("sampled VTK mesh point_leaves must have length $expected_points"))
+  size(mesh.point_references) == (D, expected_points) ||
+    throw(ArgumentError("sampled VTK mesh point_references must have size ($D, $expected_points)"))
+  length(mesh.cell_leaves) == expected_cells ||
+    throw(ArgumentError("sampled VTK mesh cell_leaves must have length $expected_cells"))
+  size(mesh.cell_references) == (D, expected_cells) ||
+    throw(ArgumentError("sampled VTK mesh cell_references must have size ($D, $expected_cells)"))
+  size(mesh.cell_centers) == (D, expected_cells) ||
+    throw(ArgumentError("sampled VTK mesh cell_centers must have size ($D, $expected_cells)"))
+  return mesh
+end
+
+function _require_vtk_sampled_skeleton(skeleton::Grico.SampledMeshSkeleton{D}) where {D}
+  _require_vtk_dimension(skeleton)
+  point_count = size(skeleton.points, 2)
+  edge_count = size(skeleton.edges, 2)
+  size(skeleton.points, 1) == D ||
+    throw(ArgumentError("sampled VTK mesh skeleton points must have $D coordinate rows"))
+  size(skeleton.edges, 1) == 2 ||
+    throw(ArgumentError("sampled VTK mesh skeleton edges must have two rows"))
+
+  for edge_index in axes(skeleton.edges, 2), endpoint in 1:2
+    vertex = skeleton.edges[endpoint, edge_index]
+    1 <= vertex <= point_count ||
+      throw(ArgumentError("sampled VTK mesh skeleton edge indices must refer to skeleton points"))
+  end
+
+  _require_vtk_datasets(skeleton.cell_data, edge_count, "mesh-skeleton cell")
+  return skeleton
+end
+
+function _require_vtk_datasets(datasets, tuple_count::Int, location::AbstractString)
+  for (name, data) in datasets
+    _vtk_tuple_count(data) == tuple_count ||
+      throw(ArgumentError("$location dataset $name must have $tuple_count tuples"))
+    _require_vtk_array_values(data, "$location dataset $name")
+  end
+
+  return datasets
+end
+
+_vtk_tuple_count(data::AbstractVector) = length(data)
+_vtk_tuple_count(data::AbstractMatrix) = size(data, 2)
+
+function _require_vtk_array_values(data::_VtkArrayData, context::AbstractString)
+  for value in data
+    value isa Real && !(value isa Bool) ||
+      throw(ArgumentError("$context must contain finite real values"))
+    isfinite(value) || throw(ArgumentError("$context must contain finite values"))
+  end
+
+  return data
+end
+
+@noinline function _throw_vtk_work_overflow(context::AbstractString)
+  throw(ArgumentError("$context creates too many VTK samples"))
+end
+
+@inline function _vtk_checked_product(left::Int, right::Int, context::AbstractString)
+  (left == 0 || right <= typemax(Int) ÷ left) || _throw_vtk_work_overflow(context)
+  return left * right
+end
+
+@inline function _vtk_checked_increment(value::Int, context::AbstractString)
+  value < typemax(Int) || _throw_vtk_work_overflow(context)
+  return value + 1
+end
+
+function _vtk_checked_power(base::Int, exponent::Int, context::AbstractString)
+  result = 1
+
+  for _ in 1:exponent
+    result = _vtk_checked_product(result, base, context)
+  end
+
+  return result
 end
 
 # WriteVTK's default VTK XML version may change with package versions. Grico pins
@@ -155,18 +261,19 @@ end
 # but the implementation deliberately avoids depending on WriteVTK internals.
 function Grico.write_pvd(path::AbstractString, vtk_files::AbstractVector{<:AbstractString};
                          timesteps=nothing)
-  values = timesteps === nothing ? collect(eachindex(vtk_files)) .- 1 : collect(timesteps)
-  length(values) == length(vtk_files) ||
-    throw(ArgumentError("timesteps length $(length(values)) does not match file count $(length(vtk_files))"))
+  files = collect(vtk_files)
+  values = timesteps === nothing ? [index - 1 for index in eachindex(files)] : collect(timesteps)
+  length(values) == length(files) ||
+    throw(ArgumentError("timesteps length $(length(values)) does not match file count $(length(files))"))
 
   open(path, "w") do io
     println(io, "<?xml version=\"1.0\"?>")
     println(io, "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">")
     println(io, "  <Collection>")
 
-    for index in eachindex(vtk_files)
-      relative_path = relpath(vtk_files[index], dirname(path))
-      escaped_step = _vtk_xml_attribute(values[index])
+    for (file, step) in zip(files, values)
+      relative_path = relpath(file, dirname(path))
+      escaped_step = _vtk_xml_attribute(step)
       escaped_path = _vtk_xml_attribute(relative_path)
       println(io,
               "    <DataSet timestep=\"$escaped_step\" group=\"\" part=\"0\" file=\"$escaped_path\"/>")
@@ -261,11 +368,10 @@ function _vtk_lagrange_cells(mesh::Grico.SampledMesh{D}) where {D}
   for leaf_index in eachindex(mesh.leaf_data)
     point_offset = (leaf_index - 1) * local_point_count
     cell_offset = (leaf_index - 1) * mesh.cells_per_leaf
-    local_points = collect((point_offset+1):(point_offset+local_point_count))
     local_cell_offset = 1
 
     for I in cell_indices
-      cells[cell_offset+local_cell_offset] = _vtk_cell(local_points, mesh.point_stride,
+      cells[cell_offset+local_cell_offset] = _vtk_cell(point_offset, mesh.point_stride,
                                                        mesh.sample_degree, I, Val(D))
       local_cell_offset += 1
     end
@@ -278,90 +384,90 @@ end
 # vertex/edge/face/interior ordering required by VTK Lagrange cells. The helper
 # routines below append interior points on lines, planes, and volumes after the
 # corner points, mirroring VTK's canonical ordering.
-function _vtk_cell(local_points::AbstractVector{Int}, point_stride::Int, degree::Int,
-                   index::CartesianIndex{1}, ::Val{1})
+function _vtk_cell(point_offset::Int, point_stride::Int, degree::Int, index::CartesianIndex{1},
+                   ::Val{1})
   start = ((index[1] - 1) * degree + 1,)
   connectivity = Vector{Int}(undef, degree + 1)
   offset = 1
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride, start)
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride, (start[1] + degree,))
-  _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 1, degree)
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride, start)
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride, (start[1] + degree,))
+  _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 1, degree)
   return MeshCell(VTKCellTypes.VTK_LAGRANGE_CURVE, connectivity)
 end
 
-function _vtk_cell(local_points::AbstractVector{Int}, point_stride::Int, degree::Int,
-                   index::CartesianIndex{2}, ::Val{2})
+function _vtk_cell(point_offset::Int, point_stride::Int, degree::Int, index::CartesianIndex{2},
+                   ::Val{2})
   start = ((index[1] - 1) * degree + 1, (index[2] - 1) * degree + 1)
   connectivity = Vector{Int}(undef, (degree + 1)^2)
   offset = 1
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride, start)
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride, start)
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2]))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2] + degree))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2] + degree))
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 1, degree)
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1] + degree, start[2]), 2, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2] + degree), 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 2, degree)
-  _vtk_push_plane!(connectivity, offset, local_points, point_stride, start, 1, 2, degree)
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 2, degree)
+  _vtk_push_plane!(connectivity, offset, point_offset, point_stride, start, 1, 2, degree)
   return MeshCell(VTKCellTypes.VTK_LAGRANGE_QUADRILATERAL, connectivity)
 end
 
-function _vtk_cell(local_points::AbstractVector{Int}, point_stride::Int, degree::Int,
-                   index::CartesianIndex{3}, ::Val{3})
+function _vtk_cell(point_offset::Int, point_stride::Int, degree::Int, index::CartesianIndex{3},
+                   ::Val{3})
   start = ((index[1] - 1) * degree + 1, (index[2] - 1) * degree + 1, (index[3] - 1) * degree + 1)
   connectivity = Vector{Int}(undef, (degree + 1)^3)
   offset = 1
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride, start)
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride, start)
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2], start[3]))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2] + degree, start[3]))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2] + degree, start[3]))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2], start[3] + degree))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2], start[3] + degree))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2] + degree, start[3] + degree))
-  offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2] + degree, start[3] + degree))
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 1, degree)
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1] + degree, start[2], start[3]), 2, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2] + degree, start[3]), 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 2, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 2, degree)
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2], start[3] + degree), 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1] + degree, start[2], start[3] + degree), 2, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2] + degree, start[3] + degree), 1, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2], start[3] + degree), 2, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride, start, 3, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride, start, 3, degree)
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1] + degree, start[2], start[3]), 3, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1] + degree, start[2] + degree, start[3]), 3, degree)
-  offset = _vtk_push_line!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_line!(connectivity, offset, point_offset, point_stride,
                            (start[1], start[2] + degree, start[3]), 3, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride, start, 2, 3, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride, start, 2, 3, degree)
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride,
                             (start[1] + degree, start[2], start[3]), 2, 3, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride, start, 1, 3, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride, start, 1, 3, degree)
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2] + degree, start[3]), 1, 3, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride, start, 1, 2, degree)
-  offset = _vtk_push_plane!(connectivity, offset, local_points, point_stride,
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride, start, 1, 2, degree)
+  offset = _vtk_push_plane!(connectivity, offset, point_offset, point_stride,
                             (start[1], start[2], start[3] + degree), 1, 2, degree)
-  _vtk_push_volume!(connectivity, offset, local_points, point_stride, start, degree)
+  _vtk_push_volume!(connectivity, offset, point_offset, point_stride, start, degree)
   return MeshCell(VTKCellTypes.VTK_LAGRANGE_HEXAHEDRON, connectivity)
 end
 
@@ -369,30 +475,27 @@ end
 # connectivity array. They keep the dimension-specific cell routines readable
 # while preserving VTK's required ordering: first vertices, then edge interiors,
 # then face interiors, then volume interiors.
-function _vtk_push_point!(connectivity::AbstractVector{Int}, offset::Int,
-                          local_points::AbstractVector{Int}, point_stride::Int,
-                          index::NTuple{D,Int}) where {D}
-  connectivity[offset] = _vtk_local_point(local_points, point_stride, index)
+function _vtk_push_point!(connectivity::AbstractVector{Int}, offset::Int, point_offset::Int,
+                          point_stride::Int, index::NTuple{D,Int}) where {D}
+  connectivity[offset] = _vtk_local_point(point_offset, point_stride, index)
   return offset + 1
 end
 
-function _vtk_push_line!(connectivity::AbstractVector{Int}, offset::Int,
-                         local_points::AbstractVector{Int}, point_stride::Int, start::NTuple{D,Int},
-                         axis::Int, degree::Int) where {D}
+function _vtk_push_line!(connectivity::AbstractVector{Int}, offset::Int, point_offset::Int,
+                         point_stride::Int, start::NTuple{D,Int}, axis::Int, degree::Int) where {D}
   for delta in 1:(degree-1)
-    offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+    offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                               _vtk_shift_index(start, axis, delta))
   end
 
   return offset
 end
 
-function _vtk_push_plane!(connectivity::AbstractVector{Int}, offset::Int,
-                          local_points::AbstractVector{Int}, point_stride::Int,
-                          start::NTuple{D,Int}, inner_axis::Int, outer_axis::Int,
+function _vtk_push_plane!(connectivity::AbstractVector{Int}, offset::Int, point_offset::Int,
+                          point_stride::Int, start::NTuple{D,Int}, inner_axis::Int, outer_axis::Int,
                           degree::Int) where {D}
   for outer in 1:(degree-1), inner in 1:(degree-1)
-    offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+    offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                               _vtk_shift_index(_vtk_shift_index(start, inner_axis, inner),
                                                outer_axis, outer))
   end
@@ -400,11 +503,10 @@ function _vtk_push_plane!(connectivity::AbstractVector{Int}, offset::Int,
   return offset
 end
 
-function _vtk_push_volume!(connectivity::AbstractVector{Int}, offset::Int,
-                           local_points::AbstractVector{Int}, point_stride::Int,
-                           start::NTuple{3,Int}, degree::Int)
+function _vtk_push_volume!(connectivity::AbstractVector{Int}, offset::Int, point_offset::Int,
+                           point_stride::Int, start::NTuple{3,Int}, degree::Int)
   for k in 1:(degree-1), j in 1:(degree-1), i in 1:(degree-1)
-    offset = _vtk_push_point!(connectivity, offset, local_points, point_stride,
+    offset = _vtk_push_point!(connectivity, offset, point_offset, point_stride,
                               (start[1] + i, start[2] + j, start[3] + k))
   end
 
@@ -418,8 +520,7 @@ end
 # Convert one tensor-product local index to the one-based sampled point number
 # used by WriteVTK. Grico's sampled points are ordered with axis 1 as the fastest
 # varying index, matching Julia's column-major Cartesian traversal.
-function _vtk_local_point(local_points::AbstractVector{Int}, point_stride::Int,
-                          index::NTuple{D,Int}) where {D}
+function _vtk_local_point(point_offset::Int, point_stride::Int, index::NTuple{D,Int}) where {D}
   linear_index = 1
   stride = 1
 
@@ -428,7 +529,7 @@ function _vtk_local_point(local_points::AbstractVector{Int}, point_stride::Int,
     stride *= point_stride
   end
 
-  return local_points[linear_index]
+  return point_offset + linear_index
 end
 
 end

@@ -1172,7 +1172,9 @@ end
 """
     interface_count(snapshot)
 
-Return the number of non-periodic interface records stored in `snapshot`.
+Return the number of interface records stored in `snapshot`.
+
+Periodic axes contribute wrapped interface records rather than boundary records.
 """
 function interface_count(snapshot::GridSnapshot)
   return length(_require_current_snapshot(snapshot).interface_minus)
@@ -1665,20 +1667,6 @@ function _snapshot_cell_in_tree(grid::CartesianGrid, tree_lookup, cell::Int)
   return get(tree_lookup, signature, NONE) == cell
 end
 
-function _structural_split_axis(grid::CartesianGrid, cell::Int)
-  split = _split_axis(grid, cell)
-  split != 0 && return split
-  first = _first_child(grid, cell)
-  first == NONE && return 0
-  child = first
-  for axis in 1:dimension(grid)
-    if _level(grid, child, axis) == _level(grid, cell, axis) + 1
-      return axis
-    end
-  end
-  return 0
-end
-
 function _snapshot_touches_parent_boundary(topology, cell::Int, axis::Int, side::Int)
   grid_data = _snapshot_topology_grid(topology)
   parent_cell = _parent(grid_data, cell)
@@ -1763,21 +1751,6 @@ function _neighbor(grid::CartesianGrid, lookup, cell::Int, axis::Int, side::Int)
   _is_tree_cell(grid, cell) || return NONE
   lower, upper = _expected_direct_neighbors(grid, lookup, cell, axis)
   return side == LOWER ? lower : upper
-end
-
-function _filtered_upper_face_neighbor_specs(grid::CartesianGrid{D},
-                                             active::AbstractVector{<:Integer},
-                                             leaf_to_index::AbstractVector{<:Integer}) where {D}
-  specs = Tuple{Int,Int,Int}[]
-
-  for leaf in active, axis in 1:D
-    for other in opposite_active_leaves(grid, leaf, axis, UPPER)
-      @inbounds leaf_to_index[other] == 0 && continue
-      push!(specs, (leaf, axis, other))
-    end
-  end
-
-  return specs
 end
 
 # Input normalization and low-level argument checks.

@@ -58,8 +58,21 @@ selection rules have a direct geometric interpretation. In particular, the
 endpoint indices `0` and `1` correspond to trace-carrying factors, while
 indices `≥ 2` correspond to factors that vanish at both endpoints. This is why
 mode admissibility here has consequences later for continuity and sparsity.
+
+Advanced users may define additional basis-family subtypes. A custom subtype
+must implement [`is_active_mode`](@ref) for tuples of matching dimension. The
+generic [`basis_modes`](@ref) and [`basis_mode_count`](@ref) methods then scan
+the surrounding tensor-product box and filter it through that predicate.
+Families with nontrivial admissibility rules should specialize
+[`basis_mode_count`](@ref), and possibly [`basis_modes`](@ref), when the fallback
+scan would be too expensive.
 """
 abstract type AbstractBasisFamily end
+
+# The trunk iterator stores retained-order completion tables with one entry per
+# admissible order budget. Polynomial degrees this large are outside practical FE
+# use and should fail cleanly instead of attempting enormous allocations.
+const _TRUNK_COMPLETION_TABLE_MAX_ENTRIES = 1_000_000
 
 """
     FullTensorBasis()
@@ -177,7 +190,7 @@ function basis_modes(basis::AbstractBasisFamily, degrees::NTuple{D,<:Integer}) w
   checked_degrees = _checked_basis_degrees(degrees)
   box_count = _checked_basis_mode_box_count(checked_degrees)
   return BasisModes{D,typeof(basis)}(basis, checked_degrees, box_count,
-                                     _basis_mode_count(basis, checked_degrees))
+                                     basis_mode_count(basis, checked_degrees))
 end
 
 """
@@ -333,12 +346,18 @@ end
 # Decode a mixed-radix linear index into one tensor-product mode tuple, using
 # axis-specific bases `degrees[axis] + 1`.
 function _mode_from_linear_index(index::Int, degrees::NTuple{D,Int}) where {D}
-  return ntuple(axis -> begin
-                  base = degrees[axis] + 1
-                  digit = index % base
-                  index = fld(index, base)
-                  digit
-                end, D)
+  mode, _ = _mode_from_linear_index(Val(D), index, degrees)
+  return mode
+end
+
+@inline _mode_from_linear_index(::Val{0}, index::Int, degrees::NTuple{D,Int}) where {D} = (), index
+
+@inline function _mode_from_linear_index(::Val{A}, index::Int, degrees::NTuple{D,Int}) where {A,D}
+  axis = D - A + 1
+  base = degrees[axis] + 1
+  digit = index % base
+  tail, remaining = _mode_from_linear_index(Val(A - 1), fld(index, base), degrees)
+  return (digit, tail...), remaining
 end
 
 # Quick admissibility test for the axiswise box bounds `0 ≤ mₐ ≤ pₐ`.
@@ -362,9 +381,9 @@ end
 # entries.
 function _trunk_mode_count(degrees::NTuple{D,Int}) where {D}
   limit = _trunk_retained_order_limit(degrees)
-  limit < typemax(Int) || throw(ArgumentError("basis retained-order limit is too large"))
-  current = zeros(Int128, limit + 1)
-  next = zeros(Int128, limit + 1)
+  table_length = _checked_trunk_completion_table_length(limit)
+  current = zeros(Int128, table_length)
+  next = zeros(Int128, table_length)
   current[1] = 1
 
   for axis in 1:D
@@ -377,20 +396,26 @@ end
 
 function _trunk_completion_counts(degrees::NTuple{D,Int}) where {D}
   limit = _trunk_retained_order_limit(degrees)
-  limit < typemax(Int) || throw(ArgumentError("basis retained-order limit is too large"))
-  exact = zeros(Int128, limit + 1)
+  table_length = _checked_trunk_completion_table_length(limit)
+  exact = zeros(Int128, table_length)
   exact[1] = 1
   completion_counts = Vector{Vector{Int}}(undef, D + 1)
-  completion_counts[1] = ones(Int, limit + 1)
+  completion_counts[1] = ones(Int, table_length)
 
   for axis in 1:D
-    next = zeros(Int128, limit + 1)
+    next = zeros(Int128, table_length)
     _update_trunk_exact_counts!(next, exact, degrees[axis], limit)
     exact = next
     completion_counts[axis+1] = _cumulative_mode_counts(exact)
   end
 
   return completion_counts
+end
+
+function _checked_trunk_completion_table_length(limit::Int)
+  limit < _TRUNK_COMPLETION_TABLE_MAX_ENTRIES ||
+    throw(ArgumentError("basis retained-order completion table is too large"))
+  return limit + 1
 end
 
 function _update_trunk_exact_counts!(next::Vector{Int128}, current_counts::Vector{Int128},

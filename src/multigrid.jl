@@ -7,6 +7,8 @@
 # sparse reduced-space prolongations and restriction is their algebraic
 # transpose, so constraints remain part of the reduced operator contract.
 
+const _DEFAULT_COARSE_DIRECT_DOF_LIMIT = 512
+
 """
     GeometricMultigridPreconditioner(; kwargs...)
 
@@ -21,13 +23,21 @@ systems.
 The implementation builds one configurable hp hierarchy on a shared `HpSpace`;
 unsupported coupled-space or non-nested cases throw explicit `ArgumentError`s
 when requested explicitly. [`AutoLinearSolver`](@ref) chooses this
-preconditioner when a hierarchy is available and otherwise falls back to a
-generic preconditioner.
+preconditioner for supported SPD affine problems and otherwise falls back to a
+generic preconditioner unless GMG is requested explicitly.
+
+`smoother=:auto` uses damped Jacobi for SPD operators and a fixed small GMRES
+smoothing cycle for nonsymmetric or indefinite operators. The GMRES smoother is
+more expensive per V-cycle, but it damps advective and component-coupled error
+modes that diagonal smoothing often leaves untouched. When GMRES smoothing is
+selected, `smoother_restart` must cover the larger pre/post smoothing count.
 
 `coarse_direct_dof_limit` controls the base-level solve: reduced coarse systems
 at or below this size are assembled from local operator matrices and solved
 with dense Cholesky for declared SPD operators or dense LU for general
-operators. Larger systems use the configured coarse Krylov tolerance policy.
+operators. The default is sized for modest scalar dense kernels; larger systems
+use the configured coarse Krylov tolerance policy unless the caller explicitly
+opts into a larger dense coarse solve.
 """
 struct GeometricMultigridPreconditioner <: AbstractPreconditioner
   min_degree::Int
@@ -36,6 +46,8 @@ struct GeometricMultigridPreconditioner <: AbstractPreconditioner
   pre_smoothing_steps::Int
   post_smoothing_steps::Int
   smoother_damping::Float64
+  smoother::Symbol
+  smoother_restart::Int
   coarse_relative_tolerance::Float64
   coarse_absolute_tolerance::Float64
   coarse_maxiter::Int
@@ -46,31 +58,37 @@ function GeometricMultigridPreconditioner(; min_degree::Integer=1, max_levels::I
                                           p_sequence::Symbol=:bisect,
                                           pre_smoothing_steps::Integer=2,
                                           post_smoothing_steps::Integer=2,
-                                          smoother_damping::Real=0.8,
+                                          smoother_damping::Real=0.8, smoother::Symbol=:auto,
+                                          smoother_restart::Integer=8,
                                           coarse_relative_tolerance::Real=1.0e-12,
                                           coarse_absolute_tolerance::Real=0.0,
                                           coarse_maxiter::Integer=10_000,
-                                          coarse_direct_dof_limit::Integer=512)
+                                          coarse_direct_dof_limit::Integer=_DEFAULT_COARSE_DIRECT_DOF_LIMIT)
   checked_min_degree = _checked_nonnegative(min_degree, "min_degree")
   checked_max_levels = _checked_positive(max_levels, "max_levels")
   p_sequence in (:bisect, :decrease_by_one, :go_to_one) ||
     throw(ArgumentError("p_sequence must be :bisect, :decrease_by_one, or :go_to_one"))
   checked_pre = _checked_nonnegative(pre_smoothing_steps, "pre_smoothing_steps")
   checked_post = _checked_nonnegative(post_smoothing_steps, "post_smoothing_steps")
-  damping = Float64(smoother_damping)
-  damping > 0 || throw(ArgumentError("smoother_damping must be positive"))
-  coarse_rtol = Float64(coarse_relative_tolerance)
-  coarse_atol = Float64(coarse_absolute_tolerance)
-  coarse_rtol >= 0 || throw(ArgumentError("coarse_relative_tolerance must be nonnegative"))
-  coarse_atol >= 0 || throw(ArgumentError("coarse_absolute_tolerance must be nonnegative"))
+  damping = Float64(_checked_solver_positive(smoother_damping, Float64, "smoother_damping"))
+  smoother in (:auto, :jacobi, :gmres) ||
+    throw(ArgumentError("smoother must be :auto, :jacobi, or :gmres"))
+  checked_smoother_restart = _checked_positive(smoother_restart, "smoother_restart")
+  coarse_rtol = Float64(_checked_solver_tolerance(coarse_relative_tolerance, Float64,
+                                                  "coarse_relative_tolerance"))
+  coarse_atol = Float64(_checked_solver_tolerance(coarse_absolute_tolerance, Float64,
+                                                  "coarse_absolute_tolerance"))
   checked_coarse_maxiter = _checked_positive(coarse_maxiter, "coarse_maxiter")
   checked_coarse_direct = _checked_nonnegative(coarse_direct_dof_limit, "coarse_direct_dof_limit")
   return GeometricMultigridPreconditioner(checked_min_degree, checked_max_levels, p_sequence,
-                                          checked_pre, checked_post, damping, coarse_rtol,
-                                          coarse_atol, checked_coarse_maxiter,
-                                          checked_coarse_direct)
+                                          checked_pre, checked_post, damping, smoother,
+                                          checked_smoother_restart, coarse_rtol, coarse_atol,
+                                          checked_coarse_maxiter, checked_coarse_direct)
 end
 
+# One rediscretized level of the hp hierarchy. The operator and Jacobi object
+# are compiled for reduced-space vectors; the residual, operator-value, and
+# correction arrays are persistent V-cycle work buffers owned by the level.
 struct _MultigridLevel{T<:AbstractFloat,P<:AssemblyPlan,W<:_ReducedOperatorWorkspace{T},
                        O<:_ReducedAffineOperator,J<:_CompiledPreconditioner{T}}
   plan::P
@@ -82,6 +100,9 @@ struct _MultigridLevel{T<:AbstractFloat,P<:AssemblyPlan,W<:_ReducedOperatorWorks
   correction::Vector{T}
 end
 
+# Sparse reduced-space prolongation from one coarse level to the next finer
+# level. Restriction in the V-cycle is the algebraic transpose of this map, so
+# the reduced constraints remain part of the transfer definition.
 struct _ReducedTransfer{T<:AbstractFloat,CP<:AssemblyPlan,FP<:AssemblyPlan}
   coarse_plan::CP
   fine_plan::FP
@@ -90,6 +111,9 @@ struct _ReducedTransfer{T<:AbstractFloat,CP<:AssemblyPlan,FP<:AssemblyPlan}
   coefficients::Vector{T}
 end
 
+# Leaf-local tensor-mode transfer contribution before global constraint
+# elimination. These entries express one coarse modal basis function exactly in
+# the fine modal basis on the child leaf.
 struct _LocalTransferEntry{D,T<:AbstractFloat}
   coarse_leaf::Int
   fine_leaf::Int
@@ -98,6 +122,9 @@ struct _LocalTransferEntry{D,T<:AbstractFloat}
   coefficient::T
 end
 
+# One admissible h-coarsening operation. A candidate is emitted only when both
+# children of a dyadic split are active leaves, so the hierarchy coarsens one
+# nested frontier without skipping geometric levels.
 struct _MultigridHCoarseningCandidate{D}
   cell::Int
   axis::Int
@@ -105,6 +132,10 @@ struct _MultigridHCoarseningCandidate{D}
   target_degrees::NTuple{D,Int}
 end
 
+# Dense direct coarse solves are intentionally preferred for moderate coarse
+# systems. The coarse level is the only place where exact inversion is expected;
+# using a direct factorization here keeps V-cycles deterministic and avoids a
+# fragile nested Krylov solve for common root-grid sizes.
 struct _DenseCholeskyCoarseSolver{T<:AbstractFloat}
   factor::Matrix{T}
 end
@@ -114,9 +145,30 @@ struct _DenseLUCoarseSolver{T<:AbstractFloat}
   pivots::Vector{Int}
 end
 
+# Large coarse systems keep a matrix-free Krylov base solve rather than
+# assembling an unbounded dense factorization. This is a bounded-memory base
+# solve with explicit tolerances, so an inadequate coarse solve fails clearly
+# instead of silently returning a poor V-cycle correction.
 struct _KrylovCoarseSolver end
 
-struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,OC<:AbstractOperatorClass} <:
+# Workspace for one fixed-cycle right-preconditioned GMRES smoother. Columns of
+# `krylov` store the Arnoldi basis vᵢ, columns of `preconditioned` store
+# zᵢ = M⁻¹vᵢ, and `hessenberg` plus the Givens arrays represent the small
+# least-squares problem solved after the prescribed number of smoothing steps.
+struct _GmresSmootherWorkspace{T<:AbstractFloat}
+  krylov::Matrix{T}
+  preconditioned::Matrix{T}
+  hessenberg::Matrix{T}
+  least_squares_rhs::Vector{T}
+  givens_cosine::Vector{T}
+  givens_sine::Vector{T}
+  coefficients::Vector{T}
+end
+
+# Fully compiled hpMG hierarchy. The object owns all level plans, transfers,
+# smoothers, coarse solver state, and reusable inter-level right-hand side and
+# correction arrays needed by `_apply_preconditioner!`.
+struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,OC<:_OperatorClass} <:
        _CompiledPreconditioner{T}
   levels::Vector{_MultigridLevel{T}}
   transfers::Vector{_ReducedTransfer{T}}
@@ -127,6 +179,9 @@ struct _CompiledGeometricMultigridPreconditioner{T<:AbstractFloat,CS,OC<:Abstrac
   pre_smoothing_steps::Int
   post_smoothing_steps::Int
   smoother_damping::T
+  smoother::Symbol
+  smoother_restart::Int
+  gmres_smoothers::Vector{_GmresSmootherWorkspace{T}}
   coarse_relative_tolerance::T
   coarse_absolute_tolerance::T
   coarse_maxiter::Int
@@ -141,41 +196,61 @@ end
 
 function _solve_affine_problem(problem::AffineProblem,
                                solver::CGSolver{<:GeometricMultigridPreconditioner};
-                               relative_tolerance=sqrt(eps(Float64)), absolute_tolerance=0.0,
-                               maxiter=nothing, initial_solution=nothing)
+                               relative_tolerance=nothing, absolute_tolerance=0.0, maxiter=nothing,
+                               initial_solution=nothing)
+  _check_cg_geometric_multigrid_policy(problem, solver.preconditioner)
   hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
   finest = hierarchy.levels[end]
   T = eltype(finest.residual)
+  rtol = relative_tolerance === nothing ? sqrt(eps(T)) :
+         _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  atol = _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
   rhs = zeros(T, reduced_dof_count(finest.plan))
   _reduced_rhs!(rhs, finest.plan, finest.workspace)
-  outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) : maxiter
-  reduced_values = _cg_solve(finest.operator, rhs, hierarchy;
-                             relative_tolerance=T(relative_tolerance),
-                             absolute_tolerance=T(absolute_tolerance), maxiter=outer_maxiter,
+  outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) :
+                  _checked_positive(maxiter, "maxiter")
+  reduced_values = _cg_solve(finest.operator, rhs, hierarchy; relative_tolerance=rtol,
+                             absolute_tolerance=atol, maxiter=outer_maxiter,
                              initial_solution=initial_solution)
   return _state_from_reduced_result(finest.plan, reduced_values)
 end
 
 function _solve_affine_problem(problem::AffineProblem,
                                solver::FGMRESSolver{<:GeometricMultigridPreconditioner};
-                               relative_tolerance=sqrt(eps(Float64)), absolute_tolerance=0.0,
-                               maxiter=nothing, initial_solution=nothing)
+                               relative_tolerance=nothing, absolute_tolerance=0.0, maxiter=nothing,
+                               initial_solution=nothing)
   hierarchy = _compile_geometric_multigrid(problem, solver.preconditioner)
   finest = hierarchy.levels[end]
   T = eltype(finest.residual)
+  rtol = relative_tolerance === nothing ? sqrt(eps(T)) :
+         _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  atol = _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
   rhs = zeros(T, reduced_dof_count(finest.plan))
   _reduced_rhs!(rhs, finest.plan, finest.workspace)
-  outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) : maxiter
+  outer_maxiter = maxiter === nothing ? max(1_000, 2 * length(rhs)) :
+                  _checked_positive(maxiter, "maxiter")
   reduced_values = _fgmres_solve(finest.operator, rhs, hierarchy; restart=solver.restart,
-                                 relative_tolerance=T(relative_tolerance),
-                                 absolute_tolerance=T(absolute_tolerance), maxiter=outer_maxiter,
-                                 initial_solution=initial_solution)
+                                 relative_tolerance=rtol, absolute_tolerance=atol,
+                                 maxiter=outer_maxiter, initial_solution=initial_solution)
   return _state_from_reduced_result(finest.plan, reduced_values)
+end
+
+function _check_cg_geometric_multigrid_policy(problem::AffineProblem,
+                                              preconditioner::GeometricMultigridPreconditioner)
+  _is_spd_operator_class(operator_class(problem)) ||
+    throw(ArgumentError("CG with GeometricMultigridPreconditioner requires an SPD affine problem; use FGMRESSolver or declare the operator SPD if that is mathematically valid"))
+  preconditioner.pre_smoothing_steps == preconditioner.post_smoothing_steps ||
+    throw(ArgumentError("CG with GeometricMultigridPreconditioner requires equal pre- and post-smoothing steps so the V-cycle remains symmetric"))
+  smoother = _resolved_multigrid_smoother(preconditioner.smoother, operator_class(problem))
+  smoother === :jacobi ||
+    throw(ArgumentError("CG with GeometricMultigridPreconditioner requires the Jacobi smoother; use FGMRESSolver for nonsymmetric smoother policies"))
+  return nothing
 end
 
 function _default_affine_preconditioner(problem::AffineProblem)
   candidate = GeometricMultigridPreconditioner()
-  return _supports_geometric_multigrid(problem, candidate) ? candidate : JacobiPreconditioner()
+  return _is_spd_operator_class(operator_class(problem)) &&
+         _supports_geometric_multigrid(problem, candidate) ? candidate : JacobiPreconditioner()
 end
 
 function _supports_geometric_multigrid(problem::AffineProblem,
@@ -243,16 +318,48 @@ Base.@nospecializeinfer function _compile_geometric_multigrid(problem::AffinePro
                                                         for index in 1:(length(levels)-1)])
   coarse_solver = Base.inferencebarrier(_compile_coarse_solver(levels[1], solver,
                                                                operator_class(problem)))
-  level_rhs = [zeros(T, reduced_dof_count(level.plan)) for level in levels]
-  level_solution = [zeros(T, reduced_dof_count(level.plan)) for level in levels]
+  smoother = _resolved_multigrid_smoother(solver.smoother, operator_class(problem))
+  _check_multigrid_smoother_steps(solver, smoother)
+  level_rhs = [zeros(T, reduced_dof_count(levels[index].plan)) for index in 1:(length(levels)-1)]
+  level_solution = [zeros(T, reduced_dof_count(levels[index].plan))
+                    for index in 1:(length(levels)-1)]
+  gmres_smoothers = _compile_multigrid_gmres_smoothers(T, levels, smoother, solver.smoother_restart)
   return _CompiledGeometricMultigridPreconditioner(levels, transfers, coarse_solver,
                                                    operator_class(problem), level_rhs,
                                                    level_solution, solver.pre_smoothing_steps,
                                                    solver.post_smoothing_steps,
-                                                   T(solver.smoother_damping),
+                                                   T(solver.smoother_damping), smoother,
+                                                   solver.smoother_restart, gmres_smoothers,
                                                    T(solver.coarse_relative_tolerance),
                                                    T(solver.coarse_absolute_tolerance),
                                                    solver.coarse_maxiter)
+end
+
+function _resolved_multigrid_smoother(smoother::Symbol, operator_class::_OperatorClass)
+  smoother === :auto && return _is_spd_operator_class(operator_class) ? :jacobi : :gmres
+  return smoother
+end
+
+function _check_multigrid_smoother_steps(solver::GeometricMultigridPreconditioner, smoother::Symbol)
+  smoother === :gmres || return nothing
+  requested_steps = max(solver.pre_smoothing_steps, solver.post_smoothing_steps)
+  requested_steps <= solver.smoother_restart ||
+    throw(ArgumentError("GMRES multigrid smoother requires smoother_restart to be at least max(pre_smoothing_steps, post_smoothing_steps)"))
+  return nothing
+end
+
+function _compile_multigrid_gmres_smoothers(::Type{T}, levels::Vector{_MultigridLevel{T}},
+                                            smoother::Symbol, restart::Int) where {T<:AbstractFloat}
+  smoother === :gmres || return _GmresSmootherWorkspace{T}[]
+  return [_compile_gmres_smoother_workspace(T, reduced_dof_count(levels[index].plan), restart)
+          for index in 2:length(levels)]
+end
+
+function _compile_gmres_smoother_workspace(::Type{T}, n::Int, restart::Int) where {T<:AbstractFloat}
+  count = max(1, min(restart, max(n, 1)))
+  return _GmresSmootherWorkspace(zeros(T, n, count + 1), zeros(T, n, count),
+                                 zeros(T, count + 1, count), zeros(T, count + 1), zeros(T, count),
+                                 zeros(T, count), zeros(T, count))
 end
 
 function _compile_multigrid_level(plan::AssemblyPlan{D,T}) where {D,T<:AbstractFloat}
@@ -264,7 +371,7 @@ function _compile_multigrid_level(plan::AssemblyPlan{D,T}) where {D,T<:AbstractF
 end
 
 function _compile_coarse_solver(level::_MultigridLevel{T}, solver::GeometricMultigridPreconditioner,
-                                operator_class::AbstractOperatorClass) where {T<:AbstractFloat}
+                                operator_class::_OperatorClass) where {T<:AbstractFloat}
   n = reduced_dof_count(level.plan)
   0 < n <= solver.coarse_direct_dof_limit || return _KrylovCoarseSolver()
   matrix = _assemble_reduced_operator_matrix(level.plan, level.workspace.scratch)
@@ -294,11 +401,18 @@ end
 function _matrix_is_symmetric(matrix::AbstractMatrix{T}) where {T<:AbstractFloat}
   n = _require_square_matrix(matrix, "coarse multigrid matrix")
   tolerance = sqrt(eps(T))
+  matrix_scale = zero(T)
+
+  for value in matrix
+    isfinite(value) || return false
+    matrix_scale = max(matrix_scale, abs(value))
+  end
+
+  allowed = tolerance * matrix_scale
 
   for column in 1:n
     for row in (column+1):n
-      scale = max(abs(matrix[row, column]), abs(matrix[column, row]), one(T))
-      abs(matrix[row, column] - matrix[column, row]) <= tolerance * scale || return false
+      abs(matrix[row, column] - matrix[column, row]) <= allowed || return false
     end
   end
 
@@ -469,13 +583,9 @@ function _multigrid_level_fields(fine_fields::Tuple, spaces::Vector)
                  length(fine_fields)) for level_index in eachindex(spaces)]
 end
 
-function _field_on_space(field::ScalarField, space::HpSpace)
-  return ScalarField(_field_id(field), space, field_name(field))
-end
+_field_on_space(field::ScalarField, space::HpSpace) = _field_with_identity(field, space)
 
-function _field_on_space(field::VectorField, space::HpSpace)
-  return VectorField(_field_id(field), space, component_count(field), field_name(field))
-end
+_field_on_space(field::VectorField, space::HpSpace) = _field_with_identity(field, space)
 
 function _problem_on_fields(source::AffineProblem, new_fields::Tuple)
   source_data = _problem_data(source)
@@ -563,7 +673,7 @@ function _append_field_reduced_transfer_entries!(entries::Dict{Tuple{Int,Int},T}
 
       for source_pair in pair.second
         coefficient = inverse_coefficient * source_pair.second
-        abs(coefficient) > 1000 * eps(T) || continue
+        _keep_transfer_coefficient(coefficient) || continue
         _accumulate_transfer_entry!(entries, source_pair.first, fine_index, coefficient)
       end
     end
@@ -585,7 +695,7 @@ function _compile_local_transfer_entries(coarse_space::HpSpace{D,T},
       for coarse_mode in local_modes(coarse_space, coarse_leaf)
         for fine_mode in local_modes(fine_space, fine_leaf)
           coefficient = _tensor_mode_transfer_coefficient(matrices, coarse_mode, fine_mode)
-          abs(coefficient) > 1000 * eps(T) || continue
+          _keep_transfer_coefficient(coefficient) || continue
           push!(entries,
                 _LocalTransferEntry{D,T}(coarse_leaf, fine_leaf, coarse_mode, fine_mode,
                                          coefficient))
@@ -595,6 +705,11 @@ function _compile_local_transfer_entries(coarse_space::HpSpace{D,T},
   end
 
   return entries
+end
+
+function _keep_transfer_coefficient(coefficient::T) where {T<:AbstractFloat}
+  isfinite(coefficient) || throw(ArgumentError("multigrid transfer coefficient must be finite"))
+  return !iszero(coefficient)
 end
 
 function _fine_leaves_under_coarse_leaf(coarse_space::HpSpace, fine_space::HpSpace,
@@ -748,7 +863,7 @@ function _vcycle!(mg::_CompiledGeometricMultigridPreconditioner{T}, level_index:
     return _coarse_solve!(solution, mg.coarse_solver, level, rhs, mg)
   end
 
-  _smooth_jacobi!(solution, level, rhs, mg.pre_smoothing_steps, mg.smoother_damping)
+  _smooth_multigrid_level!(solution, mg, level_index, rhs, mg.pre_smoothing_steps)
   residual = level.residual
   copyto!(residual, rhs)
   _apply_operator!(level.operator_values, level.operator, solution)
@@ -760,7 +875,7 @@ function _vcycle!(mg::_CompiledGeometricMultigridPreconditioner{T}, level_index:
   fill!(coarse_solution, zero(T))
   _vcycle!(mg, level_index - 1, coarse_solution, coarse_rhs)
   _prolongate_reduced_add!(solution, transfer, coarse_solution)
-  _smooth_jacobi!(solution, level, rhs, mg.post_smoothing_steps, mg.smoother_damping)
+  _smooth_multigrid_level!(solution, mg, level_index, rhs, mg.post_smoothing_steps)
   return solution
 end
 
@@ -799,6 +914,23 @@ function _coarse_solve!(solution::AbstractVector{T}, ::_KrylovCoarseSolver,
   return solution
 end
 
+function _smooth_multigrid_level!(solution::AbstractVector{T},
+                                  mg::_CompiledGeometricMultigridPreconditioner{T},
+                                  level_index::Int, rhs::AbstractVector{T},
+                                  steps::Int) where {T<:AbstractFloat}
+  steps == 0 && return solution
+  level = mg.levels[level_index]
+
+  if mg.smoother === :jacobi
+    return _smooth_jacobi!(solution, level, rhs, steps, mg.smoother_damping)
+  elseif mg.smoother === :gmres
+    return _smooth_gmres!(solution, level, rhs, steps, mg.smoother_damping,
+                          mg.gmres_smoothers[level_index-1])
+  end
+
+  throw(ArgumentError("unsupported multigrid smoother $(mg.smoother)"))
+end
+
 function _smooth_jacobi!(solution::AbstractVector{T}, level::_MultigridLevel{T},
                          rhs::AbstractVector{T}, steps::Int, damping::T) where {T<:AbstractFloat}
   steps == 0 && return solution
@@ -812,6 +944,108 @@ function _smooth_jacobi!(solution::AbstractVector{T}, level::_MultigridLevel{T},
   end
 
   return solution
+end
+
+# Fixed-cycle right-preconditioned GMRES smoother. This is used for general
+# operators where diagonal Richardson smoothing is often ineffective. The
+# routine deliberately performs a prescribed number of Arnoldi steps instead of
+# solving to a tolerance; a smoother should remove high-frequency error modes
+# at bounded cost, not become an inner Krylov solve whose work varies by level.
+function _smooth_gmres!(solution::AbstractVector{T}, level::_MultigridLevel{T},
+                        rhs::AbstractVector{T}, steps::Int, damping::T,
+                        workspace::_GmresSmootherWorkspace{T}) where {T<:AbstractFloat}
+  steps == 0 && return solution
+  _require_length(solution, length(rhs), "multigrid smoother solution")
+  copyto!(level.residual, rhs)
+  _apply_operator!(level.operator_values, level.operator, solution)
+  _axpy!(level.residual, -one(T), level.operator_values)
+  residual_norm = sqrt(_dot_self(level.residual))
+  residual_norm == zero(T) && return solution
+  count = min(steps, size(workspace.preconditioned, 2), length(rhs))
+  count == 0 && return solution
+  fill!(workspace.krylov, zero(T))
+  fill!(workspace.preconditioned, zero(T))
+  fill!(workspace.hessenberg, zero(T))
+  fill!(workspace.least_squares_rhs, zero(T))
+  fill!(workspace.givens_cosine, zero(T))
+  fill!(workspace.givens_sine, zero(T))
+  fill!(workspace.coefficients, zero(T))
+
+  @inbounds for row in eachindex(level.residual)
+    workspace.krylov[row, 1] = level.residual[row] / residual_norm
+  end
+
+  workspace.least_squares_rhs[1] = residual_norm
+  inner_count = 0
+
+  for column in 1:count
+    inner_count = column
+    z_column = view(workspace.preconditioned, :, column)
+    v_column = view(workspace.krylov, :, column)
+    _apply_preconditioner!(z_column, level.jacobi, v_column)
+    _apply_operator!(level.operator_values, level.operator, z_column)
+
+    for basis_column in 1:column
+      v_basis = view(workspace.krylov, :, basis_column)
+      workspace.hessenberg[basis_column, column] = _dot(level.operator_values, v_basis)
+      _axpy!(level.operator_values, -workspace.hessenberg[basis_column, column], v_basis)
+    end
+
+    next_norm = sqrt(_dot_self(level.operator_values))
+    workspace.hessenberg[column+1, column] = next_norm
+
+    if next_norm > zero(T) && column < count + 1
+      @inbounds for row in eachindex(level.operator_values)
+        workspace.krylov[row, column+1] = level.operator_values[row] / next_norm
+      end
+    end
+
+    _apply_previous_givens_rotations!(workspace.hessenberg, workspace.givens_cosine,
+                                      workspace.givens_sine, column)
+    cosine, sine = _givens_rotation(workspace.hessenberg[column, column],
+                                    workspace.hessenberg[column+1, column])
+    workspace.givens_cosine[column] = cosine
+    workspace.givens_sine[column] = sine
+    _apply_givens_rotation!(workspace.hessenberg, column, column, cosine, sine)
+    _apply_givens_rotation!(workspace.least_squares_rhs, column, cosine, sine)
+
+    next_norm == zero(T) && break
+  end
+
+  _gmres_smoother_upper_triangular_solve!(workspace.coefficients, workspace.hessenberg,
+                                          workspace.least_squares_rhs, inner_count)
+
+  for column in 1:inner_count
+    scale = damping * workspace.coefficients[column]
+    iszero(scale) && continue
+    z_column = view(workspace.preconditioned, :, column)
+    _axpy!(solution, scale, z_column)
+  end
+
+  return solution
+end
+
+function _gmres_smoother_upper_triangular_solve!(result::AbstractVector{T},
+                                                 upper::AbstractMatrix{T}, rhs::AbstractVector{T},
+                                                 count::Int) where {T<:AbstractFloat}
+  _require_length(result, count, "GMRES smoother coefficient work vector")
+
+  for row in count:-1:1
+    value = @inbounds rhs[row]
+
+    for column in (row+1):count
+      @inbounds value -= upper[row, column] * result[column]
+    end
+
+    diagonal = @inbounds upper[row, row]
+    isfinite(diagonal) ||
+      throw(ArgumentError("GMRES smoother encountered a non-finite Krylov least-squares diagonal"))
+    !iszero(diagonal) ||
+      throw(ArgumentError("GMRES smoother encountered a singular Krylov least-squares problem"))
+    result[row] = value / diagonal
+  end
+
+  return result
 end
 
 function _prolongate_reduced_add!(fine_reduced::AbstractVector{T}, transfer::_ReducedTransfer{T},

@@ -28,7 +28,7 @@ function build_origin_singularity_poisson_context(; dimension=DIMENSION,
   manufactured = origin_solution_data(; dimension, singular_exponent)
   space = HpSpace(Domain(ntuple(_ -> 0.0, dimension), ntuple(_ -> 1.0, dimension),
                          ntuple(_ -> 1, dimension)),
-                  SpaceOptions(degree=UniformDegree(initial_degree)))
+                  SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(initial_degree)))
   u = ScalarField(space; name=:u)
   return (; manufactured..., initial_degree, space, u)
 end

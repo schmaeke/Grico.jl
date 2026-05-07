@@ -88,6 +88,36 @@ _quadrature_tolerance(::Type{Float32}) = 5.0e-5
 
 _quadrature_tolerance(::Type{Float64}) = 1.0e-12
 
+struct _CoreZeroBasedVector{T} <: AbstractVector{T}
+  data::Vector{T}
+end
+
+Base.size(buffer::_CoreZeroBasedVector) = size(buffer.data)
+Base.axes(buffer::_CoreZeroBasedVector) = (0:(length(buffer.data)-1),)
+Base.getindex(buffer::_CoreZeroBasedVector, index::Int) = buffer.data[index+1]
+Base.setindex!(buffer::_CoreZeroBasedVector, value, index::Int) = (buffer.data[index+1] = value)
+
+struct _EvenAxisSumBasis <: Grico.AbstractBasisFamily end
+
+function Grico.is_active_mode(::_EvenAxisSumBasis, degrees::NTuple{D,<:Integer},
+                              mode::NTuple{D,<:Integer}) where {D}
+  for axis in 1:D
+    0 <= mode[axis] <= degrees[axis] || return false
+  end
+
+  return iseven(sum(mode))
+end
+
+function _basis_iteration_first_axis_sum(modes)
+  total = 0
+
+  for mode in modes
+    total += first(mode)
+  end
+
+  return total
+end
+
 @testset "Dense Local Kernels" begin
   matrix_data = [0.0 2.0 1.0; 1.0 -2.0 -3.0; 2.0 3.0 1.0]
   rhs = [1.0, -2.0, 0.5]
@@ -152,6 +182,9 @@ end
   @test_throws ArgumentError Grico.legendre_values_and_derivatives!(0.5, 2, aliased, aliased)
   @test_throws ArgumentError Grico.integrated_legendre_values_and_derivatives!(0.5, 2, aliased,
                                                                                aliased)
+  zero_based_values = _CoreZeroBasedVector(zeros(Float64, 3))
+  @test_throws ArgumentError Grico.legendre_values_and_derivatives!(0.5, 2, zero_based_values,
+                                                                    nothing)
 
   @test_throws ArgumentError Grico.legendre_values(0.0, -1)
   @test_throws ArgumentError Grico.legendre_values(0.0, big(typemax(Int)) + 1)
@@ -200,6 +233,17 @@ end
   @test trunk_ordered ==
         filter(mode -> Grico.is_active_mode(Grico.TrunkBasis(), (4, 3, 2), mode), full_ordered)
 
+  full_iterator = Grico.basis_modes(Grico.FullTensorBasis(), (7, 6, 5, 4))
+  _basis_iteration_first_axis_sum(full_iterator)
+  @test @inferred(_basis_iteration_first_axis_sum(full_iterator)) == 5880
+  @test @allocated(_basis_iteration_first_axis_sum(full_iterator)) == 0
+
+  custom_modes = collect(Grico.basis_modes(_EvenAxisSumBasis(), (2, 1)))
+  @test custom_modes == [(0, 0), (2, 0), (1, 1)]
+  @test Grico.basis_mode_count(_EvenAxisSumBasis(), (2, 1)) == length(custom_modes)
+  @test Grico.is_active_mode(_EvenAxisSumBasis(), (2, 1), (1, 1))
+  @test !Grico.is_active_mode(_EvenAxisSumBasis(), (2, 1), (2, 1))
+
   for (basis, degrees) in ((Grico.FullTensorBasis(), (4,)), (Grico.FullTensorBasis(), (2, 3, 1)),
                            (Grico.TrunkBasis(), (3, 3)), (Grico.TrunkBasis(), (3, 2, 1, 2)))
     iterator = Grico.basis_modes(basis, degrees)
@@ -220,6 +264,8 @@ end
   @test_throws ArgumentError Grico.basis_modes(Grico.FullTensorBasis(), (typemax(Int),))
   @test_throws ArgumentError Grico.basis_mode_count(Grico.TrunkBasis(), (typemax(Int),))
   @test_throws ArgumentError Grico.basis_modes(Grico.TrunkBasis(), (typemax(Int),))
+  @test_throws ArgumentError Grico.basis_mode_count(Grico.TrunkBasis(), (typemax(Int) - 1,))
+  @test_throws ArgumentError Grico.basis_modes(Grico.TrunkBasis(), (typemax(Int) - 1,))
 end
 
 @testset "Quadrature" begin
@@ -237,6 +283,8 @@ end
   @test manual_rule isa Grico.GaussLegendreRule{Float64}
   @test Grico.point(manual_rule, 1) == (0.0,)
   @test Grico.weight(manual_rule, 1) == 2.0
+  manual_two_point_rule = Grico.GaussLegendreRule([-sqrt(1 / 3), sqrt(1 / 3)], [1.0, 1.0])
+  @test Grico.point_count(manual_two_point_rule) == 2
 
   for degree in 0:5
     @test _integrate_monomial(rule, degree) ≈ _exact_interval_monomial(degree) atol = 1.0e-12
@@ -283,6 +331,9 @@ end
   @test_throws ArgumentError Grico.gauss_legendre_rule(0)
   @test_throws ArgumentError Grico.GaussLegendreRule{Float64}([2.0], [1.0])
   @test_throws ArgumentError Grico.GaussLegendreRule{Float64}([0.0], [-1.0])
+  @test_throws ArgumentError Grico.GaussLegendreRule([0.5], [2.0])
+  @test_throws ArgumentError Grico.GaussLegendreRule([sqrt(1 / 3), -sqrt(1 / 3)], [1.0, 1.0])
+  @test_throws ArgumentError Grico.TensorQuadrature(Float64, (typemax(Int), 2))
 
   for (T, point_count) in ((Float32, 8), (Float64, 8), (Float64, 16))
     high_order_rule = Grico.gauss_legendre_rule(T, point_count)

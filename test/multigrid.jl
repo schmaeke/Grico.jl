@@ -1,5 +1,6 @@
 using Test
 using Grico
+import Grico: JacobiPreconditioner, add_cell!
 
 struct _MGIdentity end
 
@@ -44,6 +45,19 @@ function _test_transfer_adjoint(transfer)
 end
 
 @testset "Geometric multigrid" begin
+  @test_throws ArgumentError GeometricMultigridPreconditioner(smoother_damping=Inf)
+  @test_throws ArgumentError GeometricMultigridPreconditioner(coarse_relative_tolerance=Inf)
+  @test_throws ArgumentError GeometricMultigridPreconditioner(coarse_absolute_tolerance=NaN)
+  @test !Grico._matrix_is_symmetric([1.0e-14 0.0; 1.0e-10 1.0e-14])
+  @test !Grico._matrix_is_symmetric([1.0 NaN; NaN 1.0])
+  gmres_coefficients = zeros(2)
+  Grico._gmres_smoother_upper_triangular_solve!(gmres_coefficients, [1.0e-14 0.0; 0.0 1.0],
+                                                [1.0, 2.0], 2)
+  @test gmres_coefficients ≈ [1.0e14, 2.0]
+  @test_throws ArgumentError Grico._gmres_smoother_upper_triangular_solve!(zeros(2),
+                                                                           [0.0 0.0; 0.0 1.0],
+                                                                           [1.0, 2.0], 2)
+
   dg_problem, dg_field = _mg_identity_problem(continuity=:dg, degree=3)
   dg_state = solve(dg_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   @test coefficients(dg_state) ≈ ones(field_dof_count(dg_field))
@@ -57,6 +71,9 @@ end
   hierarchy = Grico._compile_geometric_multigrid(dg_problem, GeometricMultigridPreconditioner())
   @test length(hierarchy.levels) == 2
   @test hierarchy.coarse_solver isa Grico._DenseCholeskyCoarseSolver
+  @test length(hierarchy.level_rhs) == length(hierarchy.levels) - 1
+  @test length(hierarchy.level_solution) == length(hierarchy.levels) - 1
+  @test isempty(hierarchy.gmres_smoothers)
   @test _test_transfer_adjoint(only(hierarchy.transfers))
 
   weak_problem, weak_field = _mg_identity_problem(continuity=:dg, degree=3)
@@ -74,8 +91,28 @@ end
   weak_cg = solve(compile(weak_problem); solver=CGSolver(preconditioner=JacobiPreconditioner()),
                   relative_tolerance=1.0e-12)
   @test coefficients(weak_gmg) ≈ coefficients(weak_cg) atol = 1.0e-8
+  @test_throws ArgumentError solve(weak_problem;
+                                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner(pre_smoothing_steps=1,
+                                                                                                   post_smoothing_steps=2)))
+  @test_throws ArgumentError solve(weak_problem;
+                                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner(smoother=:gmres)))
   @test_throws ArgumentError solve(compile(weak_problem);
                                    solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+
+  threshold_domain = Domain((0.0, 0.0), (1.0, 1.0), (22, 22))
+  threshold_space = HpSpace(threshold_domain, SpaceOptions(degree=UniformDegree(2), continuity=:cg))
+  threshold_field = ScalarField(threshold_space; name=:u)
+  threshold_problem = AffineProblem(threshold_field; operator_class=SPD())
+  add_cell_bilinear!(threshold_problem, threshold_field, threshold_field) do q, v, w
+    value(v) * value(w)
+  end
+  threshold_hierarchy = Grico._compile_geometric_multigrid(threshold_problem,
+                                                           GeometricMultigridPreconditioner())
+  @test Grico.reduced_dof_count(threshold_hierarchy.levels[1].plan) > 512
+  @test threshold_hierarchy.coarse_solver isa Grico._KrylovCoarseSolver
+  threshold_direct = Grico._compile_geometric_multigrid(threshold_problem,
+                                                        GeometricMultigridPreconditioner(coarse_direct_dof_limit=4096))
+  @test threshold_direct.coarse_solver isa Grico._DenseCholeskyCoarseSolver
 
   nonsym_domain = Domain((0.0,), (1.0,), (2,))
   nonsym_space = HpSpace(nonsym_domain, SpaceOptions(degree=UniformDegree(3), continuity=:dg))
@@ -94,6 +131,14 @@ end
   nonsym_hierarchy = Grico._compile_geometric_multigrid(nonsym_problem,
                                                         GeometricMultigridPreconditioner())
   @test nonsym_hierarchy.coarse_solver isa Grico._DenseLUCoarseSolver
+  @test nonsym_hierarchy.smoother == :gmres
+  @test length(nonsym_hierarchy.gmres_smoothers) == length(nonsym_hierarchy.levels) - 1
+  @test_throws ArgumentError Grico._compile_geometric_multigrid(nonsym_problem,
+                                                                GeometricMultigridPreconditioner(smoother=:gmres,
+                                                                                                 smoother_restart=1))
+  @test Grico._default_affine_preconditioner(nonsym_problem) isa JacobiPreconditioner
+  @test_throws ArgumentError solve(nonsym_problem;
+                                   solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
   nonsym_state = solve(nonsym_problem;
                        solver=FGMRESSolver(preconditioner=GeometricMultigridPreconditioner()),
                        relative_tolerance=1.0e-12)
@@ -133,4 +178,35 @@ end
   @test coefficients(solve(hanging_problem;
                            solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))) ≈
         ones(field_dof_count(hanging_field))
+
+  float32_domain = Domain((0.0f0,), (1.0f0,), (2,))
+  float32_space = HpSpace(float32_domain, SpaceOptions(degree=UniformDegree(3), continuity=:dg))
+  float32_field = ScalarField(float32_space; name=:u)
+  float32_problem = AffineProblem(float32_field; operator_class=SPD())
+  add_cell!(float32_problem, _MGIdentity())
+  float32_state = solve(float32_problem;
+                        solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+  @test eltype(coefficients(float32_state)) === Float32
+  @test coefficients(float32_state) ≈ ones(Float32, field_dof_count(float32_field))
+
+  float32_h_domain = Domain((0.0f0,), (1.0f0,), (1,))
+  refine!(grid(float32_h_domain), 1, 1)
+  float32_h_space = HpSpace(float32_h_domain,
+                            SpaceOptions(degree=UniformDegree(16), continuity=:dg))
+  float32_h_field = ScalarField(float32_h_space; name=:u)
+  float32_h_problem = AffineProblem(float32_h_field; operator_class=SPD())
+  add_cell!(float32_h_problem, _MGIdentity())
+  float32_hierarchy = Grico._compile_geometric_multigrid(float32_h_problem,
+                                                         GeometricMultigridPreconditioner(min_degree=16,
+                                                                                          max_levels=2))
+  @test any(coefficient -> 0 < abs(coefficient) <= 1000eps(Float32),
+            only(float32_hierarchy.transfers).coefficients)
+
+  diagnostics = Grico.multigrid_diagnostics(weak_problem;
+                                            preconditioner=GeometricMultigridPreconditioner(),
+                                            repetitions=1)
+  @test diagnostics.levels == 2
+  @test diagnostics.smoother == :jacobi
+  @test diagnostics.coarse_solver == :dense_cholesky
+  @test diagnostics.vcycle_seconds_per_call >= 0
 end

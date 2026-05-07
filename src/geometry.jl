@@ -727,6 +727,7 @@ end
 # intermediate tuple.
 function _write_checked_axis_values!(value_at_axis, destination::AbstractVector, axis_count::Int,
                                      name::AbstractString)
+  _require_one_based_vector(destination, name)
   _require_length(destination, axis_count, name)
 
   @inbounds for axis in 1:axis_count

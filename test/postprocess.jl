@@ -1,8 +1,8 @@
 using Test
 using Grico
-import Grico: SampledPostprocess, postprocess_supported, sample_mesh_skeleton
+import Grico: SampledPostprocess, postprocess_supported, sample_mesh_skeleton, scalar_dof_count
 
-function _throws_argument_message(f, needle::AbstractString)
+function _postprocess_throws_argument_message(f, needle::AbstractString)
   try
     f()
   catch exception
@@ -15,10 +15,25 @@ function _throws_argument_message(f, needle::AbstractString)
   return nothing
 end
 
+struct ShiftedPostprocessVector{T} <: AbstractVector{T}
+  data::Vector{T}
+end
+
+Base.size(vector::ShiftedPostprocessVector) = size(vector.data)
+Base.axes(vector::ShiftedPostprocessVector) = (0:(length(vector.data)-1),)
+Base.IndexStyle(::Type{<:ShiftedPostprocessVector}) = IndexLinear()
+Base.getindex(vector::ShiftedPostprocessVector, index::Int) = vector.data[index+1]
+
+function Base.iterate(vector::ShiftedPostprocessVector, state::Int=1)
+  state > length(vector.data) && return nothing
+  return vector.data[state], state + 1
+end
+
 @testset "Postprocess Sampling" begin
   @test postprocess_supported(1)
   @test postprocess_supported(3)
   @test !postprocess_supported(4)
+  @test !postprocess_supported(true)
   @test !postprocess_supported(big(typemax(Int)) + 1)
 
   domain = Domain((0.0,), (1.0,), (1,))
@@ -80,6 +95,11 @@ end
   @test cells["contextual_cell"] == [0.75, 2.25]
   @test cells["tuple_cell"] == [1.0 1.0; 0.25 0.75]
 
+  shifted_leaf_data = ShiftedPostprocessVector([9.0])
+  shifted_cell_data = sample_postprocess(domain; cell_data=(shifted=shifted_leaf_data,),
+                                         subdivisions=2)
+  @test Dict(shifted_cell_data.cell_data)["shifted"] == [9.0, 9.0]
+
   linear_state = State(FieldLayout((u,)), [0.0, 1.0])
   du_dx = (_x, _values, leaf, ξ) -> field_gradient(linear_state, u, leaf, ξ)[1]
   gradient_sampled = sample_postprocess(linear_state; point_data=(du_dx=du_dx,), subdivisions=2,
@@ -116,13 +136,14 @@ end
   @test active_leaves(ordered_space) != active_leaves(grid(ordered_domain))
   @test sample_postprocess(ordered_domain; state=ordered_state) isa SampledPostprocess
 
-  _throws_argument_message(() -> write_vtk("unloaded", domain), "requires WriteVTK")
-  _throws_argument_message(() -> write_pvd("unloaded.pvd", String[]), "requires WriteVTK")
-  _throws_argument_message(() -> plot_field(sampled, :u), "requires Makie")
-  _throws_argument_message(() -> plot_field!(nothing, sampled, :u), "requires Makie")
-  _throws_argument_message(() -> plot_field(state, :u), "requires Makie")
-  _throws_argument_message(() -> plot_mesh(refined_domain), "requires Makie")
-  _throws_argument_message(() -> plot_mesh!(nothing, refined_domain), "requires Makie")
+  _postprocess_throws_argument_message(() -> write_vtk("unloaded", domain), "requires WriteVTK")
+  _postprocess_throws_argument_message(() -> write_pvd("unloaded.pvd", String[]),
+                                       "requires WriteVTK")
+  _postprocess_throws_argument_message(() -> plot_field(sampled, :u), "requires Makie")
+  _postprocess_throws_argument_message(() -> plot_field!(nothing, sampled, :u), "requires Makie")
+  _postprocess_throws_argument_message(() -> plot_field(state, :u), "requires Makie")
+  _postprocess_throws_argument_message(() -> plot_mesh(refined_domain), "requires Makie")
+  _postprocess_throws_argument_message(() -> plot_mesh!(nothing, refined_domain), "requires Makie")
 
   fallback_script = raw"""
 using Grico
@@ -175,10 +196,22 @@ _throws_argument_message(() -> plot_mesh!(nothing, domain), "requires Makie")
                                                 field_data=["time" => [1.0], "time" => [2.0]])
   @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=[1.0],), subdivisions=2)
   @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=(() -> 1.0),))
+  @test_throws ArgumentError sample_postprocess(State(FieldLayout((u,)), [NaN, 1.0]))
+  @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=x -> NaN,))
+  @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=x -> true,))
+  @test_throws ArgumentError sample_postprocess(domain; point_data=(bad=[0.0, Inf],))
+  @test_throws ArgumentError sample_postprocess(domain;
+                                                point_data=(bad=x -> x[1] == 0.0 ? 1 : 1.5,))
+  @test_throws ArgumentError sample_postprocess(domain; cell_data=(bad=leaf -> (1.0, Inf),))
   @test_throws ArgumentError sample_postprocess(domain; subdivisions=0)
   @test_throws ArgumentError sample_postprocess(domain; sample_degree=0)
-  _throws_argument_message(() -> sample_postprocess(domain; subdivisions=1.5),
-                           "subdivisions must be a positive Int-representable integer")
-  _throws_argument_message(() -> sample_postprocess(domain; sample_degree=1.5),
-                           "sample_degree must be a positive Int-representable integer")
+  _postprocess_throws_argument_message(() -> sample_postprocess(domain; subdivisions=1.5),
+                                       "subdivisions must be a positive Int-representable integer")
+  _postprocess_throws_argument_message(() -> sample_postprocess(domain; sample_degree=1.5),
+                                       "sample_degree must be a positive Int-representable integer")
+  _postprocess_throws_argument_message(() -> sample_postprocess(domain; subdivisions=typemax(Int)),
+                                       "too many postprocess samples")
+  _postprocess_throws_argument_message(() -> sample_postprocess(domain; subdivisions=2,
+                                                                sample_degree=typemax(Int)),
+                                       "too many postprocess samples")
 end

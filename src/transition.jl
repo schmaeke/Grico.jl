@@ -9,7 +9,9 @@ For each active target leaf, the transition stores the contiguous slice of
 source leaves whose physical cells overlap that target leaf. This overlap data
 is the geometric backbone for state transfer: values on the target space are
 evaluated by locating the source leaf that contains each target quadrature
-point.
+point. The row table is indexed by target active-leaf order, not by raw cell id,
+so its size scales with the target frontier rather than append-only grid
+history.
 """
 struct SpaceTransition{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:HpSpace{D,T},O<:Vector{Int},
                        C<:Vector{Int},V<:Vector{Int}}
@@ -18,6 +20,57 @@ struct SpaceTransition{D,T<:AbstractFloat,S<:HpSpace{D,T},N<:HpSpace{D,T},O<:Vec
   source_offsets::O
   source_counts::C
   source_leaf_data::V
+
+  function SpaceTransition(source_space::S, target_space::N, source_offsets::O, source_counts::C,
+                           source_leaf_data::V) where {D,T<:AbstractFloat,S<:HpSpace{D,T},
+                                                       N<:HpSpace{D,T},O<:Vector{Int},
+                                                       C<:Vector{Int},V<:Vector{Int}}
+    _check_space_transition_data(source_space, target_space, source_offsets, source_counts,
+                                 source_leaf_data)
+    return new{D,T,S,N,O,C,V}(source_space, target_space, source_offsets, source_counts,
+                              source_leaf_data)
+  end
+end
+
+function _check_space_transition_data(source_space::HpSpace{D,T}, target_space::HpSpace{D,T},
+                                      source_offsets::Vector{Int}, source_counts::Vector{Int},
+                                      source_leaf_data::Vector{Int}) where {D,T<:AbstractFloat}
+  source_snapshot = snapshot(source_space)
+  target_snapshot = snapshot(target_space)
+  target_active = target_snapshot.active_leaves
+  length(source_offsets) == length(target_active) ||
+    throw(ArgumentError("transition source offsets must match the active target leaf count"))
+  length(source_counts) == length(target_active) ||
+    throw(ArgumentError("transition source counts must match the active target leaf count"))
+
+  cursor = 1
+
+  for target_index in eachindex(target_active)
+    first = source_offsets[target_index]
+    count = source_counts[target_index]
+    count > 0 || throw(ArgumentError("transition target row $target_index has no source leaves"))
+    first == cursor || throw(ArgumentError("transition source rows must be stored contiguously"))
+    last = first + count - 1
+    1 <= first <= last <= length(source_leaf_data) ||
+      throw(ArgumentError("transition source row $target_index exceeds source leaf data"))
+    target_leaf = target_active[target_index]
+
+    for source_index in first:last
+      source_leaf = source_leaf_data[source_index]
+      1 <= source_leaf <= stored_cell_count(grid(source_space)) ||
+        throw(ArgumentError("transition source leaf $source_leaf is outside the source grid"))
+      is_active_leaf(source_snapshot, source_leaf) ||
+        throw(ArgumentError("transition source leaf $source_leaf is not active in the source space"))
+      _cells_overlap(grid(source_snapshot), source_leaf, grid(target_snapshot), target_leaf) ||
+        throw(ArgumentError("transition source leaf $source_leaf does not overlap target leaf $target_leaf"))
+    end
+
+    cursor = last + 1
+  end
+
+  cursor == length(source_leaf_data) + 1 ||
+    throw(ArgumentError("transition source leaf data contains unused entries"))
+  return nothing
 end
 
 """
@@ -38,17 +91,26 @@ target_space(transition::SpaceTransition) = transition.target_space
 # This compact compressed-row style layout avoids allocating small vectors for
 # every target leaf.
 function _source_leaf_range(transition::SpaceTransition, target_leaf::Integer)
-  checked_leaf = _checked_cell(grid(target_space(transition)), target_leaf)
-  is_active_leaf(snapshot(target_space(transition)), checked_leaf) ||
-    throw(ArgumentError("leaf $checked_leaf is not an active target leaf"))
-  first, count = _source_leaf_range_unchecked(transition, checked_leaf)
+  target = target_space(transition)
+  target_snapshot = snapshot(target)
+  checked_leaf = _checked_cell(grid(target), target_leaf)
+  target_index = checked_leaf <= length(target_snapshot.leaf_to_index) ?
+                 @inbounds(target_snapshot.leaf_to_index[checked_leaf]) : 0
+  target_index != 0 || throw(ArgumentError("leaf $checked_leaf is not an active target leaf"))
+  first, count = _source_leaf_range_at_index_unchecked(transition, target_index)
   count != 0 || throw(ArgumentError("leaf $checked_leaf has no compiled source leaves"))
   return first, count
 end
 
 @inline function _source_leaf_range_unchecked(transition::SpaceTransition, target_leaf::Int)
-  first = @inbounds transition.source_offsets[target_leaf]
-  count = @inbounds transition.source_counts[target_leaf]
+  target_index = @inbounds snapshot(target_space(transition)).leaf_to_index[target_leaf]
+  return _source_leaf_range_at_index_unchecked(transition, target_index)
+end
+
+@inline function _source_leaf_range_at_index_unchecked(transition::SpaceTransition,
+                                                       target_index::Int)
+  first = @inbounds transition.source_offsets[target_index]
+  count = @inbounds transition.source_counts[target_index]
   return first, count
 end
 
@@ -58,11 +120,12 @@ end
 Return the active source leaves that overlap one active target leaf.
 
 These leaves are stored in the traversal order used by [`transition`](@ref) and
-form the local search set used during state transfer.
+form the local search set used during state transfer. The returned object is a
+non-copying view into the transition data.
 """
 function source_leaves(transition::SpaceTransition, target_leaf::Integer)
   first, count = _source_leaf_range(transition, target_leaf)
-  return transition.source_leaf_data[first:(first+count-1)]
+  return @view transition.source_leaf_data[first:(first+count-1)]
 end
 
 # Source/target overlap is collected by descending the source tree only through
@@ -203,8 +266,14 @@ function derived_adaptivity_plan(driver_plan::AdaptivityPlan, field::AbstractFie
                                  limits=limits)
 end
 
+function _copied_transition_target_data(plan::AdaptivityPlan)
+  copied_domain = copy(target_domain(plan))
+  copied_snapshot = _snapshot(grid(copied_domain), target_snapshot(plan).active_leaves)
+  return copied_domain, copied_snapshot, copy(plan.target_degrees)
+end
+
 function _transition_target_data(plan::AdaptivityPlan, use_compact::Bool)
-  use_compact || return target_domain(plan), target_snapshot(plan), plan.target_degrees
+  use_compact || return _copied_transition_target_data(plan)
   compact_domain, compact_snapshot, old_to_new = compact(target_domain(plan), target_snapshot(plan))
   compact_degrees = _remap_compacted_target_degrees(target_snapshot(plan), plan.target_degrees,
                                                     compact_snapshot, old_to_new)
@@ -246,6 +315,10 @@ If `compact=true`, the target space is compiled on a non-mutating compacted copy
 of the target grid. The source space and the plan snapshot remain valid while
 the transition uses the compacted target for all new-space data.
 
+By default, the target space is still compiled on a non-mutating copy of the
+plan target domain, but retains the plan's full target-grid storage. This keeps
+compiled transitions independent of later edits to the mutable plan.
+
 Because the source and target domains share the same physical box and root-grid
 layout, the transition can describe source-to-target overlap purely by leaf
 relations on dyadic grids.
@@ -260,15 +333,17 @@ function transition(plan::AdaptivityPlan{D,T}; compact::Bool=false) where {D,T<:
   new_space = _compile_snapshot_space(new_domain, new_snapshot, options)
   source_snapshot = snapshot(old_space)
   target_grid = grid(new_space)
-  source_offsets = zeros(Int, stored_cell_count(target_grid))
-  source_counts = zeros(Int, stored_cell_count(target_grid))
+  target_active = snapshot(new_space).active_leaves
+  source_offsets = zeros(Int, length(target_active))
+  source_counts = zeros(Int, length(target_active))
   source_data = Int[]
   source_leaves = Int[]
 
-  for leaf in snapshot(new_space).active_leaves
+  for target_index in eachindex(target_active)
+    leaf = target_active[target_index]
     leaves = _transition_source_leaves!(source_leaves, source_snapshot, target_grid, leaf)
-    source_offsets[leaf] = length(source_data) + 1
-    source_counts[leaf] = length(leaves)
+    source_offsets[target_index] = length(source_data) + 1
+    source_counts[target_index] = length(leaves)
     append!(source_data, leaves)
   end
 
@@ -289,14 +364,14 @@ function adapted_field(transition::SpaceTransition, field::ScalarField;
                        name::Symbol=field_name(field))
   field_space(field) === source_space(transition) ||
     throw(ArgumentError("field must belong to the transition source space"))
-  return ScalarField(_field_id(field), target_space(transition), name)
+  return _field_with_identity(field, target_space(transition), name)
 end
 
 function adapted_field(transition::SpaceTransition, field::VectorField;
                        name::Symbol=field_name(field))
   field_space(field) === source_space(transition) ||
     throw(ArgumentError("field must belong to the transition source space"))
-  return VectorField(_field_id(field), target_space(transition), component_count(field), name)
+  return _field_with_identity(field, target_space(transition), name)
 end
 
 """

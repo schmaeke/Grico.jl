@@ -90,7 +90,7 @@ domains. Higher-dimensional domains may be valid for numerical work, but the
 standard visualization backends targeted by Grico do not have a common direct
 representation for them.
 """
-postprocess_supported(dimension::Integer) = 1 <= dimension <= 3
+postprocess_supported(dimension::Integer) = !(dimension isa Bool) && 1 <= dimension <= 3
 
 """
     sample_postprocess(state; kwargs...)
@@ -163,6 +163,37 @@ end
 function _checked_postprocess_positive_integer(value, name::AbstractString)
   value isa Integer || throw(ArgumentError("$name must be a positive Int-representable integer"))
   return _checked_positive(value, name)
+end
+
+@noinline function _throw_postprocess_work_overflow(context::AbstractString)
+  throw(ArgumentError("$context creates too many postprocess samples"))
+end
+
+@inline function _checked_postprocess_work_product(left::Int, right::Int, context::AbstractString)
+  (left == 0 || right <= typemax(Int) ÷ left) || _throw_postprocess_work_overflow(context)
+  return left * right
+end
+
+@inline function _checked_postprocess_work_increment(value::Int, context::AbstractString)
+  value < typemax(Int) || _throw_postprocess_work_overflow(context)
+  return value + 1
+end
+
+function _checked_postprocess_work_power(base::Int, exponent::Int, context::AbstractString)
+  result = 1
+
+  for _ in 1:exponent
+    result = _checked_postprocess_work_product(result, base, context)
+  end
+
+  return result
+end
+
+function _checked_postprocess_array_work(tuple_count::Int, component_count::Int, ::Type{T},
+                                         context::AbstractString) where {T}
+  value_count = _checked_postprocess_work_product(tuple_count, component_count, context)
+  _checked_postprocess_work_product(value_count, sizeof(T), context)
+  return value_count
 end
 
 """
@@ -412,14 +443,18 @@ end
 @inline function _postprocess_store_field_sample!(sampled::AbstractVector{T},
                                                   values::AbstractVector{T},
                                                   point_index::Int) where {T<:AbstractFloat}
-  sampled[point_index] = values[1]
+  value = values[1]
+  isfinite(value) || throw(ArgumentError("sampled field values must be finite"))
+  sampled[point_index] = value
   return sampled
 end
 
 function _postprocess_store_field_sample!(sampled::AbstractMatrix{T}, values::AbstractVector{T},
                                           point_index::Int) where {T<:AbstractFloat}
   @inbounds for component in axes(sampled, 1)
-    sampled[component, point_index] = values[component]
+    value = values[component]
+    isfinite(value) || throw(ArgumentError("sampled field values must be finite"))
+    sampled[component, point_index] = value
   end
 
   return sampled
@@ -560,30 +595,50 @@ function _require_postprocess_dataset_sizes(datasets, count::Int, location::Abst
   for (name, data) in datasets
     _postprocess_tuple_count(data) == count ||
       throw(ArgumentError("$location dataset $name must have $count tuples"))
+    _require_postprocess_array_values(data, "$location dataset $name")
   end
 end
 
 _postprocess_tuple_count(data::AbstractVector) = length(data)
 _postprocess_tuple_count(data::AbstractMatrix) = size(data, 2)
 
+function _require_postprocess_array_values(data::PostprocessArray, context::AbstractString)
+  for value in data
+    _checked_postprocess_real(value, context)
+  end
+
+  return data
+end
+
+@inline function _checked_postprocess_real(value, context::AbstractString)
+  value isa Real && !(value isa Bool) ||
+    throw(ArgumentError("$context must contain finite real values"))
+  isfinite(value) || throw(ArgumentError("$context must contain finite values"))
+  return value
+end
+
 # Cell datasets are allowed to be specified either per exported cell or per
 # active leaf. In the latter case the values are replicated to the
 # `cells_per_leaf` exported subcells belonging to that leaf.
 function _expand_postprocess_leaf_dataset(data::AbstractVector, cells_per_leaf::Int)
-  expanded = similar(data, length(data) * cells_per_leaf)
+  expanded = Vector{eltype(data)}(undef, length(data) * cells_per_leaf)
 
-  for leaf_index in eachindex(data), local_cell in 1:cells_per_leaf
-    expanded[(leaf_index-1)*cells_per_leaf+local_cell] = data[leaf_index]
+  for (leaf_offset, value) in enumerate(data), local_cell in 1:cells_per_leaf
+    expanded[(leaf_offset-1)*cells_per_leaf+local_cell] = value
   end
 
   return expanded
 end
 
 function _expand_postprocess_leaf_dataset(data::AbstractMatrix, cells_per_leaf::Int)
-  expanded = similar(data, size(data, 1), size(data, 2) * cells_per_leaf)
+  expanded = Matrix{eltype(data)}(undef, size(data, 1), size(data, 2) * cells_per_leaf)
 
-  for leaf_index in axes(data, 2), local_cell in 1:cells_per_leaf
-    expanded[:, (leaf_index-1)*cells_per_leaf+local_cell] = data[:, leaf_index]
+  for (leaf_offset, column) in enumerate(eachcol(data)), local_cell in 1:cells_per_leaf
+    target = (leaf_offset - 1) * cells_per_leaf + local_cell
+
+    for (component, value) in enumerate(column)
+      expanded[component, target] = value
+    end
   end
 
   return expanded
@@ -608,7 +663,8 @@ function _collect_postprocess_samples(sample_count::Int, location::AbstractStrin
 end
 
 function _postprocess_collected_sample_buffer(first_value::Number, sample_count::Int,
-                                              ::AbstractString)
+                                              location::AbstractString)
+  _checked_postprocess_real(first_value, "$location dataset callable output")
   return Vector{typeof(first_value)}(undef, sample_count)
 end
 
@@ -616,20 +672,38 @@ function _postprocess_collected_sample_buffer(first_value::Union{Tuple,AbstractV
                                               sample_count::Int, location::AbstractString)
   !isempty(first_value) ||
     throw(ArgumentError("$location dataset callables must return at least one tuple/vector component"))
-  return Matrix{_postprocess_sample_component_type(first_value)}(undef, length(first_value),
-                                                                 sample_count)
+  component_type = _postprocess_sample_component_type(first_value, location)
+  return Matrix{component_type}(undef, length(first_value), sample_count)
 end
 
 function _postprocess_collected_sample_buffer(::Any, ::Int, location::AbstractString)
   throw(ArgumentError("$location dataset callables must return scalars, tuples, or vectors"))
 end
 
-_postprocess_sample_component_type(first_value::Tuple) = Base.promote_typeof(first_value...)
-_postprocess_sample_component_type(first_value::AbstractVector) = eltype(first_value)
+function _postprocess_sample_component_type(first_value::Union{Tuple,AbstractVector},
+                                            location::AbstractString)
+  component_type = nothing
+
+  for value in first_value
+    _checked_postprocess_real(value, "$location dataset callable output")
+    component_type = component_type === nothing ? typeof(value) :
+                     promote_type(component_type, typeof(value))
+  end
+
+  return component_type
+end
 
 @inline function _postprocess_store_collected_sample!(values::AbstractVector, current::Number,
-                                                      index::Int, ::AbstractString)
-  values[index] = current
+                                                      index::Int, location::AbstractString)
+  checked = _checked_postprocess_real(current, "$location dataset callable output")
+
+  try
+    values[index] = checked
+  catch exception
+    _postprocess_conversion_exception(exception) || rethrow()
+    throw(ArgumentError("$location dataset callables must return one stable scalar type"))
+  end
+
   return values
 end
 
@@ -639,11 +713,22 @@ function _postprocess_store_collected_sample!(values::AbstractMatrix,
   length(current) == size(values, 1) ||
     throw(ArgumentError("$location dataset callables must return one fixed tuple/vector size"))
 
-  @inbounds for component in axes(values, 1)
-    values[component, index] = current[component]
+  for (component, raw) in enumerate(current)
+    checked = _checked_postprocess_real(raw, "$location dataset callable output")
+
+    try
+      values[component, index] = checked
+    catch exception
+      _postprocess_conversion_exception(exception) || rethrow()
+      throw(ArgumentError("$location dataset callables must return one stable component type"))
+    end
   end
 
   return values
+end
+
+@inline function _postprocess_conversion_exception(exception)
+  return exception isa InexactError || exception isa MethodError || exception isa TypeError
 end
 
 function _postprocess_store_collected_sample!(values, ::Any, ::Int, location::AbstractString)
@@ -664,12 +749,19 @@ end
 function _sampled_mesh(domain_data::AbstractDomain{D,T}, leaf_data::AbstractVector{<:Integer},
                        subdivisions::Int, sample_degree::Int) where {D,T<:AbstractFloat}
   leaf_count = length(leaf_data)
-  point_resolution = subdivisions * sample_degree
-  point_stride = point_resolution + 1
-  local_point_count = point_stride^D
-  total_point_count = leaf_count * local_point_count
-  total_cells = leaf_count * subdivisions^D
-  cells_per_leaf = subdivisions^D
+  point_resolution = _checked_postprocess_work_product(subdivisions, sample_degree,
+                                                       "postprocess point resolution")
+  point_stride = _checked_postprocess_work_increment(point_resolution, "postprocess point stride")
+  local_point_count = _checked_postprocess_work_power(point_stride, D, "postprocess point grid")
+  cells_per_leaf = _checked_postprocess_work_power(subdivisions, D, "postprocess cell grid")
+  total_point_count = _checked_postprocess_work_product(leaf_count, local_point_count,
+                                                        "postprocess point grid")
+  total_cells = _checked_postprocess_work_product(leaf_count, cells_per_leaf,
+                                                  "postprocess cell grid")
+  _checked_postprocess_array_work(total_point_count, D, T, "postprocess point arrays")
+  _checked_postprocess_array_work(total_point_count, 1, Int, "postprocess point arrays")
+  _checked_postprocess_array_work(total_cells, D, T, "postprocess cell arrays")
+  _checked_postprocess_array_work(total_cells, 1, Int, "postprocess cell arrays")
   points = Matrix{T}(undef, D, total_point_count)
   point_leaves = Vector{Int}(undef, total_point_count)
   point_references = Matrix{T}(undef, D, total_point_count)

@@ -1,5 +1,6 @@
 using Test
 using Grico
+import Grico: EmbeddedSurface, SegmentMesh, SurfaceQuadrature, point_count
 
 const EMBEDDED_GEOMETRY_TOL = 1.0e-10
 
@@ -43,6 +44,7 @@ end
 
   @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> 1.0) === nothing
   @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> x[1]) === nothing
+  @test Grico.finite_cell_quadrature(domain, 1, (2,), x -> -1.0) isa Grico.TensorQuadrature
 
   sliver = Grico.finite_cell_quadrature(domain, 1, (1,), x -> x[1] - 1.0e-6; subdivision_depth=0)
   @test sliver !== nothing
@@ -60,6 +62,20 @@ end
   _argument_message_contains(() -> Grico.finite_cell_quadrature(domain, 1, (1,), x -> -1.0;
                                                                 subdivision_depth=1.5),
                              "subdivision_depth")
+  _argument_message_contains(() -> Grico.ImplicitRegion(x -> -1.0; subdivision_depth=typemax(Int)),
+                             "subdivision_depth")
+  _argument_message_contains(() -> Grico.finite_cell_quadrature(domain, 1, (1,), x -> x[1] - 0.5;
+                                                                subdivision_depth=21),
+                             "subdivision_depth")
+
+  calls = Ref(0)
+  extension_region = Grico.ImplicitRegion(x -> (calls[] += 1; x[1] - 0.5); subdivision_depth=4)
+  extension_domain = Grico.PhysicalDomain(domain, extension_region;
+                                          cell_measure=Grico.FiniteCellExtension(1.0))
+  @test Grico._assembly_cell_quadrature(extension_domain, 1, (2,)) === nothing
+  @test calls[] == 0
+  @test isempty(extension_region.leaf_classification_cache)
+  @test isempty(extension_region.cut_quadrature_cache)
 end
 
 @testset "Embedded Surface Dimension Boundaries" begin
@@ -77,4 +93,24 @@ end
   quadratures = Grico.surface_quadratures(EmbeddedSurface(line; point_count=2), planar)
   @test length(quadratures) == 1
   @test only(quadratures) isa SurfaceQuadrature{2}
+end
+
+@testset "Embedded Surface Input Validation" begin
+  rule = Grico.PointQuadrature([(0.0,)], [1.0])
+  @test SurfaceQuadrature(1, rule, [(2.0,)]).normals == [(1.0,)]
+
+  _argument_message_contains(() -> SurfaceQuadrature(1, rule, [(true,)]), "not Bool")
+  _argument_message_contains(() -> SurfaceQuadrature(1, Grico.PointQuadrature([(0.0,)], [-1.0]),
+                                                     [(1.0,)]), "positive finite")
+  _argument_message_contains(() -> SurfaceQuadrature(1, Grico.PointQuadrature([(0.0,)], [0.0]),
+                                                     [(1.0,)]), "positive finite")
+
+  _argument_message_contains(() -> SegmentMesh([(false, 0.0), (1.0, 0.0)], [(1, 2)]), "not Bool")
+  _argument_message_contains(() -> SegmentMesh([(0.0, 0.0), (1.0, 0.0)], [(true, 2)]), "not Bool")
+  _argument_message_contains(() -> SegmentMesh([(0.0, 0.0), (0.0, 0.0)], [(1, 2)]),
+                             "positive geometric length")
+  _argument_message_contains(() -> SegmentMesh([(0.0, 0.0), (1.0, 0.0)], [(1, 2), (2, 1)]),
+                             "duplicate")
+  _argument_message_contains(() -> SegmentMesh([(0.0, 0.0), (1.0, 0.0), (0.0, 0.0), (1.0, 0.0)],
+                                               [(1, 2), (3, 4)]), "duplicate")
 end

@@ -25,6 +25,10 @@
 const _GAUSS_LEGENDRE_TOLERANCE_SCALE = 1.0e3
 const _GAUSS_LEGENDRE_MAX_NEWTON_ITERATIONS = 32
 
+struct _TrustedGaussLegendreRule end
+
+const _TRUSTED_GAUSS_LEGENDRE_RULE = _TrustedGaussLegendreRule()
+
 # Abstract interface.
 
 """
@@ -57,23 +61,29 @@ for tensor-product quadrature throughout the library.
 
 In practice, this is the canonical reference rule from which the default cell,
 face, and many verification quadratures are assembled.
+
+The direct constructor is an expert constructor for already known
+Gauss-Legendre data: it validates that the supplied points are strictly
+increasing roots of `Pₙ` and that the weights match the classical
+Gauss-Legendre formula to floating-point tolerance. Use
+[`gauss_legendre_rule`](@ref) to construct canonical rules from a point count,
+and [`PointQuadrature`](@ref) for arbitrary weighted point clouds.
 """
 struct GaussLegendreRule{T<:AbstractFloat} <: AbstractQuadrature{1,T}
   points::Vector{T}
   weights::Vector{T}
 
-  # Validate the rule as a genuine quadrature rule on `[-1,1]`: the point and
-  # weight vectors must match, all values must be finite, points must lie in the
-  # reference interval, and weights must be strictly positive.
+  # Validate the rule as a genuine Gauss-Legendre rule on `[-1,1]`: storage must
+  # be well formed, points must be ordered roots, and weights must match the
+  # classical formula.
   function GaussLegendreRule{T}(points::Vector{T}, weights::Vector{T}) where {T<:AbstractFloat}
-    length(points) == length(weights) ||
-      throw(ArgumentError("points and weights must have matching lengths"))
-    !isempty(points) || throw(ArgumentError("Gauss-Legendre rules require at least one point"))
-    all(isfinite, points) || throw(ArgumentError("points must be finite"))
-    all(isfinite, weights) || throw(ArgumentError("weights must be finite"))
-    all(point -> -one(T) <= point <= one(T), points) ||
-      throw(ArgumentError("points must lie in [-1, 1]"))
-    all(weight -> weight > zero(T), weights) || throw(ArgumentError("weights must be positive"))
+    _check_gauss_legendre_rule(points, weights)
+    return new{T}(points, weights)
+  end
+
+  function GaussLegendreRule{T}(points::Vector{T}, weights::Vector{T},
+                                ::_TrustedGaussLegendreRule) where {T<:AbstractFloat}
+    _check_gauss_legendre_storage(points, weights)
     return new{T}(points, weights)
   end
 end
@@ -351,7 +361,7 @@ function gauss_legendre_rule(::Type{T}, point_count::Integer) where {T<:Abstract
     weights[mirror] = w
   end
 
-  return GaussLegendreRule{T}(points, weights)
+  return GaussLegendreRule{T}(points, weights, _TRUSTED_GAUSS_LEGENDRE_RULE)
 end
 
 @inline _gauss_legendre_tolerance(::Type{T}) where {T<:AbstractFloat} = T(_GAUSS_LEGENDRE_TOLERANCE_SCALE) *
@@ -400,7 +410,8 @@ TensorQuadrature(::Tuple{}) = TensorQuadrature(Float64, ())
 # Build a tensor-product rule from per-axis point counts by first constructing
 # one-dimensional Gauss-Legendre rules on each axis.
 function TensorQuadrature(::Type{T}, shape::NTuple{D,<:Integer}) where {D,T<:AbstractFloat}
-  rules = ntuple(axis -> gauss_legendre_rule(T, shape[axis]), D)
+  checked_shape = _checked_tensor_quadrature_shape(shape)
+  rules = ntuple(axis -> gauss_legendre_rule(T, checked_shape[axis]), D)
   return TensorQuadrature(rules)
 end
 
@@ -413,13 +424,98 @@ end
 # convention matches the rest of the package: axis 1 varies fastest.
 function TensorQuadrature(rules::NTuple{D,GaussLegendreRule{T}}) where {D,T<:AbstractFloat}
   shape = ntuple(axis -> point_count(rules[axis]), D)
-  stride = ntuple(axis -> axis == 1 ? 1 : prod(shape[1:(axis-1)]), D)
-  count = prod(shape; init=1)
+  stride, count = _tensor_quadrature_strides_and_count(shape)
   return TensorQuadrature{D,T}(rules, shape, stride, count)
 end
 
 function PointQuadrature(points::Vector{NTuple{D,T}}, weights::Vector{T}) where {D,T<:AbstractFloat}
   PointQuadrature{D,T}(points, weights)
+end
+
+function _check_gauss_legendre_storage(points::Vector{T},
+                                       weights::Vector{T}) where {T<:AbstractFloat}
+  length(points) == length(weights) ||
+    throw(ArgumentError("points and weights must have matching lengths"))
+  !isempty(points) || throw(ArgumentError("Gauss-Legendre rules require at least one point"))
+  all(isfinite, points) || throw(ArgumentError("points must be finite"))
+  all(isfinite, weights) || throw(ArgumentError("weights must be finite"))
+  all(point -> -one(T) <= point <= one(T), points) ||
+    throw(ArgumentError("points must lie in [-1, 1]"))
+  all(weight -> weight > zero(T), weights) || throw(ArgumentError("weights must be positive"))
+  return nothing
+end
+
+function _check_gauss_legendre_rule(points::Vector{T}, weights::Vector{T}) where {T<:AbstractFloat}
+  _check_gauss_legendre_storage(points, weights)
+  _check_strictly_increasing(points, "points")
+
+  count = length(points)
+  values = Vector{T}(undef, count + 1)
+  derivatives = Vector{T}(undef, count + 1)
+  tolerance = _gauss_legendre_rule_validation_tolerance(T)
+
+  for index in 1:count
+    point_value = @inbounds points[index]
+    _legendre_values_and_derivatives!(point_value, count, values, derivatives)
+    abs(values[end]) <= tolerance ||
+      throw(ArgumentError("points must be roots of the matching Legendre polynomial"))
+
+    derivative = derivatives[end]
+    expected_weight = T(2) / ((one(T) - point_value * point_value) * derivative^2)
+    isfinite(expected_weight) ||
+      throw(ArgumentError("Gauss-Legendre weight validation produced a non-finite value"))
+    abs(@inbounds(weights[index]) - expected_weight) <=
+    tolerance * max(one(T), abs(expected_weight)) ||
+      throw(ArgumentError("weights must match the Gauss-Legendre formula"))
+  end
+
+  return nothing
+end
+
+@inline _gauss_legendre_rule_validation_tolerance(::Type{T}) where {T<:AbstractFloat} = sqrt(eps(T))
+
+function _check_strictly_increasing(values::Vector{T},
+                                    name::AbstractString) where {T<:AbstractFloat}
+  for index in 2:length(values)
+    @inbounds values[index-1] < values[index] ||
+              throw(ArgumentError("$name must be strictly increasing"))
+  end
+
+  return nothing
+end
+
+function _checked_tensor_quadrature_shape(shape::NTuple{D,<:Integer}) where {D}
+  checked_shape = ntuple(axis -> _checked_positive(shape[axis], "shape[$axis]"), D)
+  _checked_tensor_quadrature_point_count(checked_shape)
+  return checked_shape
+end
+
+function _checked_tensor_quadrature_point_count(shape::NTuple{D,Int}) where {D}
+  count = 1
+
+  for axis in 1:D
+    axis_count = @inbounds shape[axis]
+    axis_count <= typemax(Int) ÷ count ||
+      throw(ArgumentError("tensor quadrature point count must be Int-representable"))
+    count *= axis_count
+  end
+
+  return count
+end
+
+function _tensor_quadrature_strides_and_count(shape::NTuple{D,Int}) where {D}
+  strides = Vector{Int}(undef, D)
+  count = 1
+
+  for axis in 1:D
+    @inbounds strides[axis] = count
+    axis_count = @inbounds shape[axis]
+    axis_count <= typemax(Int) ÷ count ||
+      throw(ArgumentError("tensor quadrature point count must be Int-representable"))
+    count *= axis_count
+  end
+
+  return Tuple(strides)::NTuple{D,Int}, count
 end
 
 # Mixed-radix tensor indexing utilities.

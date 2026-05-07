@@ -1,5 +1,11 @@
 using Test
 using Grico
+import Grico: IdentityPreconditioner, JacobiPreconditioner, KernelScratch, PointQuadrature,
+              SurfaceQuadrature, add_boundary!, add_cell!, add_interface!, add_surface!,
+              add_surface_quadrature!, block, cell_apply!, is_full_tensor, local_dof_index,
+              local_mode_count, point_count, scratch_matrix, scratch_vector, shape_gradient,
+              shape_value, tensor_degrees, tensor_gradient!, tensor_interpolate!, tensor_mode_count,
+              tensor_point_count, tensor_project_gradient!, tensor_quadrature_shape, tensor_values
 
 struct _MatrixFreeIdentity end
 
@@ -482,6 +488,69 @@ end
                                                              Grico._ReducedOperatorWorkspace(weak_mass_plan).scratch)
   @test weak_mass_matrix * [0.25, -0.5] ≈ apply(weak_mass_plan, [0.25, -0.5])
 
+  nonlinear_test_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(nonlinear_test_problem, dg_field, dg_field) do q, v, w
+    value(v)^2 * value(w)
+  end
+  nonlinear_test_plan = compile(nonlinear_test_problem)
+  @test_throws ArgumentError apply(nonlinear_test_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(nonlinear_test_plan,
+                                                                     Grico._ReducedOperatorWorkspace(nonlinear_test_plan).scratch)
+
+  nonlinear_trial_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(nonlinear_trial_problem, dg_field, dg_field) do q, v, w
+    value(v) * value(w)^2
+  end
+  nonlinear_trial_plan = compile(nonlinear_trial_problem)
+  @test_throws ArgumentError apply(nonlinear_trial_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(nonlinear_trial_plan,
+                                                                     Grico._ReducedOperatorWorkspace(nonlinear_trial_plan).scratch)
+
+  test_only_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(test_only_problem, dg_field, dg_field) do q, v, w
+    value(v)
+  end
+  test_only_plan = compile(test_only_problem)
+  @test_throws ArgumentError apply(test_only_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(test_only_plan,
+                                                                     Grico._ReducedOperatorWorkspace(test_only_plan).scratch)
+
+  trial_only_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(trial_only_problem, dg_field, dg_field) do q, v, w
+    value(w)
+  end
+  trial_only_plan = compile(trial_only_problem)
+  @test_throws ArgumentError apply(trial_only_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(trial_only_plan,
+                                                                     Grico._ReducedOperatorWorkspace(trial_only_plan).scratch)
+
+  constant_bilinear_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(constant_bilinear_problem, dg_field, dg_field) do q, v, w
+    1.0
+  end
+  constant_bilinear_plan = compile(constant_bilinear_problem)
+  @test_throws ArgumentError apply(constant_bilinear_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(constant_bilinear_plan,
+                                                                     Grico._ReducedOperatorWorkspace(constant_bilinear_plan).scratch)
+
+  separate_terms_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(separate_terms_problem, dg_field, dg_field) do q, v, w
+    value(v) + value(w)
+  end
+  separate_terms_plan = compile(separate_terms_problem)
+  @test_throws ArgumentError apply(separate_terms_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(separate_terms_plan,
+                                                                     Grico._ReducedOperatorWorkspace(separate_terms_plan).scratch)
+
+  quotient_problem = AffineProblem(dg_field)
+  add_cell_bilinear!(quotient_problem, dg_field, dg_field) do q, v, w
+    value(v) / value(w)
+  end
+  quotient_plan = compile(quotient_problem)
+  @test_throws ArgumentError apply(quotient_plan, [0.25, -0.5])
+  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(quotient_plan,
+                                                                     Grico._ReducedOperatorWorkspace(quotient_plan).scratch)
+
   diffusion_problem = AffineProblem(dg_field)
   add_cell!(diffusion_problem, _MatrixFreeDiffusion(dg_field, 2.0))
   diffusion_plan = compile(diffusion_problem)
@@ -540,6 +609,82 @@ end
   @test tensor_point_values ≈ [value(tensor_item, tensor_coefficients, tensor_field, point_index)
                                for point_index in 1:point_count(tensor_item)]
 
+  weak_tensor_mass_problem = AffineProblem(tensor_field; operator_class=SPD())
+  add_cell_bilinear!(weak_tensor_mass_problem, tensor_field, tensor_field) do q, v, w
+    value(v) * value(w)
+  end
+  weak_tensor_mass_plan = compile(weak_tensor_mass_problem)
+  weak_tensor_mass_scratch = KernelScratch(Float64)
+  weak_tensor_mass_output = zeros(field_dof_count(tensor_field))
+  cell_apply!(weak_tensor_mass_output, weak_tensor_mass_plan.cell_operators[1],
+              weak_tensor_mass_plan.integration.cells[1], tensor_coefficients,
+              weak_tensor_mass_scratch)
+  @test size(weak_tensor_mass_scratch.matrices[1]) == (2, 0)
+
+  weak_tensor_diffusion_scratch = KernelScratch(Float64)
+  weak_tensor_diffusion_output = zeros(field_dof_count(tensor_field))
+  cell_apply!(weak_tensor_diffusion_output, weak_tensor_plan.cell_operators[1],
+              weak_tensor_plan.integration.cells[1], tensor_coefficients,
+              weak_tensor_diffusion_scratch)
+  @test length(weak_tensor_diffusion_scratch.vectors[5]) == 0
+
+  vector_tensor_field = VectorField(tensor_space, 2; name=:velocity)
+  vector_tensor_problem = AffineProblem(vector_tensor_field; operator_class=NonsymmetricOperator())
+  add_cell_bilinear!(vector_tensor_problem, vector_tensor_field, vector_tensor_field) do q, v, w
+    test_component = component(v)
+    trial_component = component(w)
+    mass_scale = test_component == trial_component ? 2.0 : -0.25
+    diffusion_scale = test_component == trial_component ? 1.1 : 0.35
+    mass_scale * value(v) * value(w) +
+    diffusion_scale * inner(grad(v), grad(w)) +
+    0.05 * grad(v)[trial_component] * value(w) +
+    0.07 * value(v) * grad(w)[test_component]
+  end
+  vector_tensor_plan = compile(vector_tensor_problem)
+  vector_tensor_coefficients = [sin(0.17 * index) + 0.1 * cos(0.31 * index)
+                                for index in 1:field_dof_count(vector_tensor_field)]
+  vector_tensor_matrix = Grico._assemble_reduced_operator_matrix(vector_tensor_plan,
+                                                                 Grico._ReducedOperatorWorkspace(vector_tensor_plan).scratch)
+  @test apply(vector_tensor_plan, vector_tensor_coefficients) ≈
+        vector_tensor_matrix * vector_tensor_coefficients
+  vector_tensor_diagonal_selected, vector_tensor_diagonal = _kernel_reduced_diagonal(vector_tensor_plan)
+  @test vector_tensor_diagonal_selected
+  @test vector_tensor_diagonal ≈ _reference_reduced_diagonal(vector_tensor_plan)
+
+  trunk_vector_space = HpSpace(tensor_domain, SpaceOptions(degree=UniformDegree(2), continuity=:dg))
+  trunk_vector_field = VectorField(trunk_vector_space, 2; name=:trunk_velocity)
+  trunk_vector_problem = AffineProblem(trunk_vector_field; operator_class=NonsymmetricOperator())
+  add_cell_bilinear!(trunk_vector_problem, trunk_vector_field, trunk_vector_field) do q, v, w
+    component(v) == component(w) ? inner(grad(v), grad(w)) + value(v) * value(w) :
+    0.2 * value(v) * grad(w)[component(v)]
+  end
+  trunk_vector_plan = compile(trunk_vector_problem)
+  trunk_vector_coefficients = [cos(0.19 * index) for index in 1:field_dof_count(trunk_vector_field)]
+  trunk_vector_matrix = Grico._assemble_reduced_operator_matrix(trunk_vector_plan,
+                                                                Grico._ReducedOperatorWorkspace(trunk_vector_plan).scratch)
+  @test apply(trunk_vector_plan, trunk_vector_coefficients) ≈
+        trunk_vector_matrix * trunk_vector_coefficients
+
+  vector_3d_domain = Domain((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1, 1, 1))
+  vector_3d_space = HpSpace(vector_3d_domain,
+                            SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2),
+                                         continuity=:dg))
+  vector_3d_field = VectorField(vector_3d_space, 3; name=:displacement)
+  vector_3d_problem = AffineProblem(vector_3d_field; operator_class=NonsymmetricOperator())
+  add_cell_bilinear!(vector_3d_problem, vector_3d_field, vector_3d_field) do q, v, w
+    test_component = component(v)
+    trial_component = component(w)
+    coupling = test_component == trial_component ? 1.4 : 0.2
+    coupling * inner(grad(v), grad(w)) +
+    0.03 * grad(v)[trial_component] * value(w) +
+    0.04 * value(v) * grad(w)[test_component]
+  end
+  vector_3d_plan = compile(vector_3d_problem)
+  vector_3d_coefficients = [sin(0.07 * index) for index in 1:field_dof_count(vector_3d_field)]
+  vector_3d_matrix = Grico._assemble_reduced_operator_matrix(vector_3d_plan,
+                                                             Grico._ReducedOperatorWorkspace(vector_3d_plan).scratch)
+  @test apply(vector_3d_plan, vector_3d_coefficients) ≈ vector_3d_matrix * vector_3d_coefficients
+
   boundary_problem = AffineProblem(dg_field)
   add_boundary!(boundary_problem, BoundaryFace(1, UPPER), _MatrixFreeBoundaryMass(dg_field, 3.0))
   boundary_plan = compile(boundary_problem)
@@ -555,6 +700,31 @@ end
   end
   weak_boundary_plan = compile(weak_boundary_problem)
   @test apply(weak_boundary_plan, [0.25, -0.5]) ≈ apply(boundary_plan, [0.25, -0.5])
+
+  vector_boundary_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+  vector_boundary_space = HpSpace(vector_boundary_domain,
+                                  SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3),
+                                               continuity=:dg))
+  vector_boundary_field = VectorField(vector_boundary_space, 2; name=:velocity)
+  vector_boundary_problem = AffineProblem(vector_boundary_field;
+                                          operator_class=NonsymmetricOperator())
+  add_boundary_bilinear!(vector_boundary_problem, BoundaryFace(1, UPPER), vector_boundary_field,
+                         vector_boundary_field) do q, v, w
+    test_component = component(v)
+    trial_component = component(w)
+    coupling = test_component == trial_component ? 1.3 : -0.25
+    coupling * value(v) * value(w) +
+    0.2 * normal_gradient(v) * value(w) +
+    0.15 * value(v) * normal_gradient(w) +
+    0.03 * grad(v)[trial_component] * grad(w)[test_component]
+  end
+  vector_boundary_plan = compile(vector_boundary_problem)
+  vector_boundary_coefficients = [sin(0.13 * index)
+                                  for index in 1:field_dof_count(vector_boundary_field)]
+  vector_boundary_matrix = Grico._assemble_reduced_operator_matrix(vector_boundary_plan,
+                                                                   Grico._ReducedOperatorWorkspace(vector_boundary_plan).scratch)
+  @test apply(vector_boundary_plan, vector_boundary_coefficients) ≈
+        vector_boundary_matrix * vector_boundary_coefficients
 
   interface_domain = Domain((0.0,), (1.0,), (2,))
   interface_space = HpSpace(interface_domain, SpaceOptions(degree=UniformDegree(1), continuity=:dg))
@@ -575,6 +745,40 @@ end
   @test apply(weak_interface_plan, weak_interface_coefficients) ≈
         apply(interface_plan, weak_interface_coefficients)
 
+  weak_interface_penalty_problem = AffineProblem(interface_field; operator_class=SPD())
+  add_interface_bilinear!(weak_interface_penalty_problem, interface_field,
+                          interface_field) do q, v, w
+    minimum(cell_size(q, interface_field)) * jump(value(v)) * jump(value(w))
+  end
+  weak_interface_penalty_plan = compile(weak_interface_penalty_problem)
+  @test apply(weak_interface_penalty_plan, ones(field_dof_count(interface_field))) ≈
+        zeros(field_dof_count(interface_field))
+
+  vector_interface_domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 1))
+  vector_interface_space = HpSpace(vector_interface_domain,
+                                   SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3),
+                                                continuity=:dg))
+  vector_interface_field = VectorField(vector_interface_space, 2; name=:velocity)
+  vector_interface_problem = AffineProblem(vector_interface_field;
+                                           operator_class=NonsymmetricOperator())
+  add_interface_bilinear!(vector_interface_problem, vector_interface_field,
+                          vector_interface_field) do q, v, w
+    test_component = component(v)
+    trial_component = component(w)
+    coupling = test_component == trial_component ? 2.0 : 0.35
+    coupling * jump(value(v)) * jump(value(w)) +
+    0.3 * average(normal_gradient(v)) * jump(value(w)) +
+    0.2 * jump(value(v)) * average(normal_gradient(w)) +
+    0.04 * inner(jump(grad(v)), average(grad(w)))
+  end
+  vector_interface_plan = compile(vector_interface_problem)
+  vector_interface_coefficients = [cos(0.09 * index)
+                                   for index in 1:field_dof_count(vector_interface_field)]
+  vector_interface_matrix = Grico._assemble_reduced_operator_matrix(vector_interface_plan,
+                                                                    Grico._ReducedOperatorWorkspace(vector_interface_plan).scratch)
+  @test apply(vector_interface_plan, vector_interface_coefficients) ≈
+        vector_interface_matrix * vector_interface_coefficients
+
   surface_problem = AffineProblem(dg_field)
   surface_quadrature = PointQuadrature([(0.0,)], [1.0])
   add_surface_quadrature!(surface_problem, SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
@@ -591,6 +795,41 @@ end
   end
   weak_surface_plan = compile(weak_surface_problem)
   @test apply(weak_surface_plan, [0.25, -0.5]) ≈ apply(surface_plan, [0.25, -0.5])
+
+  vector_surface_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
+  vector_surface_space = HpSpace(vector_surface_domain,
+                                 SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3),
+                                              continuity=:dg))
+  vector_surface_field = VectorField(vector_surface_space, 2; name=:velocity)
+  vector_surface_problem = AffineProblem(vector_surface_field;
+                                         operator_class=NonsymmetricOperator())
+  vector_surface_quadrature = Grico.TensorQuadrature(Float64, (1, 4))
+  vector_surface_normals = fill((1.0, 0.0), point_count(vector_surface_quadrature))
+  add_surface_quadrature!(vector_surface_problem,
+                          SurfaceQuadrature(1, vector_surface_quadrature, vector_surface_normals))
+  add_surface_bilinear!(vector_surface_problem, vector_surface_field,
+                        vector_surface_field) do q, v, w
+    test_component = component(v)
+    trial_component = component(w)
+    coupling = test_component == trial_component ? 1.1 : -0.2
+    coupling * value(v) * value(w) +
+    0.15 * normal_gradient(v) * value(w) +
+    0.17 * value(v) * normal_gradient(w) +
+    0.02 * grad(v)[trial_component] * grad(w)[test_component]
+  end
+  vector_surface_plan = compile(vector_surface_problem)
+  vector_surface_coefficients = [sin(0.11 * index)
+                                 for index in 1:field_dof_count(vector_surface_field)]
+  vector_surface_matrix = Grico._assemble_reduced_operator_matrix(vector_surface_plan,
+                                                                  Grico._ReducedOperatorWorkspace(vector_surface_plan).scratch)
+  @test apply(vector_surface_plan, vector_surface_coefficients) ≈
+        vector_surface_matrix * vector_surface_coefficients
+  surface_diagnostics = Grico.operator_diagnostics(vector_surface_plan; repetitions=1)
+  @test surface_diagnostics.embedded_surfaces == 1
+  @test surface_diagnostics.apply_seconds_per_call >= 0
+  @test surface_diagnostics.apply_bytes_per_call <= 1_000
+  @test surface_diagnostics.reduced_apply_seconds_per_call >= 0
+  @test eltype(Grico._diagnostic_sample_vector(Float32, 3)) === Float32
 
   cg_space = HpSpace(domain, SpaceOptions(degree=UniformDegree(1)))
   cg_field = ScalarField(cg_space; name=:u)

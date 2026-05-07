@@ -22,8 +22,7 @@ import Grico: cell_residual!, face_residual!, interface_residual!
 # is at rest, density and pressure are Gaussian concentrations in a homogeneous
 # ambient medium, and all outer faces are periodic. The discretization remains
 # Grico-specific: adaptive Cartesian `h`-refinement, matrix-free residuals, and
-# sum-factorized cell kernels are used instead of the paper's DGSEM/FV subcell
-# blend.
+# a modal DG basis are used instead of the paper's DGSEM/FV subcell blend.
 #
 # Directory organization:
 #

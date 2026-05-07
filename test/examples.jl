@@ -3,7 +3,7 @@ using Grico
 
 @testset "Matrix-Free Poisson Example" begin
   domain = Domain((0.0,), (1.0,), (2,))
-  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(2)))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
   u = ScalarField(space; name=:u)
 
   problem = AffineProblem(u; operator_class=SPD())
@@ -16,8 +16,8 @@ using Grico
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, LOWER), 1.0))
   add_constraint!(problem, Dirichlet(u, BoundaryFace(1, UPPER), 1.0))
 
-  plan = compile(problem)
-  state = solve(plan; solver=CGSolver(preconditioner=JacobiPreconditioner()))
+  solver = CGSolver(preconditioner=GeometricMultigridPreconditioner())
+  state = solve(problem; solver)
 
-  @test l2_error(state, u, x -> x[1] * (1.0 - x[1]) + 1.0; plan) <= 1.0e-10
+  @test l2_error(state, u, x -> x[1] * (1.0 - x[1]) + 1.0) <= 1.0e-10
 end

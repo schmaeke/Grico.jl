@@ -2,12 +2,33 @@
 #
 # Affine solves run operator-class-selected Krylov methods on reduced
 # matrix-free operators. Residual solves run Newton on the reduced nonlinear
-# equations and use the same reduced-operator CG kernel for matrix-free tangent
-# corrections. Solver objects and preconditioners are kept separate from the
+# equations and use operator-class-selected reduced Krylov tangent corrections.
+# Solver objects and preconditioners are kept separate from the
 # reduced algebra so GMG can plug in as an ordinary preconditioner instead of as
 # a special CG code path.
 
+"""
+    AbstractLinearSolver
+
+Supertype for linear-solver policy objects.
+
+Concrete subtypes describe how a reduced matrix-free linear system should be
+solved once an affine or tangent operator has been compiled. Solver policies
+own algorithmic choices such as CG versus FGMRES and carry the preconditioner
+policy that is compiled against the concrete reduced operator.
+"""
 abstract type AbstractLinearSolver end
+
+"""
+    AbstractPreconditioner
+
+Supertype for reduced-operator preconditioner policies.
+
+Concrete subtypes describe reusable approximations to `A⁻¹` for the reduced
+constraint-compatible system `A x = b`. A policy object is cheap configuration;
+the actual work arrays, diagonals, multigrid hierarchy, or factorizations are
+created later by the internal preconditioner compiler.
+"""
 abstract type AbstractPreconditioner end
 
 """
@@ -84,9 +105,10 @@ Default linear-solver policy.
 
 For affine problems this policy chooses the outer Krylov method from the
 declared operator class: CG for [`SPD`](@ref) problems and FGMRES for general,
-nonsymmetric, or indefinite problems. When solving from an `AffineProblem`, it
-uses geometric multigrid as the preferred preconditioner whenever a supported
-hierarchy can be compiled; otherwise it falls back to Jacobi.
+nonsymmetric, or indefinite problems. When solving a supported SPD
+`AffineProblem`, it uses geometric multigrid as the preferred preconditioner;
+otherwise it falls back to Jacobi unless a solver policy requests GMG
+explicitly.
 """
 struct AutoLinearSolver <: AbstractLinearSolver end
 
@@ -141,6 +163,40 @@ struct _JacobiCompiledPreconditioner{T<:AbstractFloat} <: _CompiledPreconditione
   inverse_diagonal::Vector{T}
 end
 
+function _checked_solver_tolerance(value, ::Type{T}, name::AbstractString) where {T<:AbstractFloat}
+  value isa Bool && throw(ArgumentError("$name must be a finite nonnegative number"))
+
+  converted = try
+    T(value)
+  catch
+    throw(ArgumentError("$name must be convertible to $T"))
+  end
+
+  isfinite(converted) && converted >= zero(T) ||
+    throw(ArgumentError("$name must be a finite nonnegative number"))
+  return converted
+end
+
+function _checked_solver_positive(value, ::Type{T}, name::AbstractString) where {T<:AbstractFloat}
+  value isa Bool && throw(ArgumentError("$name must be a finite positive number"))
+
+  converted = try
+    T(value)
+  catch
+    throw(ArgumentError("$name must be convertible to $T"))
+  end
+
+  isfinite(converted) && converted > zero(T) ||
+    throw(ArgumentError("$name must be a finite positive number"))
+  return converted
+end
+
+function _linear_tolerance(relative_tolerance::T, absolute_tolerance::T,
+                           rhs_norm::T) where {T<:AbstractFloat}
+  isfinite(rhs_norm) || throw(ArgumentError("rhs norm must be finite"))
+  return max(absolute_tolerance, relative_tolerance * rhs_norm)
+end
+
 """
     solve(problem; solver=AutoLinearSolver(), kwargs...)
     solve(plan; solver=AutoLinearSolver(), kwargs...)
@@ -155,10 +211,10 @@ description. When only a compiled plan is available, it chooses CG/Jacobi for
 declared SPD operators and FGMRES/Jacobi otherwise.
 
 For residual problems, the same keyword names configure a Newton solve. The
-default tangent correction uses matrix-free CG on `P' J(u) P` without
-preconditioning. Passing a non-`nothing` preconditioner to the default residual
-solve is rejected so nonlinear preconditioning remains an explicit custom
-`linear_solve` decision.
+default tangent correction uses matrix-free CG for declared [`SPD`](@ref)
+tangents and FGMRES otherwise, without preconditioning. Passing a non-`nothing`
+preconditioner to the default residual solve is rejected so nonlinear
+preconditioning remains an explicit custom `linear_solve` decision.
 """
 function solve(problem::AffineProblem; solver::AbstractLinearSolver=AutoLinearSolver(), kwargs...)
   return _solve_affine_problem(problem, solver; kwargs...)
@@ -178,6 +234,8 @@ function solve(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=AutoLinearS
       throw(ArgumentError("affine solves use solver=...; construct a CGSolver, FGMRESSolver, or AutoLinearSolver policy instead of passing linear_solve/preconditioner"))
     return _solve_affine(plan; solver, kwargs...)
   end
+  solver isa AutoLinearSolver ||
+    throw(ArgumentError("residual solves use linear_solve=... for tangent corrections; solver=... is only supported for affine solves"))
   residual_linear_solve = linear_solve === nothing ? default_tangent_linear_solve : linear_solve
   kind === :residual &&
     return _solve_residual(plan; linear_solve=residual_linear_solve, preconditioner, kwargs...)
@@ -193,20 +251,23 @@ function _solve_affine(plan::AssemblyPlan{D,T}; solver::AbstractLinearSolver=Aut
                        maxiter=max(1_000, 2 * reduced_dof_count(plan)),
                        initial_solution=nothing) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :affine)
+  checked_relative = _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  checked_absolute = _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
+  checked_maxiter = _checked_positive(maxiter, "maxiter")
   workspace = _ReducedOperatorWorkspace(plan)
   reduced_rhs = zeros(T, reduced_dof_count(plan))
   _reduced_rhs!(reduced_rhs, plan, workspace)
   operator = _ReducedAffineOperator(plan, workspace)
   reduced_values = _solve_reduced_system(solver, operator, reduced_rhs;
-                                         relative_tolerance=T(relative_tolerance),
-                                         absolute_tolerance=T(absolute_tolerance), maxiter=maxiter,
-                                         initial_solution=initial_solution)
+                                         relative_tolerance=checked_relative,
+                                         absolute_tolerance=checked_absolute,
+                                         maxiter=checked_maxiter, initial_solution=initial_solution)
   return _state_from_reduced_result(plan, reduced_values)
 end
 
 function _state_from_reduced_result(plan::AssemblyPlan{D,T},
                                     reduced_values::AbstractVector{T}) where {D,T<:AbstractFloat}
-  _require_length(reduced_values, reduced_dof_count(plan), "linear solve result")
+  _require_exact_vector(reduced_values, reduced_dof_count(plan), "linear solve result")
   eltype(reduced_values) == T ||
     throw(ArgumentError("linear solve result element type must match the plan scalar type"))
   full_values = zeros(T, dof_count(plan))
@@ -217,14 +278,20 @@ end
 function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_linear_solve,
                          preconditioner=nothing, initial_state=nothing,
                          relative_tolerance=sqrt(eps(T)), absolute_tolerance=sqrt(eps(T)),
-                         maxiter::Int=20, damping=one(T), linear_relative_tolerance=sqrt(eps(T)),
+                         maxiter=20, damping=one(T), linear_relative_tolerance=sqrt(eps(T)),
                          linear_absolute_tolerance=zero(T),
                          linear_maxiter=max(1_000, 2 * reduced_dof_count(plan))) where {D,
                                                                                         T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
-  maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
-  damping_value = T(damping)
-  damping_value > zero(T) || throw(ArgumentError("damping must be positive"))
+  checked_relative = _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  checked_absolute = _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
+  checked_linear_relative = _checked_solver_tolerance(linear_relative_tolerance, T,
+                                                      "linear_relative_tolerance")
+  checked_linear_absolute = _checked_solver_tolerance(linear_absolute_tolerance, T,
+                                                      "linear_absolute_tolerance")
+  checked_maxiter = _checked_positive(maxiter, "maxiter")
+  checked_linear_maxiter = _checked_positive(linear_maxiter, "linear_maxiter")
+  damping_value = _checked_solver_positive(damping, T, "damping")
   map = _reduced_map(plan)
   workspace = _ReducedOperatorWorkspace(plan)
   residual_workspace = ResidualWorkspace(plan)
@@ -239,11 +306,11 @@ function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_l
   correction_rhs = zeros(T, reduced_dof_count(map))
   initial_residual_norm = nothing
 
-  for _ in 1:maxiter
+  for _ in 1:checked_maxiter
     _reduced_residual!(reduced_residual, plan, reduced_values, workspace, residual_workspace)
     residual_norm = sqrt(_dot_self(reduced_residual))
-    initial_residual_norm === nothing && (initial_residual_norm = max(residual_norm, one(T)))
-    tolerance = max(T(absolute_tolerance), T(relative_tolerance) * initial_residual_norm)
+    initial_residual_norm === nothing && (initial_residual_norm = residual_norm)
+    tolerance = max(checked_absolute, checked_relative * initial_residual_norm)
     residual_norm <= tolerance && return _state_from_reduced!(plan, workspace, reduced_values)
 
     @inbounds for index in eachindex(reduced_residual)
@@ -251,10 +318,10 @@ function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_l
     end
 
     correction = linear_solve(plan, workspace.state, correction_rhs; workspace, residual_workspace,
-                              preconditioner, relative_tolerance=T(linear_relative_tolerance),
-                              absolute_tolerance=T(linear_absolute_tolerance),
-                              maxiter=linear_maxiter)
-    _require_length(correction, reduced_dof_count(map), "Newton correction")
+                              preconditioner, relative_tolerance=checked_linear_relative,
+                              absolute_tolerance=checked_linear_absolute,
+                              maxiter=checked_linear_maxiter)
+    _require_exact_vector(correction, reduced_dof_count(map), "Newton correction")
     eltype(correction) == T ||
       throw(ArgumentError("Newton correction element type must match the plan scalar type"))
 
@@ -265,10 +332,10 @@ function _solve_residual(plan::AssemblyPlan{D,T}; linear_solve=default_tangent_l
 
   _reduced_residual!(reduced_residual, plan, reduced_values, workspace, residual_workspace)
   residual_norm = sqrt(_dot_self(reduced_residual))
-  baseline = initial_residual_norm === nothing ? one(T) : initial_residual_norm
-  tolerance = max(T(absolute_tolerance), T(relative_tolerance) * baseline)
+  baseline = initial_residual_norm === nothing ? zero(T) : initial_residual_norm
+  tolerance = max(checked_absolute, checked_relative * baseline)
   residual_norm <= tolerance && return _state_from_reduced!(plan, workspace, reduced_values)
-  throw(ArgumentError("Newton solve did not converge in $maxiter iterations"))
+  throw(ArgumentError("Newton solve did not converge in $checked_maxiter iterations"))
 end
 
 function _state_from_reduced!(plan::AssemblyPlan{D,T}, workspace::_ReducedOperatorWorkspace{T},
@@ -310,15 +377,16 @@ function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Abstra
                    preconditioner::_CompiledPreconditioner{T}; relative_tolerance::T,
                    absolute_tolerance::T, maxiter::Int,
                    initial_solution=nothing) where {T<:AbstractFloat}
+  _require_exact_vector(rhs_data, _operator_size(operator), "rhs")
+  maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
   n = length(rhs_data)
   n == 0 && return T[]
-  n == _operator_size(operator) ||
-    throw(ArgumentError("rhs length must match the reduced operator size"))
-  maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
+  _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
   solution = zeros(T, n)
 
   if initial_solution !== nothing
-    _require_length(initial_solution, n, "initial solution")
+    _require_exact_vector(initial_solution, n, "initial solution")
     eltype(initial_solution) == T ||
       throw(ArgumentError("initial solution element type must match the plan scalar type"))
     copyto!(solution, initial_solution)
@@ -337,7 +405,7 @@ function _cg_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Abstra
   direction = copy(preconditioned_residual)
   residual_inner = _dot(residual, preconditioned_residual)
   rhs_norm = sqrt(_dot_self(rhs_data))
-  tolerance = max(absolute_tolerance, relative_tolerance * max(rhs_norm, one(T)))
+  tolerance = _linear_tolerance(relative_tolerance, absolute_tolerance, rhs_norm)
   residual_norm2 = _dot_self(residual)
   residual_norm2 <= tolerance * tolerance && return solution
 
@@ -366,16 +434,17 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Ab
                        preconditioner::_CompiledPreconditioner{T}; restart::Int,
                        relative_tolerance::T, absolute_tolerance::T, maxiter::Int,
                        initial_solution=nothing) where {T<:AbstractFloat}
-  n = length(rhs_data)
-  n == 0 && return T[]
-  n == _operator_size(operator) ||
-    throw(ArgumentError("rhs length must match the reduced operator size"))
+  _require_exact_vector(rhs_data, _operator_size(operator), "rhs")
   restart >= 1 || throw(ArgumentError("restart must be positive"))
   maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
+  n = length(rhs_data)
+  n == 0 && return T[]
+  _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
   solution = zeros(T, n)
 
   if initial_solution !== nothing
-    _require_length(initial_solution, n, "initial solution")
+    _require_exact_vector(initial_solution, n, "initial solution")
     eltype(initial_solution) == T ||
       throw(ArgumentError("initial solution element type must match the plan scalar type"))
     copyto!(solution, initial_solution)
@@ -390,7 +459,7 @@ function _fgmres_solve(operator::_AbstractReducedLinearOperator{T}, rhs_data::Ab
   end
 
   rhs_norm = sqrt(_dot_self(rhs_data))
-  tolerance = max(absolute_tolerance, relative_tolerance * max(rhs_norm, one(T)))
+  tolerance = _linear_tolerance(relative_tolerance, absolute_tolerance, rhs_norm)
   residual_norm = sqrt(_dot_self(residual))
   residual_norm <= tolerance && return solution
 
@@ -534,7 +603,9 @@ function _upper_triangular_solve!(result::AbstractVector{T}, upper::AbstractMatr
     end
 
     diagonal = @inbounds upper[row, row]
-    abs(diagonal) > 1000 * eps(T) ||
+    isfinite(diagonal) ||
+      throw(ArgumentError("FGMRES encountered a non-finite Krylov least-squares diagonal"))
+    !iszero(diagonal) ||
       throw(ArgumentError("FGMRES encountered a singular Krylov least-squares problem"))
     @inbounds result[row] = value / diagonal
   end
@@ -602,11 +673,12 @@ end
     default_tangent_linear_solve(plan, state, reduced_rhs; workspace=...,
                                  residual_workspace=..., preconditioner=nothing, kwargs...)
 
-Default matrix-free CG solve for Newton tangent corrections.
+Default matrix-free Krylov solve for Newton tangent corrections.
 
 Advanced API: this function defines Grico's built-in residual-solve policy. It
 is useful as a reference and as the default for [`solve`](@ref) on residual
-plans, but nonlinear preconditioning and globalization remain application
+plans. It uses CG when the residual problem declares an [`SPD`](@ref) tangent and
+FGMRES otherwise. Nonlinear preconditioning and globalization remain application
 policy. Passing a preconditioner to this default method is intentionally
 rejected; provide a custom `linear_solve` when tangent preconditioning is
 required.
@@ -621,14 +693,20 @@ function default_tangent_linear_solve(plan::AssemblyPlan{D,T}, state::State{T},
                                       initial_solution=nothing) where {D,T<:AbstractFloat}
   _require_matrix_free_kind(plan, :residual)
   _check_state(plan, state)
-  _require_length(reduced_rhs, reduced_dof_count(plan), "reduced rhs")
+  _require_exact_vector(reduced_rhs, reduced_dof_count(plan), "reduced rhs")
+  _check_residual_workspace(plan, residual_workspace)
+  workspace.state.layout === plan.layout ||
+    throw(ArgumentError("reduced operator workspace belongs to a different field layout"))
+  checked_relative = _checked_solver_tolerance(relative_tolerance, T, "relative_tolerance")
+  checked_absolute = _checked_solver_tolerance(absolute_tolerance, T, "absolute_tolerance")
+  checked_maxiter = _checked_positive(maxiter, "maxiter")
   preconditioner === nothing ||
     throw(ArgumentError("matrix-free tangent preconditioning is not implemented; pass preconditioner=nothing or a custom linear_solve"))
   copyto!(workspace.full_state, coefficients(state))
   operator = _ReducedTangentOperator(plan, workspace, residual_workspace)
-  return _solve_reduced_system(CGSolver(), operator, reduced_rhs;
-                               relative_tolerance=relative_tolerance,
-                               absolute_tolerance=absolute_tolerance, maxiter=maxiter,
+  solver = _is_spd_operator_class(plan.operator_class) ? CGSolver() : FGMRESSolver()
+  return _solve_reduced_system(solver, operator, reduced_rhs; relative_tolerance=checked_relative,
+                               absolute_tolerance=checked_absolute, maxiter=checked_maxiter,
                                initial_solution=initial_solution)
 end
 
@@ -645,7 +723,7 @@ function _probe_reduced_diagonal!(diagonal::AbstractVector{T}, plan::AssemblyPla
                                   workspace::_ReducedOperatorWorkspace{T}) where {D,
                                                                                   T<:AbstractFloat}
   count = reduced_dof_count(plan)
-  _require_length(diagonal, count, "reduced diagonal")
+  _require_exact_vector(diagonal, count, "reduced diagonal")
   basis = zeros(T, count)
   response = zeros(T, count)
 
@@ -660,12 +738,12 @@ function _probe_reduced_diagonal!(diagonal::AbstractVector{T}, plan::AssemblyPla
 end
 
 function _invert_jacobi_diagonal!(diagonal::AbstractVector{T}) where {T<:AbstractFloat}
-  tolerance = 1000 * eps(T)
-
   for index in eachindex(diagonal)
     value = diagonal[index]
-    abs(value) > tolerance ||
-      throw(ArgumentError("Jacobi preconditioner found a near-zero diagonal entry at reduced dof $index"))
+    isfinite(value) ||
+      throw(ArgumentError("Jacobi preconditioner found a non-finite diagonal entry at reduced dof $index"))
+    !iszero(value) ||
+      throw(ArgumentError("Jacobi preconditioner found a zero diagonal entry at reduced dof $index"))
     diagonal[index] = inv(value)
   end
 
@@ -674,7 +752,8 @@ end
 
 function _apply_preconditioner!(result::AbstractVector{T}, ::_IdentityCompiledPreconditioner{T},
                                 residual::AbstractVector{T}) where {T<:AbstractFloat}
-  _require_length(result, length(residual), "preconditioned residual")
+  _require_exact_vector(result, length(residual), "preconditioned residual")
+  _require_one_based_vector(residual, "residual")
   copyto!(result, residual)
   return result
 end
@@ -682,9 +761,10 @@ end
 function _apply_preconditioner!(result::AbstractVector{T},
                                 preconditioner::_JacobiCompiledPreconditioner{T},
                                 residual::AbstractVector{T}) where {T<:AbstractFloat}
-  _require_length(result, length(residual), "preconditioned residual")
+  _require_exact_vector(result, length(residual), "preconditioned residual")
+  _require_one_based_vector(residual, "residual")
   inverse_diagonal = preconditioner.inverse_diagonal
-  _require_length(inverse_diagonal, length(residual), "inverse diagonal")
+  _require_exact_vector(inverse_diagonal, length(residual), "inverse diagonal")
 
   @inbounds for index in eachindex(residual)
     result[index] = inverse_diagonal[index] * residual[index]

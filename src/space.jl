@@ -27,13 +27,14 @@
 # 3. public queries into compiled local modes and their global dof expansions,
 # 4. internal materialization, compilation, and validation helpers.
 
-# Public policy types.
+# Space policy types.
 
 """
     AbstractDegreePolicy
 
-Abstract supertype for policies that assign polynomial degrees to active leaves
-of an `HpSpace`.
+Internal supertype for policies that assign polynomial degrees to active leaves
+of an `HpSpace`. The supported user-facing degree policies are
+[`UniformDegree`](@ref), [`AxisDegrees`](@ref), and [`ByLeafDegrees`](@ref).
 
 Degree policies are evaluated against a domain object and determine the tuple of
 one-dimensional polynomial degrees used on each active cell. They separate the
@@ -55,8 +56,9 @@ abstract type AbstractDegreePolicy end
 """
     AbstractQuadraturePolicy
 
-Abstract supertype for policies that choose cell quadrature sizes from local
-polynomial degrees.
+Internal supertype for policies that choose cell quadrature sizes from local
+polynomial degrees. The supported user-facing quadrature policy is
+[`DegreePlusQuadrature`](@ref).
 
 Quadrature policies are used when an `HpSpace` is compiled. They determine how
 many quadrature points are associated with each active leaf and therefore how
@@ -104,7 +106,10 @@ degree pattern on every cell.
 struct AxisDegrees{D} <: AbstractDegreePolicy
   degrees::NTuple{D,Int}
 
-  AxisDegrees{D}(degrees::NTuple{D,<:Integer}) where {D} = new{D}(_checked_degree_tuple(degrees))
+  function AxisDegrees{D}(degrees::NTuple{D,<:Integer}) where {D}
+    D >= 1 || throw(ArgumentError("degree dimension must be positive"))
+    return new{D}(_checked_degree_tuple(degrees))
+  end
 end
 
 AxisDegrees(degrees::NTuple{D,<:Integer}) where {D} = AxisDegrees{D}(degrees)
@@ -124,6 +129,12 @@ other information accessible from the domain.
 """
 struct ByLeafDegrees{F} <: AbstractDegreePolicy
   f::F
+
+  function ByLeafDegrees(f)
+    length(methods(f)) > 0 ||
+      throw(ArgumentError("custom degree policy must be callable as f(domain, leaf)"))
+    return new{typeof(f)}(f)
+  end
 end
 
 # Internal degree-policy representation used after materialization.
@@ -220,9 +231,12 @@ function _normalized_continuity_policy(spec::NTuple{N,Symbol}, ::Val{D}) where {
   return _AxisContinuity{D}(spec)
 end
 
-function SpaceOptions(; basis::AbstractBasisFamily=TrunkBasis(),
-                      degree::AbstractDegreePolicy=UniformDegree(1),
-                      quadrature::AbstractQuadraturePolicy=DegreePlusQuadrature(1), continuity=:cg)
+function SpaceOptions(; basis=TrunkBasis(), degree=UniformDegree(1),
+                      quadrature=DegreePlusQuadrature(1), continuity=:cg)
+  basis isa AbstractBasisFamily || throw(ArgumentError("basis must be a basis family"))
+  degree isa AbstractDegreePolicy || throw(ArgumentError("degree must be a degree policy"))
+  quadrature isa AbstractQuadraturePolicy ||
+    throw(ArgumentError("quadrature must be a quadrature policy"))
   checked_continuity = _checked_continuity_spec(continuity)
   return SpaceOptions{typeof(basis),typeof(degree),typeof(quadrature),typeof(checked_continuity)}(basis,
                                                                                                   degree,
@@ -612,10 +626,21 @@ end
 # Evaluate a user callback and validate that it returns a full nonnegative degree
 # tuple of the correct dimension.
 function _leaf_degrees(policy::ByLeafDegrees, domain::AbstractDomain{D}, leaf::Int) where {D}
-  value = policy.f(domain, leaf)
+  value = try
+    policy.f(domain, leaf)
+  catch err
+    err isa MethodError &&
+      err.f === policy.f &&
+      throw(ArgumentError("custom degree policy must be callable as f(domain, leaf)"))
+    rethrow()
+  end
   value isa NTuple{D,<:Integer} ||
     throw(ArgumentError("custom degree policy must return an NTuple{$D,Int}"))
   return _checked_degree_tuple(value)
+end
+
+function _leaf_degrees(policy::AbstractDegreePolicy, domain::AbstractDomain, leaf::Int)
+  throw(ArgumentError("unsupported degree policy type $(typeof(policy))"))
 end
 
 # Stored degree policies are resolved by direct lookup on the active-leaf index
@@ -687,7 +712,18 @@ end
 # The default quadrature policy simply adds a fixed offset to every local degree
 # component.
 function _quadrature_shape(policy::DegreePlusQuadrature, degrees::NTuple{D,Int}) where {D}
-  return ntuple(axis -> max(degrees[axis] + policy.extra_points, 1), D)
+  return ntuple(axis -> _degree_plus_quadrature_axis(degrees[axis], policy.extra_points, axis), D)
+end
+
+function _quadrature_shape(policy::AbstractQuadraturePolicy, degrees::NTuple{D,Int}) where {D}
+  throw(ArgumentError("unsupported quadrature policy type $(typeof(policy))"))
+end
+
+@inline function _degree_plus_quadrature_axis(degree::Int, extra_points::Int, axis::Int)
+  count = Int128(degree) + Int128(extra_points)
+  count <= typemax(Int) ||
+    throw(ArgumentError("quadrature point count on axis $axis must be Int-representable"))
+  return max(Int(count), 1)
 end
 
 # Compile the continuity system and all leaf-local sparse mode expansions for

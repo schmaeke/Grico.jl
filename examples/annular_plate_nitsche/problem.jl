@@ -22,7 +22,7 @@ function build_annular_plate_nitsche_context(; inner_radius=INNER_RADIUS, outer_
   is_physical = x -> annulus_levelset(x) <= 0.0
   region = ImplicitRegion(annulus_levelset; subdivision_depth=fcm_subdivision_depth)
   domain = PhysicalDomain(background, region)
-  space = HpSpace(domain, SpaceOptions(degree=UniformDegree(degree)))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(degree)))
   u = ScalarField(space; name=:u)
 
   problem = AffineProblem(u; operator_class=SPD())

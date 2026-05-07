@@ -50,13 +50,15 @@ The source tree is easiest to understand in the following conceptual blocks:
    compile inter-element continuity ranging from global `C⁰` coupling to
    leaf-local DG independence, materialize the public `HpSpace`, and lay out
    concrete fields and states on that space.
-5. `problem.jl`, `embedded.jl`, `integration.jl`, `plans.jl`, `assembly.jl`,
-   `solve.jl`, `adaptivity.jl`, `transition.jl`, `transfer.jl`,
+5. `problem.jl`, `embedded.jl`, `integration.jl`, `weakforms.jl`,
+   `plans.jl`, `assembly.jl`, `solve.jl`, `multigrid.jl`,
+   `diagnostics.jl`, `adaptivity.jl`, `transition.jl`, `transfer.jl`,
    `indicators.jl`
    The execution layer. It describes weak-form operators, specialized
    quadrature constructions, compiled local evaluation data, operator plans,
-   solve support, manual adaptivity, source-to-target transitions, state
-   transfer, and advanced automatic indicators.
+   solve and multigrid support, runtime diagnostics, manual adaptivity,
+   source-to-target transitions, state transfer, and advanced automatic
+   indicators.
 6. `verification.jl`, `postprocess.jl`
    Postprocessing helpers for error measurement and backend-neutral sampling.
    Concrete output backends such as VTK and plotting packages are integrated
@@ -103,96 +105,87 @@ module Grico
 using LinearAlgebra
 using Polyester: @batch, disable_polyester_threads
 
-# Part I. Internal utilities shared throughout the implementation. This file is
-# intentionally included first because nearly every later layer depends on its
-# validation, indexing, and tuple-manipulation helpers.
+# Shared validation, indexing, and tuple-manipulation utilities.
 include("common.jl")
 
-# Part II. One-dimensional numerical ingredients. These files define the modal
-# polynomial data and quadrature rules from which the tensor-product finite-
-# element machinery is built.
+# One-dimensional polynomial and quadrature building blocks.
 include("polynomials.jl")
 public integrated_legendre_derivatives, integrated_legendre_values,
        integrated_legendre_values_and_derivatives!, legendre_derivatives, legendre_values,
        legendre_values_and_derivatives!
 
 include("quadrature.jl")
-export PointQuadrature, point, point_count, weight
-public AbstractQuadrature, GaussLegendreRule, TensorQuadrature, axis_point_counts, coordinate,
-       dimension, gauss_legendre_exact_degree, gauss_legendre_rule, minimum_gauss_legendre_points
+export point, weight
+public AbstractQuadrature, GaussLegendreRule, PointQuadrature, TensorQuadrature, axis_point_counts,
+       coordinate, dimension, gauss_legendre_exact_degree, gauss_legendre_rule,
+       minimum_gauss_legendre_points, point_count
 
-# Part III. Discrete mesh structure and its affine embedding into physical
-# space. Topology comes first, geometry builds on top of it, and refinement
-# mutates that topological tree.
+# Cartesian topology, affine geometry, and refinement.
 include("topology.jl")
-export CartesianGrid, LOWER, NONE, UPPER, active_leaf_count, active_leaves
-public GridSnapshot, active_leaf, boundary_face_count, boundary_face_spec, check_snapshot,
-       check_topology, compact!, covering_neighbor, first_child, interface_count, interface_spec,
-       is_active_leaf, is_domain_boundary, is_expanded, is_periodic_axis, is_tree_cell, level,
-       logical_coordinate, neighbor, opposite_active_leaves, parent, periodic_axes, root_cell_count,
-       root_cell_counts, root_cell_total, snapshot, split_axis, stored_cell_count
+export CartesianGrid, LOWER, UPPER, active_leaf_count, active_leaves
+public GridBoundaryFace, GridInterface, GridSnapshot, active_leaf, boundary_face_count,
+       boundary_face_spec, check_snapshot, check_topology, compact!, covering_neighbor, first_child,
+       interface_count, interface_spec, is_active_leaf, is_domain_boundary, is_expanded,
+       is_periodic_axis, is_tree_cell, level, logical_coordinate, neighbor, NONE,
+       opposite_active_leaves, parent, periodic_axes, root_cell_count, root_cell_counts,
+       root_cell_total, snapshot, split_axis, stored_cell_count
 
 include("geometry.jl")
 export Domain, cell_center, cell_lower, cell_size, cell_upper, cell_volume, extent, grid, origin
-public AbstractDomain, Geometry, compact, face_measure, map_from_biunit_cube, map_to_biunit_cube
+public AbstractDomain, Geometry, compact, face_measure, geometry, map_from_biunit_cube,
+       map_to_biunit_cube
 
 include("refinement.jl")
 export derefine!, refine!
 
-# Part IV. Finite-element space construction. These files move from admissible
-# local basis modes to compiled hp spaces with configurable continuity and
-# finally to concrete field/state storage on those spaces.
+# Basis families, regions, continuity, compiled spaces, and fields.
 include("basis.jl")
 export FullTensorBasis, TrunkBasis
 public AbstractBasisFamily, basis_mode_count, basis_modes, is_active_mode
 
 include("regions.jl")
 export FiniteCellExtension, ImplicitRegion, PhysicalDomain, PhysicalMeasure
-public finite_cell_quadrature
+public AbstractCellMeasure, AbstractPhysicalRegion, finite_cell_quadrature
 
 include("continuity.jl")
 
 include("space.jl")
 export AxisDegrees, ByLeafDegrees, DegreePlusQuadrature, HpSpace, SpaceOptions, UniformDegree,
-       cell_degrees, local_mode_count, mode_terms, scalar_dof_count
-public AbstractDegreePolicy, AbstractQuadraturePolicy, basis_family, cell_quadrature_shape,
-       check_space, continuity_kind, continuity_policy, global_cell_quadrature_shape,
-       is_continuous_axis, is_mode_active, local_modes, support_shape
+       cell_degrees
+public basis_family, cell_quadrature_shape, check_space, continuity_kind, continuity_policy,
+       global_cell_quadrature_shape, is_continuous_axis, is_mode_active, local_mode_count,
+       local_modes, mode_terms, scalar_dof_count, support_shape
 
 include("fields.jl")
-export AbstractField, FieldLayout, ScalarField, State, VectorField, coefficients, component_count,
+export FieldLayout, ScalarField, State, VectorField, coefficients, component_count,
        field_component_values, field_count, field_dof_count, field_dof_range, field_layout,
        field_name, field_space, field_values, fields
 public field_component_range
 
-# Part V. Problem definition and execution. Once a space and fields exist, these
-# files describe weak-form operators, compile reusable local evaluation data,
-# apply matrix-free operators, solve them, and transition states across adaptive
-# mesh or degree changes.
+# Weak forms, matrix-free execution, solvers, adaptivity, and transfer.
 include("problem.jl")
 export AffineProblem, BoundaryFace, Dirichlet, GeneralOperator, IndefiniteOperator, MeanValue,
-       NonsymmetricOperator, ResidualProblem, SPD, add_boundary!, add_cell!, add_constraint!,
-       add_interface!, add_surface!, cell_apply!, cell_diagonal!, cell_matrix!, cell_residual!,
-       cell_rhs!, cell_tangent_apply!, constrain!, face_apply!, face_diagonal!, face_matrix!,
-       face_residual!, face_rhs!, face_tangent_apply!, interface_apply!, interface_diagonal!,
-       interface_matrix!, interface_residual!, interface_rhs!, interface_tangent_apply!,
-       operator_class, surface_apply!, surface_diagonal!, surface_matrix!, surface_residual!,
-       surface_rhs!, surface_tangent_apply!, KernelScratch, scratch_matrix, scratch_vector
-public AbstractOperatorClass
+       NonsymmetricOperator, ResidualProblem, SPD, add_constraint!, operator_class
+public KernelScratch, add_boundary!, add_cell!, add_interface!, add_surface!, cell_apply!,
+       cell_diagonal!, cell_matrix!, cell_residual!, cell_rhs!, cell_tangent_apply!, face_apply!,
+       face_diagonal!, face_matrix!, face_residual!, face_rhs!, face_tangent_apply!,
+       interface_apply!, interface_diagonal!, interface_matrix!, interface_residual!,
+       interface_rhs!, interface_tangent_apply!, scratch_matrix, scratch_vector, surface_apply!,
+       surface_diagonal!, surface_matrix!, surface_residual!, surface_rhs!, surface_tangent_apply!
 
 include("embedded.jl")
-export EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
-       add_surface_quadrature!
-public implicit_surface_quadrature
+public EmbeddedSurface, SegmentMesh, SurfaceQuadrature, add_cell_quadrature!, add_embedded_surface!,
+       add_surface_quadrature!, implicit_surface_quadrature
 
 include("integration.jl")
-export CellValues, FaceValues, SurfaceValues, average, block, face_axis, face_side, jump,
-       local_dof_index, normal, normal_component, normal_gradient, gradient, field_gradient,
-       InterfaceValues, minus, plus, shape_gradient, shape_gradients, shape_normal_gradient,
-       shape_value, shape_values, TensorProductValues, tensor_axis_gradients, tensor_axis_values,
+export average, field_gradient, gradient, jump, minus, normal, normal_component, normal_gradient,
+       plus, value
+public block, CellValues, FaceValues, face_axis, face_side, InterfaceValues, is_full_tensor,
+       local_dof_index, shape_gradient, shape_gradients, shape_normal_gradient, shape_value,
+       shape_values, SurfaceValues, TensorProductValues, tensor_axis_gradients, tensor_axis_values,
        tensor_degrees, tensor_gradient!, tensor_interpolate!, tensor_local_modes, tensor_mode_count,
        tensor_mode_shape, tensor_point_count, tensor_project!, tensor_project_gradient!,
-       tensor_quadrature_shape, tensor_values, value, is_full_tensor
+       tensor_quadrature_shape, tensor_values
 
 include("weakforms.jl")
 export add_boundary_bilinear!, add_boundary_linear!, add_cell_bilinear!, add_cell_linear!,
@@ -203,15 +196,19 @@ include("plans.jl")
 export AssemblyPlan, compile
 
 include("assembly.jl")
-export OperatorWorkspace, ResidualWorkspace, apply, apply!, residual, residual!, rhs, rhs!,
-       tangent_apply, tangent_apply!
+export apply, apply!, residual, residual!, rhs, rhs!, tangent_apply, tangent_apply!
+public OperatorWorkspace, ResidualWorkspace
 
 include("solve.jl")
-export AutoLinearSolver, CGSolver, FGMRESSolver, IdentityPreconditioner, JacobiPreconditioner, solve
-public AbstractLinearSolver, AbstractPreconditioner, default_tangent_linear_solve
+export AutoLinearSolver, CGSolver, FGMRESSolver, solve
+public AbstractLinearSolver, AbstractPreconditioner, default_tangent_linear_solve,
+       IdentityPreconditioner, JacobiPreconditioner
 
 include("multigrid.jl")
 export GeometricMultigridPreconditioner
+
+include("diagnostics.jl")
+public multigrid_diagnostics, operator_diagnostics
 
 include("adaptivity.jl")
 export AdaptivityLimits, AdaptivityPlan, adaptivity_summary, request_h_derefinement!,
@@ -230,7 +227,7 @@ include("indicators.jl")
 public adaptivity_plan, coefficient_coarsening_indicators, interface_jump_indicators,
        multiresolution_indicators, projection_coarsening_indicators
 
-# Part VI. Postprocessing, verification, and output.
+# Verification and backend-neutral postprocessing entry points.
 include("verification.jl")
 export l2_error, relative_l2_error
 

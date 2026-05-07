@@ -30,13 +30,14 @@ The stored quadrature weights represent reference-surface measure on the
 embedded piece, not full-dimensional cell volume. Later compilation maps both
 the weights and the normals to physical space.
 """
-struct SurfaceQuadrature{D,T<:AbstractFloat,Q<:PointQuadrature{D,T}}
+struct SurfaceQuadrature{D,T<:AbstractFloat,Q<:AbstractQuadrature{D,T}}
   leaf::Int
   quadrature::Q
   normals::Vector{NTuple{D,T}}
 
   function SurfaceQuadrature{D,T,Q}(leaf::Int, quadrature::Q,
-                                    normals) where {D,T<:AbstractFloat,Q<:PointQuadrature{D,T}}
+                                    normals) where {D,T<:AbstractFloat,Q<:AbstractQuadrature{D,T}}
+    _check_surface_quadrature_weights(quadrature, T)
     return new{D,T,Q}(_checked_positive(leaf, "leaf"), quadrature,
                       _checked_surface_normals(quadrature, normals, T))
   end
@@ -48,9 +49,16 @@ end
 Piecewise-linear embedded curve geometry in two dimensions.
 
 `points` is a list of physical points in `ℝ²`, and `segments` is a list of
-pairs of point indices describing straight line segments between them. When
-wrapped in an [`EmbeddedSurface`](@ref), a `SegmentMesh` is intersected with the
-active cells of a two-dimensional domain, and each clipped segment piece is
+pairs of point indices describing straight line segments between them. Segments
+must have positive geometric length and must not duplicate another segment,
+including with reversed endpoint order.
+
+Segment orientation determines the surface normal: after clipping to each leaf,
+the directed segment uses the right-hand reference normal `(dy, -dx) / length`.
+Reverse a segment to flip `normal(q)` and `normal_gradient(...)` contributions.
+
+When wrapped in an [`EmbeddedSurface`](@ref), a `SegmentMesh` is intersected with
+the active cells of a two-dimensional domain, and each clipped segment piece is
 converted into one or more [`SurfaceQuadrature`](@ref) items.
 """
 struct SegmentMesh{T<:AbstractFloat}
@@ -90,13 +98,13 @@ end
 
 const _EMBEDDED_SURFACE_TOLERANCE = T -> T(64) * eps(T)
 
-function SurfaceQuadrature(leaf::Integer, quadrature::PointQuadrature{D,T},
+function SurfaceQuadrature(leaf::Integer, quadrature::AbstractQuadrature{D,T},
                            normals) where {D,T<:AbstractFloat}
   return SurfaceQuadrature{D,T,typeof(quadrature)}(_checked_positive(leaf, "leaf"), quadrature,
                                                    normals)
 end
 
-function SurfaceQuadrature(leaf::Integer, quadrature::PointQuadrature{D,T},
+function SurfaceQuadrature(leaf::Integer, quadrature::AbstractQuadrature{D,T},
                            normal::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
   return SurfaceQuadrature(leaf, quadrature, fill(normal, point_count(quadrature)))
 end
@@ -200,12 +208,12 @@ function add_cell_quadrature!(problem::_AbstractProblem, leaf::Integer,
 end
 
 function add_surface_quadrature!(problem::_AbstractProblem, leaf::Integer,
-                                 quadrature::PointQuadrature, normals)
+                                 quadrature::AbstractQuadrature, normals)
   return add_surface_quadrature!(problem, SurfaceQuadrature(leaf, quadrature, normals))
 end
 
 function add_surface_quadrature!(problem::_AbstractProblem, tag::Symbol, leaf::Integer,
-                                 quadrature::PointQuadrature, normals)
+                                 quadrature::AbstractQuadrature, normals)
   return add_surface_quadrature!(problem, tag, SurfaceQuadrature(leaf, quadrature, normals))
 end
 
@@ -766,29 +774,52 @@ end
 # storage type.
 function _segment_point_scalar_type(point)
   length(point) == 2 || throw(ArgumentError("segment-mesh points must be two-dimensional"))
-  point[1] isa Real && point[2] isa Real ||
-    throw(ArgumentError("segment-mesh point coordinates must be Real values"))
+  for axis in 1:2
+    _checked_real_not_bool(point[axis], "segment-mesh point coordinates")
+  end
   return promote_type(typeof(point[1]), typeof(point[2]))
 end
 
 function _checked_segment_point(point, ::Type{T}) where {T<:AbstractFloat}
   length(point) == 2 || throw(ArgumentError("segment-mesh points must be two-dimensional"))
-  values = ntuple(axis -> T(point[axis]), 2)
+  values = ntuple(axis -> T(_checked_real_not_bool(point[axis], "segment-mesh point coordinates")),
+                  2)
   all(isfinite, values) || throw(ArgumentError("segment-mesh points must be finite"))
   return values
+end
+
+function _checked_real_not_bool(value, name::AbstractString)
+  value isa Bool && throw(ArgumentError("$name must be Real values, not Bool"))
+  value isa Real || throw(ArgumentError("$name must be Real values"))
+  return value
+end
+
+function _checked_integer_not_bool(value, name::AbstractString)
+  value isa Bool && throw(ArgumentError("$name must be integers, not Bool"))
+  value isa Integer || throw(ArgumentError("$name must be integers"))
+  return value
 end
 
 # Validate one segment as a pair of distinct point indices.
 function _checked_segment(segment, point_count::Int)
   length(segment) == 2 ||
     throw(ArgumentError("segment-mesh segments must connect two point indices"))
-  segment[1] isa Integer && segment[2] isa Integer ||
-    throw(ArgumentError("segment-mesh segment indices must be integers"))
-  first_index = _require_index(segment[1], point_count, "segment point")
-  second_index = _require_index(segment[2], point_count, "segment point")
+  first_index = _require_index(_checked_integer_not_bool(segment[1],
+                                                         "segment-mesh segment indices"),
+                               point_count, "segment point")
+  second_index = _require_index(_checked_integer_not_bool(segment[2],
+                                                          "segment-mesh segment indices"),
+                                point_count, "segment point")
   first_index != second_index ||
     throw(ArgumentError("segment-mesh segments must have distinct endpoints"))
   return (first_index, second_index)
+end
+
+function _canonical_segment_key(first_point::NTuple{2,T},
+                                second_point::NTuple{2,T}) where {T<:AbstractFloat}
+  first_is_lower = first_point[1] < second_point[1] ||
+                   (first_point[1] == second_point[1] && first_point[2] <= second_point[2])
+  return first_is_lower ? (first_point, second_point) : (second_point, first_point)
 end
 
 # Validate the full segment-mesh topology and coordinates.
@@ -801,15 +832,41 @@ function _validate_segment_mesh(points::Vector{NTuple{2,T}}, segments::Vector{NT
     _checked_segment_point(point, T)
   end
 
+  seen_segments = Set{Tuple{NTuple{2,T},NTuple{2,T}}}()
+
   for segment in segments
-    _checked_segment(segment, length(points))
+    checked_segment = _checked_segment(segment, length(points))
+    first_point = points[checked_segment[1]]
+    second_point = points[checked_segment[2]]
+    _segment_length(first_point, second_point) > zero(T) ||
+      throw(ArgumentError("segment-mesh segments must have positive geometric length"))
+    key = _canonical_segment_key(first_point, second_point)
+    !(key in seen_segments) ||
+      throw(ArgumentError("segment-mesh segments must not contain duplicate geometry"))
+    push!(seen_segments, key)
   end
 
   return nothing
 end
 
+function _check_surface_quadrature_weights(quadrature::AbstractQuadrature{D,T},
+                                           ::Type{T}) where {D,T<:AbstractFloat}
+  for point_index in 1:point_count(quadrature)
+    value = weight(quadrature, point_index)
+    value isa Bool &&
+      throw(ArgumentError("surface-quadrature weights must be positive finite Real values, not Bool"))
+    value isa Real ||
+      throw(ArgumentError("surface-quadrature weights must be positive finite Real values"))
+    checked = T(value)
+    isfinite(checked) && checked > zero(T) ||
+      throw(ArgumentError("surface-quadrature weights must be positive finite Real values"))
+  end
+
+  return quadrature
+end
+
 # Validate and normalize the reference normals attached to a surface quadrature.
-function _checked_surface_normals(quadrature::PointQuadrature{D,T}, normals,
+function _checked_surface_normals(quadrature::AbstractQuadrature{D,T}, normals,
                                   ::Type{T}) where {D,T<:AbstractFloat}
   length(normals) == point_count(quadrature) ||
     throw(ArgumentError("surface-quadrature normals must match the quadrature point count"))
@@ -828,8 +885,7 @@ function _checked_surface_normal(normal, dimension_count::Int, ::Type{T}) where 
   length(normal) == dimension_count ||
     throw(ArgumentError("surface-quadrature normals must match the spatial dimension"))
   for axis in 1:dimension_count
-    normal[axis] isa Real ||
-      throw(ArgumentError("surface-quadrature normals must contain Real values"))
+    _checked_real_not_bool(normal[axis], "surface-quadrature normals")
   end
   values = ntuple(axis -> T(normal[axis]), dimension_count)
   magnitude = sqrt(sum(values[axis]^2 for axis in 1:dimension_count))

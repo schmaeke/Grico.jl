@@ -95,8 +95,9 @@ degree-of-freedom mappings for every field in a [`FieldLayout`](@ref). These
 objects are compiled once and then reused during assembly, residual evaluation,
 and post-processing.
 """
-struct CellValues{D,T<:AbstractFloat,F<:Tuple}
+struct CellValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
+  layout::L
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   fields::F
@@ -119,8 +120,9 @@ face, mapped to physical coordinates. In addition to the field evaluation data,
 `FaceValues` stores the outward unit normal of the face and the face axis/side
 identifiers used by boundary operators.
 """
-struct FaceValues{D,T<:AbstractFloat,F<:Tuple}
+struct FaceValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
+  layout::L
   axis::Int
   side::Int
   normal::NTuple{D,T}
@@ -147,8 +149,9 @@ topological cell face. The optional `tag` records the symbolic surface label
 under which the underlying geometry or quadrature was attached to the problem.
 For untagged attachments, `tag === nothing`.
 """
-struct SurfaceValues{D,T<:AbstractFloat,F<:Tuple}
+struct SurfaceValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
+  layout::L
   tag::_SurfaceTag
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
@@ -178,9 +181,10 @@ The two sides may also carry different local basis tables and different local
 mode-to-global expansions. This is what lets one interface item represent both
 matching interfaces and nonmatching hp interfaces in one common format.
 """
-struct InterfaceValues{D,T<:AbstractFloat,MF<:Tuple,PF<:Tuple}
+struct InterfaceValues{D,T<:AbstractFloat,L<:FieldLayout,MF<:Tuple,PF<:Tuple}
   minus_leaf::Int
   plus_leaf::Int
+  layout::L
   axis::Int
   normal::NTuple{D,T}
   points::Vector{NTuple{D,T}}
@@ -199,12 +203,14 @@ end
 # Internal side view of one interface trace. This lets the public `plus` and
 # `minus` accessors reuse the same field-evaluation machinery as cells, boundary
 # faces, and embedded surfaces without duplicating storage.
-struct _InterfaceSideValues{D,T<:AbstractFloat,F<:Tuple}
+struct _InterfaceSideValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
+  layout::L
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   normal::NTuple{D,T}
   fields::F
+  local_dof_count::Int
 end
 
 const _AssemblyValues = Union{CellValues,FaceValues,SurfaceValues,InterfaceValues}
@@ -254,9 +260,8 @@ For [`InterfaceValues`](@ref), this returns the point on the minus-side trace.
 Use [`plus`](@ref) first when the plus-side point array is needed.
 """
 @inline function point(values::_PointValues, point_index::Integer)
-  count = point_count(values)
-  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
-  return @inbounds values.points[Int(point_index)]
+  checked_point = _checked_point_index(values, point_index)
+  return @inbounds values.points[checked_point]
 end
 
 """
@@ -269,9 +274,8 @@ The weight already includes the geometric measure factor of the corresponding
 cell, face, interface patch, or embedded-surface piece.
 """
 @inline function weight(values::_PointValues, point_index::Integer)
-  count = point_count(values)
-  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
-  return @inbounds values.weights[Int(point_index)]
+  checked_point = _checked_point_index(values, point_index)
+  return @inbounds values.weights[checked_point]
 end
 
 """
@@ -311,15 +315,14 @@ normal(values::_ConstantNormalValues) = values.normal
 end
 
 @inline function normal(values::SurfaceValues, point_index::Integer)
-  count = point_count(values)
-  @boundscheck 1 <= point_index <= count || _throw_index_error(point_index, count, "point")
-  return @inbounds values.normals[Int(point_index)]
+  checked_point = _checked_point_index(values, point_index)
+  return @inbounds values.normals[checked_point]
 end
 
 function _interface_side_values(values::InterfaceValues{D,T}, leaf::Int, points,
                                 fields) where {D,T<:AbstractFloat}
-  return _InterfaceSideValues{D,T,typeof(fields)}(leaf, points, values.weights, values.normal,
-                                                  fields)
+  return _InterfaceSideValues(leaf, values.layout, points, values.weights, values.normal, fields,
+                              values.local_dof_count)
 end
 
 """
@@ -523,7 +526,10 @@ end
 
 function _checked_biunit_coordinate(::Type{T}, ξ::NTuple{D,<:Real}) where {D,T<:AbstractFloat}
   return ntuple(axis -> begin
-                  value = T(ξ[axis])
+                  raw_value = ξ[axis]
+                  raw_value isa Bool &&
+                    throw(ArgumentError("reference coordinate ξ[$axis] must be a real number, not Bool"))
+                  value = T(raw_value)
                   isfinite(value) ||
                     throw(ArgumentError("reference coordinate ξ[$axis] must be finite"))
                   -one(T) <= value <= one(T) ||
@@ -605,6 +611,50 @@ end
 
 @inline function _checked_field_component(data::_FieldValues, component::Integer)
   return _require_index(component, _field_component_count(data), "field component")
+end
+
+@inline function _check_integration_state(values::_FieldEvaluationValues, state::State)
+  @boundscheck field_layout(state) === values.layout ||
+               throw(ArgumentError("state belongs to a different field layout than this local integration item"))
+  return state
+end
+
+@inline function _check_local_vector(values::_FieldEvaluationValues, buffer::AbstractVector,
+                                     name::AbstractString)
+  @boundscheck begin
+    _require_one_based_vector(buffer, name)
+    _require_length(buffer, values.local_dof_count, name)
+  end
+  return buffer
+end
+
+@inline function _check_local_matrix(values::_FieldEvaluationValues, buffer::AbstractMatrix,
+                                     name::AbstractString)
+  @boundscheck begin
+    _require_one_based_matrix(buffer, name)
+    rows_required = values.local_dof_count
+    columns_required = values.local_dof_count
+    size(buffer, 1) >= rows_required ||
+      throw(ArgumentError("$name must have at least $rows_required rows"))
+    size(buffer, 2) >= columns_required ||
+      throw(ArgumentError("$name must have at least $columns_required columns"))
+  end
+  return buffer
+end
+
+@inline function _check_local_matrix(test_values::_FieldEvaluationValues,
+                                     trial_values::_FieldEvaluationValues, buffer::AbstractMatrix,
+                                     name::AbstractString)
+  @boundscheck begin
+    _require_one_based_matrix(buffer, name)
+    rows_required = test_values.local_dof_count
+    columns_required = trial_values.local_dof_count
+    size(buffer, 1) >= rows_required ||
+      throw(ArgumentError("$name must have at least $rows_required rows"))
+    size(buffer, 2) >= columns_required ||
+      throw(ArgumentError("$name must have at least $columns_required columns"))
+  end
+  return buffer
 end
 
 @inline _point_normal(values::FaceValues, point_index::Int) = values.normal
@@ -844,6 +894,14 @@ For full tensor-product bases this equals `prod(tensor_mode_shape(data))`; for
 reduced basis families it may be smaller.
 """
 tensor_mode_count(data::TensorProductValues) = length(data.local_modes)
+
+# Sum-factorized kernels can also work on the enclosing tensor-product mode box
+# when a reduced basis such as `TrunkBasis` omits some modes. Active
+# coefficients are embedded into this box with zeros in inactive entries; after
+# projection only active entries are scattered back to the local vector. This
+# keeps the robust tensor algorithm available without requiring a separate
+# reduced-basis contraction for every basis family.
+tensor_mode_box_count(data::TensorProductValues) = prod(tensor_mode_shape(data))
 
 """
     tensor_local_modes(data)
@@ -1115,6 +1173,21 @@ function tensor_interpolate!(result::AbstractVector{T}, data::TensorProductValue
   return _tensor_interpolate_with_axis!(result, data, coefficients, 0, scratch, first_slot)
 end
 
+function tensor_box_interpolate!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                 coefficients::AbstractVector{T},
+                                 scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_box_interpolate!(result, data, coefficients, scratch, 1)
+end
+
+function tensor_box_interpolate!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                 coefficients::AbstractVector{T}, scratch::KernelScratch{T},
+                                 first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_length(coefficients, tensor_mode_box_count(data), "tensor coefficient box")
+  _require_length(result, tensor_point_count(data), "tensor interpolation result")
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  return _tensor_interpolate_with_axis!(result, data, coefficients, 0, scratch, first_slot)
+end
+
 """
     tensor_gradient!(result, data, coefficients, scratch[, first_scratch_slot])
 
@@ -1146,6 +1219,34 @@ function tensor_gradient!(result::AbstractMatrix{T}, data::TensorProductValues{D
 
   for axis in 1:D
     _tensor_interpolate_with_axis!(values, data, coefficients, axis, scratch, first_slot)
+    @inbounds for point_index in 1:length(values)
+      result[axis, point_index] = values[point_index]
+    end
+  end
+
+  return result
+end
+
+function tensor_box_gradient!(result::AbstractMatrix{T}, data::TensorProductValues{D,T},
+                              coefficients::AbstractVector{T},
+                              scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_box_gradient!(result, data, coefficients, scratch, 1)
+end
+
+function tensor_box_gradient!(result::AbstractMatrix{T}, data::TensorProductValues{D,T},
+                              coefficients::AbstractVector{T}, scratch::KernelScratch{T},
+                              first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_length(coefficients, tensor_mode_box_count(data), "tensor coefficient box")
+  size(result, 1) == D ||
+    throw(ArgumentError("tensor gradient result row count must match the dimension"))
+  size(result, 2) == tensor_point_count(data) ||
+    throw(ArgumentError("tensor gradient result column count must match the point count"))
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  values = scratch_vector(scratch, first_slot + D, tensor_point_count(data))
+
+  for axis in 1:D
+    _tensor_interpolate_with_axis!(values, data, coefficients, axis, scratch, first_slot)
+
     @inbounds for point_index in 1:length(values)
       result[axis, point_index] = values[point_index]
     end
@@ -1203,6 +1304,21 @@ function tensor_project!(result::AbstractVector{T}, data::TensorProductValues{D,
   return _tensor_project_with_axis!(result, data, weighted_values, 0, scratch, first_slot)
 end
 
+function tensor_box_project!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                             weighted_values::AbstractVector{T},
+                             scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_box_project!(result, data, weighted_values, scratch, 1)
+end
+
+function tensor_box_project!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                             weighted_values::AbstractVector{T}, scratch::KernelScratch{T},
+                             first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_length(result, tensor_mode_box_count(data), "tensor projection box")
+  _require_length(weighted_values, tensor_point_count(data), "tensor weighted values")
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  return _tensor_project_with_axis!(result, data, weighted_values, 0, scratch, first_slot)
+end
+
 """
     tensor_project_gradient!(result, data, weighted_gradients, scratch[, first_scratch_slot])
 
@@ -1227,6 +1343,35 @@ function tensor_project_gradient!(result::AbstractVector{T}, data::TensorProduct
                                   first_scratch_slot::Integer) where {D,T<:AbstractFloat}
   _require_full_tensor(data)
   _require_length(result, tensor_mode_count(data), "tensor gradient projection result")
+  size(weighted_gradients, 1) == D ||
+    throw(ArgumentError("weighted gradient row count must match the dimension"))
+  size(weighted_gradients, 2) == tensor_point_count(data) ||
+    throw(ArgumentError("weighted gradient column count must match the point count"))
+  first_slot = _checked_positive(first_scratch_slot, "first tensor scratch slot")
+  weighted_axis = scratch_vector(scratch, first_slot + D, tensor_point_count(data))
+
+  for axis in 1:D
+    @inbounds for point_index in 1:length(weighted_axis)
+      weighted_axis[point_index] = weighted_gradients[axis, point_index]
+    end
+
+    _tensor_project_with_axis!(result, data, weighted_axis, axis, scratch, first_slot)
+  end
+
+  return result
+end
+
+function tensor_box_project_gradient!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                      weighted_gradients::AbstractMatrix{T},
+                                      scratch::KernelScratch{T}) where {D,T<:AbstractFloat}
+  return tensor_box_project_gradient!(result, data, weighted_gradients, scratch, 1)
+end
+
+function tensor_box_project_gradient!(result::AbstractVector{T}, data::TensorProductValues{D,T},
+                                      weighted_gradients::AbstractMatrix{T},
+                                      scratch::KernelScratch{T},
+                                      first_scratch_slot::Integer) where {D,T<:AbstractFloat}
+  _require_length(result, tensor_mode_box_count(data), "tensor gradient projection box")
   size(weighted_gradients, 1) == D ||
     throw(ArgumentError("weighted gradient row count must match the dimension"))
   size(weighted_gradients, 2) == tensor_point_count(data) ||
@@ -1278,17 +1423,20 @@ field-level semantics to the contiguous local block layout used by the compiled
 integration item.
 """
 @inline function block(buffer::AbstractVector, values::_FieldEvaluationValues, field::AbstractField)
+  _check_local_vector(values, buffer, "local vector")
   return view(buffer, field_dof_range(values, field))
 end
 
 @inline function block(buffer::AbstractMatrix, values::_FieldEvaluationValues,
                        test_field::AbstractField, trial_field::AbstractField)
+  _check_local_matrix(values, buffer, "local matrix")
   return view(buffer, field_dof_range(values, test_field), field_dof_range(values, trial_field))
 end
 
 @inline function block(buffer::AbstractMatrix, test_values::_FieldEvaluationValues,
                        test_field::AbstractField, trial_values::_FieldEvaluationValues,
                        trial_field::AbstractField)
+  _check_local_matrix(test_values, trial_values, buffer, "local matrix")
   return view(buffer, field_dof_range(test_values, test_field),
               field_dof_range(trial_values, trial_field))
 end
@@ -1316,6 +1464,7 @@ axes and direct leaf-local dofs on DG axes.
 @inline function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
                        point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_integration_state(values, state)
   checked_point = _checked_point_index(values, point_index)
   return _field_value(data, coefficients(state), checked_point)
 end
@@ -1327,6 +1476,7 @@ end
 @inline function value(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
                        component::Integer, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_integration_state(values, state)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
   return _field_value_component(data, coefficients(state), checked_component, checked_point)
@@ -1346,6 +1496,7 @@ same numbering passed to `cell_apply!`, `face_apply!`, `interface_apply!`, and
 @inline function value(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
                        field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_local_vector(values, local_coefficients, "local coefficient vector")
   checked_point = _checked_point_index(values, point_index)
   return _local_field_value(data, local_coefficients, checked_point)
 end
@@ -1354,6 +1505,7 @@ end
                        field::AbstractField, component::Integer,
                        point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_local_vector(values, local_coefficients, "local coefficient vector")
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
   return _local_field_value_component(data, local_coefficients, checked_component, checked_point)
@@ -1440,6 +1592,7 @@ computes
 @inline function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
                           point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_integration_state(values, state)
   checked_point = _checked_point_index(values, point_index)
   return _field_gradient(data, coefficients(state), checked_point)
 end
@@ -1447,6 +1600,7 @@ end
 @inline function gradient(values::_FieldEvaluationValues, state::State{T}, field::AbstractField,
                           component::Integer, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_integration_state(values, state)
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
   return _field_gradient(data, coefficients(state), checked_component, checked_point)
@@ -1462,6 +1616,7 @@ a matrix-free local operator kernel.
 @inline function gradient(values::_FieldEvaluationValues, local_coefficients::AbstractVector{T},
                           field::AbstractField, point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_local_vector(values, local_coefficients, "local coefficient vector")
   checked_point = _checked_point_index(values, point_index)
   return _local_field_gradient(data, local_coefficients, checked_point)
 end
@@ -1470,6 +1625,7 @@ end
                           field::AbstractField, component::Integer,
                           point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_local_vector(values, local_coefficients, "local coefficient vector")
   checked_component = _checked_field_component(data, component)
   checked_point = _checked_point_index(values, point_index)
   return _local_field_gradient(data, local_coefficients, checked_component, checked_point)
@@ -1568,6 +1724,7 @@ the other on the reconstructed discrete field itself.
                                  field::AbstractField,
                                  point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_integration_state(values, state)
   checked_point = _checked_point_index(values, point_index)
   normal_value = _point_normal(values, checked_point)
   return _field_normal_gradient(data, coefficients(state), checked_point, normal_value)
@@ -1583,6 +1740,7 @@ interface side, or embedded surface item.
                                  local_coefficients::AbstractVector{T}, field::AbstractField,
                                  point_index::Integer) where {T<:AbstractFloat}
   data = _field_values(values, field)
+  _check_local_vector(values, local_coefficients, "local coefficient vector")
   checked_point = _checked_point_index(values, point_index)
   normal_value = _point_normal(values, checked_point)
   return _local_field_normal_gradient(data, local_coefficients, checked_point, normal_value)
@@ -2013,8 +2171,8 @@ function _compile_cell(layout::FieldLayout{D,T}, leaf::Int, override) where {D,T
   terms = _compiled_item_terms(field_data)
   interior_local_dofs = _interior_local_dofs(field_data,
                                              _compiled_leaf(layout.slots[1].space, leaf).local_modes)
-  return CellValues(leaf, points, weights, field_data, terms.term_offsets, terms.term_indices,
-                    terms.term_coefficients, terms.single_term_indices,
+  return CellValues(leaf, layout, points, weights, field_data, terms.term_offsets,
+                    terms.term_indices, terms.term_coefficients, terms.single_term_indices,
                     terms.single_term_coefficients, interior_local_dofs, terms.local_dof_count)
 end
 
@@ -2076,7 +2234,7 @@ function _compile_boundary_face(layout::FieldLayout{D,T}, leaf::Int, face_axis::
   field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian, 1, shape)
   terms = _compiled_item_terms(field_data)
   normal_data = ntuple(axis -> axis == face_axis ? (side == LOWER ? -one(T) : one(T)) : zero(T), D)
-  return FaceValues(leaf, face_axis, side, normal_data, points, weights, field_data,
+  return FaceValues(leaf, layout, face_axis, side, normal_data, points, weights, field_data,
                     terms.term_offsets, terms.term_indices, terms.term_coefficients,
                     terms.single_term_indices, terms.single_term_coefficients,
                     terms.local_dof_count)
@@ -2124,7 +2282,7 @@ function _compile_interface(layout::FieldLayout{D,T}, minus_leaf::Int, face_axis
   all_fields = (minus_fields..., plus_fields...)
   terms = _compiled_item_terms(all_fields)
   normal_data = ntuple(axis -> axis == face_axis ? one(T) : zero(T), D)
-  return InterfaceValues(minus_leaf, plus_leaf, face_axis, normal_data, points, plus_points,
+  return InterfaceValues(minus_leaf, plus_leaf, layout, face_axis, normal_data, points, plus_points,
                          weights, minus_fields, plus_fields, terms.term_offsets, terms.term_indices,
                          terms.term_coefficients, terms.single_term_indices,
                          terms.single_term_coefficients, terms.local_dof_count)
@@ -2162,6 +2320,7 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T}, surface::SurfaceQ
                                      tag::_SurfaceTag=nothing) where {D,T<:AbstractFloat}
   domain_data = layout.slots[1].space.domain
   quadrature = surface.quadrature
+  tensor_shape = quadrature isa TensorQuadrature ? axis_point_counts(quadrature) : nothing
   qcount = point_count(quadrature)
   reference_points = Vector{NTuple{D,T}}(undef, qcount)
   points = Vector{NTuple{D,T}}(undef, qcount)
@@ -2179,11 +2338,13 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T}, surface::SurfaceQ
   end
 
   inverse_jacobian = _inverse_jacobian(domain_data, surface.leaf)
-  field_data, _ = _compile_item_fields(layout, surface.leaf, reference_points, inverse_jacobian)
+  field_data, _ = _compile_item_fields(layout, surface.leaf, reference_points, inverse_jacobian, 1,
+                                       tensor_shape)
   terms = _compiled_item_terms(field_data)
-  return SurfaceValues(surface.leaf, tag, points, weights, normals, field_data, terms.term_offsets,
-                       terms.term_indices, terms.term_coefficients, terms.single_term_indices,
-                       terms.single_term_coefficients, terms.local_dof_count)
+  return SurfaceValues(surface.leaf, layout, tag, points, weights, normals, field_data,
+                       terms.term_offsets, terms.term_indices, terms.term_coefficients,
+                       terms.single_term_indices, terms.single_term_coefficients,
+                       terms.local_dof_count)
 end
 
 # Build leaf-local index ranges into the global face and surface arrays. The
@@ -2285,14 +2446,30 @@ end
 # Ensure that user-supplied reference quadratures live on the standard biunit
 # reference cell. This lets the rest of the integration code assume a single
 # coordinate convention.
-function _check_reference_quadrature(quadrature::AbstractQuadrature{D}) where {D}
-  for point_index in 1:point_count(quadrature)
+function _check_reference_quadrature(quadrature::AbstractQuadrature{D,T}) where {D,T<:AbstractFloat}
+  qcount = _checked_positive(point_count(quadrature), "quadrature point count")
+
+  for point_index in 1:qcount
     ξ = point(quadrature, point_index)
+    ξ isa Tuple && length(ξ) == D || throw(ArgumentError("quadrature points must be $D-tuples"))
 
     for axis in 1:D
-      -1 <= ξ[axis] <= 1 ||
+      coordinate = ξ[axis]
+      coordinate isa Bool &&
+        throw(ArgumentError("quadrature point coordinates must be real numbers, not Bool"))
+      coordinate isa Real ||
+        throw(ArgumentError("quadrature point coordinates must be real numbers"))
+      value = T(coordinate)
+      isfinite(value) || throw(ArgumentError("quadrature points must be finite"))
+      -one(T) <= value <= one(T) ||
         throw(ArgumentError("quadrature points must lie in the biunit reference cell"))
     end
+
+    raw_weight = weight(quadrature, point_index)
+    raw_weight isa Bool && throw(ArgumentError("quadrature weights must be real numbers, not Bool"))
+    raw_weight isa Real || throw(ArgumentError("quadrature weights must be real numbers"))
+    weight_value = T(raw_weight)
+    isfinite(weight_value) || throw(ArgumentError("quadrature weights must be finite"))
   end
 
   return quadrature

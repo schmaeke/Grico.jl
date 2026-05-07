@@ -151,7 +151,7 @@ function pre_refine_blast_wave_space(space; layers=INITIAL_BLAST_REFINEMENT_LAYE
 
   source_grid = grid(space)
   base_max_level = maximum(Grico.level(source_grid, leaf, axis)
-                           for leaf in active_leaves(space), axis in 1:dimension(space))
+                           for leaf in active_leaves(space), axis in 1:Grico.dimension(space))
   plan = AdaptivityPlan(space; limits=AdaptivityLimits(space; max_h_level=base_max_level + layers))
 
   for _ in 1:layers

@@ -186,7 +186,7 @@ function euler_residual_plan(field, gamma)
   add_interface!(problem, CompressibleEulerInterface(field, gamma))
 
   for axis in 1:2, side in (LOWER, UPPER)
-    is_periodic_axis(field_space(field), axis) ||
+    Grico.is_periodic_axis(field_space(field), axis) ||
       add_boundary!(problem, BoundaryFace(axis, side), ReflectiveEulerWall(field, gamma))
   end
 

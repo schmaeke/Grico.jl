@@ -2,9 +2,9 @@ using Test
 using Grico
 import Grico: adaptivity_plan, coefficient_coarsening_indicators, h_adaptation_axes,
               h_coarsening_candidates, interface_jump_indicators, is_domain_boundary, level,
-              local_modes, map_to_biunit_cube, multiresolution_indicators, p_degree_change,
-              periodic_axes, projection_coarsening_indicators, source_leaves, snapshot,
-              target_space, derived_adaptivity_plan
+              local_modes, map_to_biunit_cube, mode_terms, multiresolution_indicators,
+              p_degree_change, periodic_axes, projection_coarsening_indicators, scalar_dof_count,
+              source_leaves, snapshot, target_space, derived_adaptivity_plan
 
 const ADAPTIVITY_TOL = 1.0e-8
 
@@ -57,8 +57,36 @@ end
   refined = target_space(space_transition)
 
   @test active_leaf_count(refined) == 3
+  @test length(space_transition.source_offsets) == active_leaf_count(refined)
+  @test length(space_transition.source_offsets) < Grico.stored_cell_count(grid(refined))
   @test all(source_leaves(space_transition, leaf) == [1] for leaf in active_leaves(refined))
   @test all(cell_degrees(refined, leaf) == (2, 2) for leaf in active_leaves(refined))
+end
+
+@testset "Transition Contracts" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(1)))
+  plan = AdaptivityPlan(space)
+
+  request_h_refinement!(plan, 1, 1)
+  space_transition = transition(plan)
+  target = target_space(space_transition)
+  first_target_leaf = first(active_leaves(target))
+  target_stored_count = Grico.stored_cell_count(grid(target))
+  overlapping_source = source_leaves(space_transition, first_target_leaf)
+
+  @test overlapping_source isa SubArray
+  @test collect(overlapping_source) == [1]
+  @test length(space_transition.source_offsets) == active_leaf_count(target)
+  @test length(space_transition.source_counts) == active_leaf_count(target)
+  @test_throws ArgumentError Grico.SpaceTransition(space, target, Int[], Int[], Int[])
+  @test_throws ArgumentError Grico.SpaceTransition(space, target, [1, 2], [1, 1], [1])
+  @test_throws ArgumentError Grico.SpaceTransition(space, target, [1, 2], [1, 1], [2, 1])
+
+  request_h_refinement!(plan, first(active_leaves(plan)), 1)
+
+  @test Grico.stored_cell_count(grid(target)) == target_stored_count
+  @test active_leaf_count(target) == 2
 end
 
 @testset "Physical Domain Adaptivity" begin
@@ -87,6 +115,30 @@ end
   automatic_active = active_leaves(target_space(transition(automatic_plan)))
   @test length(automatic_active) == 3
   @test all(leaf -> level(grid(space), leaf) == (1,), automatic_active)
+end
+
+@testset "Physical Domain Indicator Measures" begin
+  background = Domain((0.0,), (1.0,), (1,))
+  region = ImplicitRegion(x -> x[1] - 0.75; subdivision_depth=3)
+  domain = PhysicalDomain(background, region)
+  space = HpSpace(domain,
+                  SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0), continuity=:dg))
+  u = ScalarField(space; name=:u)
+  plan = AdaptivityPlan(space)
+
+  request_h_refinement!(plan, 1, 1)
+  refined_transition = transition(plan)
+  refined = target_space(refined_transition)
+  refined_u = adapted_field(refined_transition, u)
+  state = State(FieldLayout((refined_u,)), [0.0, 1.0])
+  candidates = h_coarsening_candidates(refined)
+  energies = Grico._field_cell_l2_energies(state, refined_u)
+  indicators = projection_coarsening_indicators(state, refined_u, candidates)
+
+  @test active_leaves(refined) == [2, 3]
+  @test energies[1] ≈ 0.0 atol = ADAPTIVITY_TOL
+  @test energies[2] ≈ 0.25 atol = ADAPTIVITY_TOL
+  @test only(indicators) ≈ sqrt(2 / 3) atol = ADAPTIVITY_TOL
 end
 
 @testset "Periodic Transition" begin
@@ -219,6 +271,25 @@ end
     @test _field_value_at_point(coarse_u, coarse_state, x) ≈
           _field_value_at_point(compact_recovered_u, compact_recovered_state, x) atol = ADAPTIVITY_TOL
   end
+
+  dg_domain = Domain((0.0,), (1.0,), (1,))
+  dg_coarse = HpSpace(dg_domain,
+                      SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(0),
+                                   continuity=:dg))
+  dg_u = ScalarField(dg_coarse; name=:u)
+  dg_refine_plan = AdaptivityPlan(dg_coarse)
+  request_h_refinement!(dg_refine_plan, 1, 1)
+  dg_refine_transition = transition(dg_refine_plan)
+  dg_fine_u = adapted_field(dg_refine_transition, dg_u)
+  dg_fine_state = State(FieldLayout((dg_fine_u,)), [2.0, 4.0])
+  dg_coarsen_plan = AdaptivityPlan(target_space(dg_refine_transition))
+  request_h_derefinement!(dg_coarsen_plan, 1, 1)
+  dg_coarsen_transition = transition(dg_coarsen_plan)
+  dg_recovered_u = adapted_field(dg_coarsen_transition, dg_fine_u)
+  dg_recovered_state = transfer_state(dg_coarsen_transition, dg_fine_state, dg_fine_u,
+                                      dg_recovered_u)
+
+  @test only(field_values(dg_recovered_state, dg_recovered_u)) ≈ 3.0 atol = ADAPTIVITY_TOL
 end
 
 @testset "Alternating Snapshot H Refinement Axes" begin
@@ -306,6 +377,8 @@ end
                                end)
 
   @test calls[] == 1
+  @test_throws ArgumentError transfer_state(space_transition, state, u, new_u;
+                                            linear_solve=(A, b; kwargs...) -> fill(NaN, length(b)))
 
   for x in ((0.0,), (0.125,), (0.25,), (0.5,), (0.75,), (1.0,))
     @test _field_value_at_point(u, state, x) ≈ _field_value_at_point(new_u, transferred, x) atol = ADAPTIVITY_TOL
@@ -389,6 +462,10 @@ end
                                                      degree_offset=(0, 0))
   @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
                                                      degree_offset=big(typemax(Int)) + 1)
+  @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
+                                                     degree_offset=true)
+  @test_throws ArgumentError derived_adaptivity_plan(driver_plan, pressure_space;
+                                                     degree_offset=(true,))
 end
 
 @testset "Mixed-Space State Transfer" begin
@@ -595,6 +672,8 @@ end
                                             linear_solve=(A, b) -> zeros(size(A, 1) + 1))
   @test_throws ArgumentError transfer_state(refine_transition, state, u, refined_u;
                                             linear_solve=(A, b) -> fill("bad", size(A, 1)))
+  @test_throws ArgumentError transfer_state(refine_transition, state, u, refined_u;
+                                            linear_solve=(A, b) -> fill(NaN, size(A, 1)))
   for x in ((0.0,), (0.2,), (0.5,), (0.8,), (1.0,))
     @test _field_value_at_point(refined_u, refined_state, x) ≈ 2.5 atol = ADAPTIVITY_TOL
   end
@@ -684,6 +763,17 @@ end
 
   @test all(<(1.0e-2),
             projection_coarsening_indicators(saturated_state, saturated_u, saturated_candidates))
+
+  degree_limited_domain = Domain((0.0,), (1.0,), (1,))
+  degree_limited_space = HpSpace(degree_limited_domain,
+                                 SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(3),
+                                              continuity=:dg))
+  degree_limited_plan = AdaptivityPlan(degree_limited_space)
+  request_h_refinement!(degree_limited_plan, 1, 1)
+  degree_limited_space = target_space(transition(degree_limited_plan))
+  degree_limited_limits = AdaptivityLimits(degree_limited_space; min_p=0, max_p=2)
+
+  @test isempty(h_coarsening_candidates(degree_limited_space; limits=degree_limited_limits))
 
   retained_plan = adaptivity_plan(saturated_state, saturated_u; tolerance=1.0e-2,
                                   limits=saturated_limits)
@@ -843,6 +933,18 @@ end
   @test p_degree_change(p_biased_plan, 3) == (1,)
 end
 
+@testset "Source Change Reporting" begin
+  domain = Domain((0.0,), (1.0,), (1,))
+  space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
+  plan = AdaptivityPlan(space)
+  first_child = request_h_refinement!(plan, 1, 1)
+
+  request_p_derefinement!(plan, first_child, 1)
+
+  @test p_degree_change(plan, 1) == (-1,)
+  @test adaptivity_summary(plan).p_derefinement_leaf_count == 1
+end
+
 @testset "Planner Limits And Validation" begin
   domain = Domain((0.0,), (1.0,), (1,))
   space = HpSpace(domain, SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2)))
@@ -865,6 +967,9 @@ end
   @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=NaN)
   @test_throws ArgumentError adaptivity_plan(state, u; smoothness_threshold=-1.0)
   @test_throws ArgumentError adaptivity_plan(state, u; limits=AdaptivityLimits(2))
+  nonfinite_state = State(FieldLayout((u,)), [NaN, 0.2, 0.3])
+  @test_throws ArgumentError coefficient_coarsening_indicators(nonfinite_state, u)
+  @test_throws ArgumentError adaptivity_plan(nonfinite_state, u)
 
   revision_limited_domain = Domain((0.0,), (1.0,), (1,))
   revision_limited_space = HpSpace(revision_limited_domain,

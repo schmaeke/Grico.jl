@@ -41,10 +41,16 @@ function _csv_escape(value)
   return any(character -> character in (',', '"', '\n', '\r'), text) ? "\"$text\"" : text
 end
 
-function _write_csv(path::AbstractString, rows::Vector{NamedTuple})
-  mkpath(dirname(path))
+function _resolve_output_path(path::AbstractString, default_file::AbstractString)
+  lowercase(splitext(path)[2]) == ".csv" && return path
+  return joinpath(path, default_file)
+end
 
-  open(path, "w") do io
+function _write_csv(path::AbstractString, rows::Vector{NamedTuple})
+  resolved = _resolve_output_path(path, basename(HPMG_DEFAULT_OUTPUT))
+  mkpath(dirname(resolved))
+
+  open(resolved, "w") do io
     isempty(rows) && return nothing
     names = propertynames(first(rows))
     println(io, join(names, ","))
@@ -54,7 +60,7 @@ function _write_csv(path::AbstractString, rows::Vector{NamedTuple})
     end
   end
 
-  return path
+  return resolved
 end
 
 function _push_row!(rows::Vector{NamedTuple}, case_name, category, component, repetitions, timing;
@@ -232,8 +238,8 @@ function _benchmark_case!(rows::Vector{NamedTuple}, case_name; dim, depth, degre
     _laplace_mass_problem(; dim, depth, degree, nonsymmetric)
   end
 
-  mg_policy = GeometricMultigridPreconditioner(; p_sequence=:bisect, coarse_direct_dof_limit=512,
-                                               pre_smoothing_steps=2, post_smoothing_steps=2)
+  mg_policy = GeometricMultigridPreconditioner(; p_sequence=:bisect, pre_smoothing_steps=2,
+                                               post_smoothing_steps=2)
   hierarchy = _measure!(rows, case_name, "phase", "compile_hpmg", 1) do
     Grico._compile_geometric_multigrid(problem, mg_policy)
   end

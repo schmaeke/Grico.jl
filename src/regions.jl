@@ -84,6 +84,15 @@ _checked_cell_measure(measure::AbstractCellMeasure) = measure
 
 _checked_cell_measure(measure) = throw(ArgumentError("cell_measure must be an AbstractCellMeasure"))
 
+const _FINITE_CELL_MAX_SUBDIVISION_DEPTH = 30
+
+function _checked_finite_cell_subdivision_depth(subdivision_depth::Integer)
+  checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
+  checked_depth <= _FINITE_CELL_MAX_SUBDIVISION_DEPTH ||
+    throw(ArgumentError("subdivision_depth is too large"))
+  return checked_depth
+end
+
 """
     PhysicalDomain(background, region; cell_measure=PhysicalMeasure())
 
@@ -161,6 +170,9 @@ while domains with different physical boxes, root grids, or leaf coordinates get
 independent cache entries. For codimension-0 integration, cells with only
 measure-zero contact to the physical region are classified as outside so the
 active-leaf set remains a true volume discretization.
+
+`subdivision_depth` is bounded before recursive cut-cell extraction so accidental
+inputs cannot request an exponential number of terminal subcells.
 """
 struct ImplicitRegion{F} <: AbstractPhysicalRegion
   classifier::F
@@ -172,7 +184,7 @@ end
 function ImplicitRegion(classifier; subdivision_depth=2)
   subdivision_depth isa Integer ||
     throw(ArgumentError("subdivision_depth must be a non-negative Int-representable integer"))
-  checked_depth = _checked_nonnegative(subdivision_depth, "subdivision_depth")
+  checked_depth = _checked_finite_cell_subdivision_depth(subdivision_depth)
   return ImplicitRegion(classifier, checked_depth, Dict{_LeafSignature,Symbol}(),
                         Dict{_QuadratureSignature,AbstractQuadrature}())
 end
@@ -298,7 +310,7 @@ function _cut_cell_quadrature(region::ImplicitRegion, domain::AbstractDomain{D,T
   classification = _classify_leaf(region, domain, checked_leaf)
   classification == :outside && return nothing
   base_quadrature = TensorQuadrature(T, checked_shape)
-  classification == :inside && return _point_quadrature(base_quadrature)
+  classification == :inside && return base_quadrature
   signature = _quadrature_signature(domain, checked_leaf, checked_shape)
   cached = _cached_cut_quadrature(region, signature)
   cached === nothing || return cached
@@ -327,20 +339,23 @@ end
 
 function _assembly_cell_quadrature(domain::PhysicalDomain{D,T}, leaf::Integer,
                                    quadrature_shape::NTuple{D,<:Integer}) where {D,T<:AbstractFloat}
-  physical = _physical_cell_quadrature(domain, leaf, quadrature_shape)
-  physical === nothing && return nothing
-  return _assembly_cell_quadrature(domain, physical, quadrature_shape, domain.cell_measure)
+  return _assembly_cell_quadrature(domain, leaf, quadrature_shape, domain.cell_measure)
 end
 
-function _assembly_cell_quadrature(domain::PhysicalDomain, physical, quadrature_shape,
-                                   ::PhysicalMeasure)
+function _assembly_cell_quadrature(domain::PhysicalDomain{D,T}, leaf::Integer,
+                                   quadrature_shape::NTuple{D,<:Integer},
+                                   ::PhysicalMeasure) where {D,T<:AbstractFloat}
+  physical = _physical_cell_quadrature(domain, leaf, quadrature_shape)
   return physical
 end
 
-function _assembly_cell_quadrature(domain::PhysicalDomain{D,T}, physical,
+function _assembly_cell_quadrature(domain::PhysicalDomain{D,T}, leaf::Integer,
                                    quadrature_shape::NTuple{D,<:Integer},
                                    measure::FiniteCellExtension) where {D,T<:AbstractFloat}
   alpha = T(measure.alpha)
+  alpha == one(T) && return nothing
+  physical = _physical_cell_quadrature(domain, leaf, quadrature_shape)
+  physical === nothing && return nothing
   alpha == zero(T) && return physical
   checked_shape = ntuple(axis -> _checked_positive(quadrature_shape[axis],
                                                    "quadrature_shape[$axis]"), D)
@@ -401,20 +416,6 @@ function finite_cell_quadrature(domain::AbstractDomain{D,T}, leaf::Integer,
   return _cut_cell_quadrature(region, domain, leaf, quadrature_shape)
 end
 
-# Convert a tensor-product quadrature rule to explicit point/weight storage so
-# the later finite-cell reduction can work on mutable candidate sets.
-function _point_quadrature(quadrature::TensorQuadrature{D,T}) where {D,T<:AbstractFloat}
-  points = Vector{NTuple{D,T}}(undef, point_count(quadrature))
-  weights = Vector{T}(undef, point_count(quadrature))
-
-  for point_index in 1:point_count(quadrature)
-    points[point_index] = point(quadrature, point_index)
-    weights[point_index] = weight(quadrature, point_index)
-  end
-
-  return PointQuadrature(points, weights)
-end
-
 @inline function _subcell_midpoint(lower::NTuple{D,T}, upper::NTuple{D,T},
                                    ::Type{T}) where {D,T<:AbstractFloat}
   return ntuple(axis -> T(0.5) * (lower[axis] + upper[axis]), D)
@@ -447,11 +448,27 @@ end
 
 @inline _subcell_sample_count(::Val{D}) where {D} = _subcell_corner_count(Val(D)) + 1
 
+const _FINITE_CELL_MAX_TERMINAL_SUBCELLS = 1 << 20
+
+function _check_finite_cell_subdivision_work(max_depth::Int, ::Val{D}) where {D}
+  child_count = _subcell_corner_count(Val(D))
+  terminal_count = 1
+
+  for _ in 1:max_depth
+    terminal_count <= _FINITE_CELL_MAX_TERMINAL_SUBCELLS ÷ child_count ||
+      throw(ArgumentError("subdivision_depth creates too many finite-cell subcells"))
+    terminal_count *= child_count
+  end
+
+  return nothing
+end
+
 function _collect_finite_cell_candidates!(points::Vector{NTuple{D,T}}, weights::Vector{T},
                                           domain::Domain{D,T}, leaf::Int, classifier,
                                           base_quadrature::TensorQuadrature{D,T},
                                           lower::NTuple{D,T}, upper::NTuple{D,T},
                                           max_depth::Int) where {D,T<:AbstractFloat}
+  _check_finite_cell_subdivision_work(max_depth, Val(D))
   _collect_finite_cell_candidates_recursive!(points, weights, domain, leaf, classifier,
                                              base_quadrature, lower, upper, 0, max_depth)
   return nothing
