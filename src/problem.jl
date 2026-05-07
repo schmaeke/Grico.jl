@@ -5,7 +5,7 @@
 #
 # The compiled `HpSpace` and `FieldLayout` layers fix where degrees of freedom
 # live and how global coefficient vectors are partitioned. The job of this file
-# is different: it describes which weak forms, boundary data, interface terms,
+# is different: it describes which local operators, boundary data, interface terms,
 # embedded-surface terms, and global constraints should act on those unknowns.
 #
 # The file is organized in the same order in which a reader usually encounters
@@ -16,7 +16,7 @@
 #
 # Next comes the shared mutable storage used by the public `AffineProblem` and
 # `ResidualProblem` wrappers. The storage is deliberately internal: users build
-# problems with weak-form helpers, `add_cell!`, `add_boundary!`,
+# problems with accumulator helpers, `add_cell!`, `add_boundary!`,
 # `add_interface!`, `add_surface!`, `add_*_quadrature!`, and
 # `add_constraint!`, while later compilation stages work with one normalized
 # representation.
@@ -357,10 +357,11 @@ problem in this library. It stores
 - optional cell quadrature overrides and embedded surfaces,
 - and global constraints such as Dirichlet and mean-value conditions.
 
-The preferred operator API is weak-form based: use
-[`add_cell_bilinear!`](@ref) and [`add_cell_linear!`](@ref) when possible, so
-the same mathematical definition can be lowered to matrix-free application,
-local matrices, and solver data. Plain Julia operator callbacks such as
+The preferred operator API is accumulator based: use
+[`add_cell_accumulator!`](@ref), boundary/surface/interface accumulator helpers,
+and the matching residual/tangent callbacks when possible, so the same local
+operator definition can be lowered to matrix-free application, local matrices,
+RHS vectors, diagonals, and solver data. Plain Julia operator callbacks such as
 [`cell_apply!`](@ref), [`cell_rhs!`](@ref), [`face_apply!`](@ref), and
 [`interface_apply!`](@ref) remain available as advanced escape hatches.
 
@@ -382,9 +383,12 @@ end
 Container for nonlinear residual/tangent operators and constraints.
 
 `ResidualProblem` plays the same organizational role as [`AffineProblem`](@ref),
-but for nonlinear problems. Its operators contribute through residual and
-tangent callbacks such as [`cell_residual!`](@ref) and
-[`cell_tangent_apply!`](@ref), and the operator is interpreted as a nonlinear
+but for nonlinear problems. Use residual accumulator helpers such as
+[`add_cell_accumulator!`](@ref) when the residual can be written as coefficients
+multiplying the test value and gradient, with an explicit tangent callback.
+Lower-level residual and tangent callbacks such as [`cell_residual!`](@ref) and
+[`cell_tangent_apply!`](@ref) remain available for operators outside the
+accumulator surface. In both cases the problem is interpreted as a nonlinear
 residual equation together with its local linearizations.
 
 `operator_class` declares the algebraic class of the Newton tangent operator.
@@ -724,7 +728,7 @@ Accumulate the local affine cell matrix of `operator` into `local_matrix`.
 The default implementation derives the local matrix by applying
 [`cell_apply!`](@ref) to local basis vectors. This probing is intentionally
 local to one integration item and supports advanced low-level callbacks;
-first-party weak-form operators provide analytic local-matrix lowerings.
+first-party accumulator operators provide analytic local-matrix lowerings.
 """
 function cell_matrix!(local_matrix, operator, values)
   cell_matrix!(local_matrix, operator, values, KernelScratch(eltype(local_matrix)))

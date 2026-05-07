@@ -3,6 +3,8 @@ using Grico
 import Grico: JacobiPreconditioner, add_cell!
 
 struct _MGIdentity end
+struct _MGMass end
+struct _MGNonsymmetricMassGradient end
 
 function Grico.cell_apply!(local_result, ::_MGIdentity, values, local_coefficients)
   copyto!(local_result, local_coefficients)
@@ -13,6 +15,16 @@ function Grico.cell_rhs!(local_rhs, ::_MGIdentity, values)
   fill!(local_rhs, 1.0)
   return nothing
 end
+
+Grico.cell_accumulate(::_MGMass, q, trial, test_component) = value(trial)
+
+Grico.cell_rhs_accumulate(::_MGMass, q, test_component) = 1.0
+
+function Grico.cell_accumulate(::_MGNonsymmetricMassGradient, q, trial, test_component)
+  return value(trial) + 0.1 * gradient(trial)[1]
+end
+
+Grico.cell_rhs_accumulate(::_MGNonsymmetricMassGradient, q, test_component) = 1.0
 
 function _mg_identity_problem(; continuity=:dg, degree=3, cells=(2,), refine=nothing)
   domain = Domain((0.0,), (1.0,), cells)
@@ -76,36 +88,30 @@ end
   @test isempty(hierarchy.gmres_smoothers)
   @test _test_transfer_adjoint(only(hierarchy.transfers))
 
-  weak_problem, weak_field = _mg_identity_problem(continuity=:dg, degree=3)
-  weak_problem = AffineProblem(weak_field; operator_class=SPD())
-  add_cell_bilinear!(weak_problem, weak_field, weak_field) do q, v, w
-    value(v) * value(w)
-  end
-  add_cell_linear!(weak_problem, weak_field) do q, v
-    value(v)
-  end
-  weak_hierarchy = Grico._compile_geometric_multigrid(weak_problem,
+  mass_problem, mass_field = _mg_identity_problem(continuity=:dg, degree=3)
+  mass_problem = AffineProblem(mass_field; operator_class=SPD())
+  add_cell_accumulator!(mass_problem, mass_field, mass_field, _MGMass())
+  add_cell_accumulator!(mass_problem, mass_field, _MGMass())
+  mass_hierarchy = Grico._compile_geometric_multigrid(mass_problem,
                                                       GeometricMultigridPreconditioner())
-  @test weak_hierarchy.coarse_solver isa Grico._DenseCholeskyCoarseSolver
-  weak_gmg = solve(weak_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
-  weak_cg = solve(compile(weak_problem); solver=CGSolver(preconditioner=JacobiPreconditioner()),
+  @test mass_hierarchy.coarse_solver isa Grico._DenseCholeskyCoarseSolver
+  mass_gmg = solve(mass_problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
+  mass_cg = solve(compile(mass_problem); solver=CGSolver(preconditioner=JacobiPreconditioner()),
                   relative_tolerance=1.0e-12)
-  @test coefficients(weak_gmg) ≈ coefficients(weak_cg) atol = 1.0e-8
-  @test_throws ArgumentError solve(weak_problem;
+  @test coefficients(mass_gmg) ≈ coefficients(mass_cg) atol = 1.0e-8
+  @test_throws ArgumentError solve(mass_problem;
                                    solver=CGSolver(preconditioner=GeometricMultigridPreconditioner(pre_smoothing_steps=1,
                                                                                                    post_smoothing_steps=2)))
-  @test_throws ArgumentError solve(weak_problem;
+  @test_throws ArgumentError solve(mass_problem;
                                    solver=CGSolver(preconditioner=GeometricMultigridPreconditioner(smoother=:gmres)))
-  @test_throws ArgumentError solve(compile(weak_problem);
+  @test_throws ArgumentError solve(compile(mass_problem);
                                    solver=CGSolver(preconditioner=GeometricMultigridPreconditioner()))
 
   threshold_domain = Domain((0.0, 0.0), (1.0, 1.0), (22, 22))
   threshold_space = HpSpace(threshold_domain, SpaceOptions(degree=UniformDegree(2), continuity=:cg))
   threshold_field = ScalarField(threshold_space; name=:u)
   threshold_problem = AffineProblem(threshold_field; operator_class=SPD())
-  add_cell_bilinear!(threshold_problem, threshold_field, threshold_field) do q, v, w
-    value(v) * value(w)
-  end
+  add_cell_accumulator!(threshold_problem, threshold_field, threshold_field, _MGMass())
   threshold_hierarchy = Grico._compile_geometric_multigrid(threshold_problem,
                                                            GeometricMultigridPreconditioner())
   @test Grico.reduced_dof_count(threshold_hierarchy.levels[1].plan) > 512
@@ -118,12 +124,8 @@ end
   nonsym_space = HpSpace(nonsym_domain, SpaceOptions(degree=UniformDegree(3), continuity=:dg))
   nonsym_field = ScalarField(nonsym_space; name=:u)
   nonsym_problem = AffineProblem(nonsym_field; operator_class=NonsymmetricOperator())
-  add_cell_bilinear!(nonsym_problem, nonsym_field, nonsym_field) do q, v, w
-    value(v) * value(w) + 0.1 * value(v) * grad(w)[1]
-  end
-  add_cell_linear!(nonsym_problem, nonsym_field) do q, v
-    value(v)
-  end
+  add_cell_accumulator!(nonsym_problem, nonsym_field, nonsym_field, _MGNonsymmetricMassGradient())
+  add_cell_accumulator!(nonsym_problem, nonsym_field, _MGNonsymmetricMassGradient())
   nonsym_plan = compile(nonsym_problem)
   nonsym_workspace = Grico._ReducedOperatorWorkspace(nonsym_plan)
   nonsym_matrix = Grico._assemble_reduced_operator_matrix(nonsym_plan, nonsym_workspace.scratch)
@@ -202,7 +204,7 @@ end
   @test any(coefficient -> 0 < abs(coefficient) <= 1000eps(Float32),
             only(float32_hierarchy.transfers).coefficients)
 
-  diagnostics = Grico.multigrid_diagnostics(weak_problem;
+  diagnostics = Grico.multigrid_diagnostics(mass_problem;
                                             preconditioner=GeometricMultigridPreconditioner(),
                                             repetitions=1)
   @test diagnostics.levels == 2

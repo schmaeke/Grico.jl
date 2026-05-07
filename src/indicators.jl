@@ -1,5 +1,31 @@
-# Modal, trace, and projection detail indicators.
+# This file contains the automatic, problem-independent indicator machinery used
+# by Grico's compact hp-adaptivity planner. The indicators are deliberately
+# derived from the discrete field representation itself rather than from a PDE
+# residual. They answer local resolution questions:
+#
+# - How much energy remains in the highest modal layer of each cell?
+# - Do traces agree across DG interfaces?
+# - Would collapsing two children into their parent create a large local L²
+#   projection defect?
+#
+# These quantities are not a replacement for application-specific estimators,
+# but they provide a stable default policy for examples, diagnostics, and smooth
+# manufactured problems. The implementation keeps the three roles separate:
+# modal indicators drive p-refinement and p-coarsening, DG jump indicators drive
+# h-refinement on discontinuous axes, and projection defects decide whether an
+# immediate h-coarsening candidate may be accepted.
+#
+# The code is arranged in the same order as the planner:
+# 1. modal layer energies and decay ratios,
+# 2. interface jump indicators for DG axes,
+# 3. local L² projection defects for h-coarsening candidates,
+# 4. the single-tolerance multiresolution planner that converts indicators into
+#    one `AdaptivityPlan`.
 
+# Local mode amplitudes are not always raw global coefficients. On continuous
+# spaces and constrained layouts, a local mode may expand into a short sparse
+# combination of global dofs. `_term_amplitude` applies that expansion so all
+# indicator energies are measured in the actual represented field.
 function _local_mode_amplitude(compiled::_CompiledLeaf, coefficients::AbstractVector,
                                mode_index::Int)
   return _term_amplitude(compiled.term_offsets, compiled.term_indices, compiled.term_coefficients,
@@ -9,6 +35,9 @@ end
 
 function _local_mode_energy(component_coefficients, compiled::_CompiledLeaf{D,T},
                             mode_index::Int) where {D,T<:AbstractFloat}
+  # Vector-valued fields use the Euclidean component energy of one modal tuple.
+  # This keeps scalar and vector indicators comparable without introducing a
+  # problem-specific norm at the automatic-planner level.
   energy = zero(T)
 
   for component in eachindex(component_coefficients)
@@ -169,6 +198,10 @@ function _interface_jump_energy(component_coefficients, minus_compiled::_Compile
                                 minus_leaf::Int, plus_leaf::Int, axis::Int,
                                 quadrature::TensorQuadrature{D1,T},
                                 scratch::_InterfaceJumpScratch{D,T}) where {D,D1,T<:AbstractFloat}
+  # A face in an adaptive Cartesian grid may be only a patch of either adjacent
+  # leaf face. The quadrature is therefore placed on the physical overlap in the
+  # tangential coordinates, then mapped back to each leaf's reference face before
+  # evaluating the two traces.
   minus_lower = cell_lower(domain_data, minus_leaf)
   minus_upper = cell_upper(domain_data, minus_leaf)
   plus_lower = cell_lower(domain_data, plus_leaf)
@@ -210,6 +243,10 @@ function _interface_jump_energy(component_coefficients, minus_compiled::_Compile
                                            UPPER, scratch.minus_basis)
       plus_value = _trace_component_value(plus_compiled, component_coefficients[component], axis,
                                           LOWER, scratch.plus_basis)
+      # The jump orientation is plus minus minus, matching the interface
+      # convention used by operator callbacks. The squared norm itself is
+      # orientation-independent, but keeping the sign convention local avoids
+      # later surprises if this evaluator is reused for signed diagnostics.
       difference = plus_value - minus_value
       point_jump += difference * difference
     end
@@ -626,6 +663,11 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
     fine_norm = zero(T)
     parent_jacobian = jacobian_determinant_from_biunit_cube(domain(space), candidate.cell)
 
+    # Each child is integrated in its own reference coordinates and each sample
+    # is mapped into the candidate parent reference cell before testing against
+    # the parent basis. This is what makes h-coarsening indicators robust when
+    # the fine representation is genuinely piecewise polynomial on the parent
+    # support.
     for child_index in eachindex(candidate.children)
       child = candidate.children[child_index]
       child_compiled = _compiled_leaf(space, child)
@@ -669,6 +711,10 @@ function projection_coarsening_indicators(state::State{T}, field::AbstractField,
 
     projection_norm = zero(T)
 
+    # The parent mass factor was built on the reference cell. The right-hand
+    # side was accumulated with physical weights, so the parent coefficients are
+    # scaled by the parent Jacobian before applying the cached reference-mass
+    # factorization.
     for component in 1:components
       @views begin
         rhs_component = rhs[:, component]

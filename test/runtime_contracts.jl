@@ -81,6 +81,40 @@ struct _RuntimeQuadraticOperator{F,T}
   target::T
 end
 
+struct _RuntimeDiffusionReactionAccumulator end
+struct _RuntimeInterfacePenaltyAccumulator end
+struct _RuntimeQuadraticAccumulator end
+
+@inline function _runtime_scale_tuple(scale, tuple::NTuple{D,T}) where {D,T}
+  return ntuple(axis -> scale * tuple[axis], Val(D))
+end
+
+function Grico.cell_accumulate(::_RuntimeDiffusionReactionAccumulator, q, trial, test_component)
+  return TestChannels(value(trial), gradient(trial))
+end
+
+function Grico.interface_accumulate(::_RuntimeInterfacePenaltyAccumulator, q, trial, test_component)
+  h = minimum(cell_size(q))
+  penalty = 90.0 / h
+  normal_value = normal(q)
+  jump_value = jump(value(trial))
+  average_normal_trial = average(normal_component(gradient(trial), normal_value))
+  shared_gradient = _runtime_scale_tuple(-0.5 * jump_value, normal_value)
+  minus_value = average_normal_trial - penalty * jump_value
+  plus_value = -average_normal_trial + penalty * jump_value
+  return TraceTestChannels(TestChannels(minus_value, shared_gradient),
+                           TestChannels(plus_value, shared_gradient))
+end
+
+function Grico.cell_residual_accumulate(::_RuntimeQuadraticAccumulator, q, state, test_component)
+  return TestChannels(value(state)^2 - 0.25, gradient(state))
+end
+
+function Grico.cell_tangent_accumulate(::_RuntimeQuadraticAccumulator, q, state, increment,
+                                       test_component)
+  return TestChannels(2 * value(state) * value(increment), gradient(increment))
+end
+
 function Grico.cell_residual!(local_residual, operator::_RuntimeQuadraticOperator, values, state)
   field = operator.field
 
@@ -121,6 +155,10 @@ function _runtime_allocated(call)
   return @allocated call()
 end
 
+function _runtime_threaded_allocation_limit(serial_limit::Integer)
+  return max(serial_limit, 1_000 * Threads.nthreads())
+end
+
 @testset "Runtime Contracts" begin
   @testset "Shared Memory Runtime Boundary" begin
     @test Grico._runtime_worker_count(Grico._SHARED_MEMORY_CPU_BACKEND) == Base.Threads.nthreads()
@@ -150,7 +188,7 @@ end
     fresh_apply_allocations = _runtime_allocated(() -> apply!(result, plan, coefficients_data))
 
     @test rhs_allocations <= 10_000
-    @test apply_allocations <= 1_000
+    @test apply_allocations <= _runtime_threaded_allocation_limit(1_000)
     @test apply_allocations < fresh_apply_allocations
 
     @test_throws ArgumentError rhs!(zeros(field_dof_count(u) + 1), plan, workspace)
@@ -246,8 +284,8 @@ end
     tangent_allocations = _runtime_allocated(() -> tangent_apply!(result, plan, state, increment,
                                                                   workspace))
 
-    @test residual_allocations <= 1_000
-    @test tangent_allocations <= 1_000
+    @test residual_allocations <= _runtime_threaded_allocation_limit(1_000)
+    @test tangent_allocations <= _runtime_threaded_allocation_limit(1_000)
 
     @test_throws ArgumentError residual!(coefficients(state), plan, state, workspace)
     @test_throws ArgumentError tangent_apply!(coefficients(state), plan, state, increment,
@@ -255,6 +293,64 @@ end
     @test_throws ArgumentError tangent_apply!(view(increment, :), plan, state, increment, workspace)
     @test_throws ArgumentError tangent_apply!(result, plan, state, ones(field_dof_count(u) + 1),
                                               workspace)
+  end
+
+  @testset "Accumulator Workspace" begin
+    domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 2))
+    space = HpSpace(domain,
+                    SpaceOptions(basis=FullTensorBasis(), degree=UniformDegree(2), continuity=:dg))
+    u = ScalarField(space; name=:u)
+
+    affine_problem = AffineProblem(u)
+    add_cell_accumulator!(affine_problem, u, u, _RuntimeDiffusionReactionAccumulator())
+    affine_plan = compile(affine_problem)
+    affine_workspace = OperatorWorkspace(affine_plan)
+    affine_input = [sin(0.13 * index) for index in 1:field_dof_count(u)]
+    affine_result = zeros(field_dof_count(u))
+
+    @test @inferred(apply!(affine_result, affine_plan, affine_input, affine_workspace)) ===
+          affine_result
+    accumulator_apply_allocations = _runtime_allocated() do
+      apply!(affine_result, affine_plan, affine_input, affine_workspace)
+    end
+    @test accumulator_apply_allocations <= _runtime_threaded_allocation_limit(1_000)
+
+    interface_problem = AffineProblem(u)
+    add_cell_accumulator!(interface_problem, u, u, _RuntimeDiffusionReactionAccumulator())
+    add_interface_accumulator!(interface_problem, u, u, _RuntimeInterfacePenaltyAccumulator())
+    interface_plan = compile(interface_problem)
+    interface_workspace = OperatorWorkspace(interface_plan)
+    interface_result = zeros(field_dof_count(u))
+
+    @test @inferred(apply!(interface_result, interface_plan, affine_input, interface_workspace)) ===
+          interface_result
+    accumulator_interface_allocations = _runtime_allocated() do
+      apply!(interface_result, interface_plan, affine_input, interface_workspace)
+    end
+    @test accumulator_interface_allocations <= 5_000 * Threads.nthreads()
+
+    residual_problem = ResidualProblem(u)
+    add_cell_accumulator!(residual_problem, u, u, _RuntimeQuadraticAccumulator())
+    residual_plan = compile(residual_problem)
+    residual_workspace = ResidualWorkspace(residual_plan)
+    state = State(residual_plan, affine_input)
+    increment = [cos(0.17 * index) for index in 1:field_dof_count(u)]
+    residual_result = zeros(field_dof_count(u))
+    tangent_result = zeros(field_dof_count(u))
+
+    @test @inferred(residual!(residual_result, residual_plan, state, residual_workspace)) ===
+          residual_result
+    @test @inferred(tangent_apply!(tangent_result, residual_plan, state, increment,
+                                   residual_workspace)) === tangent_result
+    accumulator_residual_allocations = _runtime_allocated() do
+      residual!(residual_result, residual_plan, state, residual_workspace)
+    end
+    accumulator_tangent_allocations = _runtime_allocated() do
+      tangent_apply!(tangent_result, residual_plan, state, increment, residual_workspace)
+    end
+
+    @test accumulator_residual_allocations <= _runtime_threaded_allocation_limit(1_000)
+    @test accumulator_tangent_allocations <= _runtime_threaded_allocation_limit(1_000)
   end
 
   @testset "Transfer Allocation Smoke" begin

@@ -1,4 +1,28 @@
-# State transfer between source and target spaces.
+# This file moves discrete field data across a `SpaceTransition`. The transfer
+# is formulated as a geometric L² projection from source fields to target
+# fields: target coefficients are chosen so the target finite-element field
+# matches the old field in the target inner product as closely as the target
+# space permits.
+#
+# The code is deliberately independent of the PDE that produced the state. It
+# only needs the source/target spaces, the old coefficients, and the overlap
+# table compiled by `transition.jl`. That separation is important for adaptive
+# workflows: the same transfer path can move affine solutions, nonlinear
+# iterates, diagnostics, or auxiliary fields without rebuilding a problem.
+#
+# There are three execution strategies:
+#
+# 1. Fully DG target spaces use one dense projection solve per target cell and
+#    write coefficients directly because no dof is shared across cells.
+# 2. The default CG/mixed path solves the same cell-local projections and then
+#    reconciles shared target dofs through small normal-equation components.
+# 3. Expert callers may provide a custom `linear_solve`, in which case CG/mixed
+#    targets fall back to a global variational projection problem.
+#
+# Source-to-target h-coarsening is handled by integrating each overlapping
+# source leaf separately. The old field is never sampled as if it were one
+# polynomial over a coarser target cell; this preserves the correct piecewise
+# polynomial content during coarsening.
 
 # State transfer is formulated as an `L²` projection on the target space. The
 # local mass operator below provides the symmetric positive definite block that
@@ -33,6 +57,10 @@ struct _CellwiseDGTransferPlan{D,T<:AbstractFloat,L,C,O,N,TR}
   max_local_dofs::Int
 end
 
+# Compiled setup for the default CG/mixed transfer path. The cell-local
+# projection systems are the same as the DG path, but their local solutions are
+# accumulated into a global normal-equation graph because continuous and hanging
+# dofs may appear in several local rows with nontrivial coefficients.
 struct _LocalProjectionTransferPlan{D,T<:AbstractFloat,L,C,O,N,TR}
   layout::L
   cells::C
@@ -253,6 +281,9 @@ function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,
                                                         upper::NTuple{D,T},
                                                         ::PhysicalMeasure) where {D,
                                                                                   T<:AbstractFloat}
+  # With physical measure, transfer integrates only the physical portion of a
+  # cut-cell overlap. This matches the inner product used by assembly on
+  # `PhysicalDomain` and avoids transferring data through fictitious volume.
   _append_physical_overlap_reference_quadrature!(points, weights, domain, leaf, shape, lower, upper,
                                                  one(T))
   return nothing
@@ -265,6 +296,10 @@ function _append_transfer_overlap_reference_quadrature!(points::Vector{NTuple{D,
                                                         upper::NTuple{D,T},
                                                         measure::FiniteCellExtension) where {D,
                                                                                              T<:AbstractFloat}
+  # Finite-cell extension uses the same split measure as assembly: a small
+  # background contribution over the full overlap plus the remaining weight on
+  # the physical portion. Transfer therefore respects the stabilization measure
+  # instead of silently switching to a pure physical projection.
   alpha = T(measure.alpha)
   alpha == one(T) &&
     return _append_reference_subcell_tensor_quadrature!(points, weights, T, shape, lower, upper,
@@ -321,6 +356,11 @@ function _assemble_transfer_rhs!(local_rhs, values::CellValues{D,T},
   target_jacobian = jacobian_determinant_from_biunit_cube(target_domain, target_leaf)
   first, count = _source_leaf_range_unchecked(transition, target_leaf)
 
+  # For h-coarsening, a target cell may cover several source leaves. Each
+  # overlap is quadratured independently, target reference samples are mapped to
+  # physical coordinates, and those physical points are then evaluated in the
+  # corresponding source leaf. This preserves the old state's discontinuities or
+  # fine-scale polynomial pieces inside the coarser target cell.
   for source_row in first:(first+count-1)
     source_leaf = @inbounds transition.source_leaf_data[source_row]
     bounds = _target_overlap_reference_bounds(target_domain, target_leaf, source_domain,
@@ -616,6 +656,10 @@ end
 function _accumulate_transfer_normal_equation!(diagonal::AbstractVector{T}, rhs::AbstractVector{T},
                                                couplings, adjacency, item::_AssemblyValues,
                                                local_solution::AbstractVector{T}) where {T<:AbstractFloat}
+  # A local projected coefficient may map to several reduced/global dofs through
+  # continuity or hanging-node substitutions. Accumulating the normal equation
+  # of that small local relation reconciles all local projections that share a
+  # target dof without assembling a full global mass matrix.
   for local_dof in 1:item.local_dof_count
     value = local_solution[local_dof]
     first_term = item.term_offsets[local_dof]
@@ -711,6 +755,9 @@ function _finish_transfer_normal_equations!(state_coefficients::AbstractVector{T
   component = Int[]
   tolerance = 1000 * eps(T)
 
+  # Most target dofs are isolated after local projection and can be written from
+  # one scalar normal equation. Only dofs coupled by shared local relations enter
+  # the small connected-component solves below.
   for dof in eachindex(state_coefficients)
     visited[dof] && continue
     neighbors = adjacency[dof]
@@ -759,6 +806,10 @@ end
 function _transfer_variational_state(transition::SpaceTransition{D,T}, state::State{T},
                                      old_fields::Tuple, new_fields::Tuple;
                                      linear_solve) where {D,T<:AbstractFloat}
+  # The variational path is kept as an expert escape hatch. It builds a normal
+  # affine Grico problem for the target mass projection, so user-supplied
+  # transfer solvers can reuse the same reduced operator interface as PDE
+  # solves.
   problem = AffineProblem(new_fields...)
 
   for index in eachindex(old_fields)

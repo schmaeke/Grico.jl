@@ -26,7 +26,7 @@ adapt, and postprocess.
 
 Two complementary viewpoints are useful while reading the package. One is
 local: on each active leaf, the code builds tensor-product polynomial modes,
-quadrature rules, and local weak-form contributions. The other is global: those
+quadrature rules, and local operator contributions. The other is global: those
 leaf-local quantities are then tied together by topology, continuity policy,
 and global degree-of-freedom numbering. Much of the architecture exists
 to keep those two viewpoints separate and explicit.
@@ -50,11 +50,11 @@ The source tree is easiest to understand in the following conceptual blocks:
    compile inter-element continuity ranging from global `C⁰` coupling to
    leaf-local DG independence, materialize the public `HpSpace`, and lay out
    concrete fields and states on that space.
-5. `problem.jl`, `embedded.jl`, `integration.jl`, `weakforms.jl`,
+5. `problem.jl`, `embedded.jl`, `integration.jl`, `accumulators.jl`,
    `plans.jl`, `assembly.jl`, `solve.jl`, `multigrid.jl`,
    `diagnostics.jl`, `adaptivity.jl`, `transition.jl`, `transfer.jl`,
    `indicators.jl`
-   The execution layer. It describes weak-form operators, specialized
+   The execution layer. It describes accumulator operators, specialized
    quadrature constructions, compiled local evaluation data, operator plans,
    solve and multigrid support, runtime diagnostics, manual adaptivity,
    source-to-target transitions, state transfer, and advanced automatic
@@ -162,7 +162,7 @@ export FieldLayout, ScalarField, State, VectorField, coefficients, component_cou
        field_name, field_space, field_values, fields
 public field_component_range
 
-# Weak forms, matrix-free execution, solvers, adaptivity, and transfer.
+# Operator definitions, matrix-free execution, solvers, adaptivity, and transfer.
 include("problem.jl")
 export AffineProblem, BoundaryFace, Dirichlet, GeneralOperator, IndefiniteOperator, MeanValue,
        NonsymmetricOperator, ResidualProblem, SPD, add_constraint!, operator_class
@@ -187,10 +187,15 @@ public block, CellValues, FaceValues, face_axis, face_side, InterfaceValues, is_
        tensor_mode_shape, tensor_point_count, tensor_project!, tensor_project_gradient!,
        tensor_quadrature_shape, tensor_values
 
-include("weakforms.jl")
-export add_boundary_bilinear!, add_boundary_linear!, add_cell_bilinear!, add_cell_linear!,
-       add_interface_bilinear!, add_interface_linear!, add_surface_bilinear!, add_surface_linear!,
-       avg, component, grad, inner, ∇, ⋅
+include("accumulators.jl")
+export TestChannels, TraceTestChannels, add_boundary_accumulator!, add_cell_accumulator!,
+       add_interface_accumulator!, add_surface_accumulator!, component, inner
+public StateChannels, TracePair, TraceStateChannels, TraceTrialChannels, TrialChannels,
+       boundary_accumulate, boundary_residual_accumulate, boundary_rhs_accumulate,
+       boundary_tangent_accumulate, cell_accumulate, cell_residual_accumulate, cell_rhs_accumulate,
+       cell_tangent_accumulate, interface_accumulate, interface_residual_accumulate,
+       interface_rhs_accumulate, interface_tangent_accumulate, surface_accumulate,
+       surface_residual_accumulate, surface_rhs_accumulate, surface_tangent_accumulate
 
 include("plans.jl")
 export AssemblyPlan, compile

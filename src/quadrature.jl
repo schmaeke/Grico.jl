@@ -2,8 +2,8 @@
 #
 # In the rest of `Grico.jl`, quadrature is the numerical counterpart of the
 # polynomial constructions defined in `polynomials.jl`: once basis functions and
-# weak-form terms are known symbolically, quadrature turns them into weighted
-# sums over reference points.
+# local operator terms are known, quadrature turns them into weighted sums over
+# reference points.
 #
 # The file is organized around three complementary ideas:
 # 1. a minimal abstract interface for iterating over weighted points,

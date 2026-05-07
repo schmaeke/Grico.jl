@@ -18,7 +18,7 @@
 # The reported numbers are therefore always with respect to a chosen
 # verification quadrature. They approximate the mathematical `L²` norm of the
 # error, but they do so through the same explicit weighted sums that the rest of
-# the package uses for weak forms.
+# the package uses for local operator integration.
 
 # Verification quadrature selection and cell-cache reuse.
 

@@ -12,7 +12,7 @@
 # the compiled `HpSpace` provides.
 #
 # From an operator writer's perspective, the point of this file is that every
-# local weak form can be written against the same interface:
+# local operator can be written against the same interface:
 #
 #   u_h(x_q),  ∇u_h(x_q),  ϕ_i(x_q),  ∇ϕ_i(x_q),  w_q.
 #
@@ -98,6 +98,7 @@ and post-processing.
 struct CellValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
   layout::L
+  cell_sizes::NTuple{D,T}
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   fields::F
@@ -126,6 +127,7 @@ struct FaceValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   axis::Int
   side::Int
   normal::NTuple{D,T}
+  cell_sizes::NTuple{D,T}
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   fields::F
@@ -153,6 +155,7 @@ struct SurfaceValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
   layout::L
   tag::_SurfaceTag
+  cell_sizes::NTuple{D,T}
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   normals::Vector{NTuple{D,T}}
@@ -187,6 +190,9 @@ struct InterfaceValues{D,T<:AbstractFloat,L<:FieldLayout,MF<:Tuple,PF<:Tuple}
   layout::L
   axis::Int
   normal::NTuple{D,T}
+  cell_sizes::NTuple{D,T}
+  minus_cell_sizes::NTuple{D,T}
+  plus_cell_sizes::NTuple{D,T}
   points::Vector{NTuple{D,T}}
   plus_points::Vector{NTuple{D,T}}
   weights::Vector{T}
@@ -206,6 +212,7 @@ end
 struct _InterfaceSideValues{D,T<:AbstractFloat,L<:FieldLayout,F<:Tuple}
   leaf::Int
   layout::L
+  cell_sizes::NTuple{D,T}
   points::Vector{NTuple{D,T}}
   weights::Vector{T}
   normal::NTuple{D,T}
@@ -321,8 +328,9 @@ end
 
 function _interface_side_values(values::InterfaceValues{D,T}, leaf::Int, points,
                                 fields) where {D,T<:AbstractFloat}
-  return _InterfaceSideValues(leaf, values.layout, points, values.weights, values.normal, fields,
-                              values.local_dof_count)
+  cell_sizes = leaf == values.minus_leaf ? values.minus_cell_sizes : values.plus_cell_sizes
+  return _InterfaceSideValues(leaf, values.layout, cell_sizes, points, values.weights,
+                              values.normal, fields, values.local_dof_count)
 end
 
 """
@@ -1400,7 +1408,7 @@ point of a face, interface trace, or embedded surface item.
 
 This is shorthand for the physical-space shape gradient dotted with the local
 unit normal. It is especially useful in Nitsche, flux, and interior-penalty
-terms where the weak form is written in terms of normal derivatives.
+terms written in terms of normal derivatives.
 """
 @inline function shape_normal_gradient(values::_NormalEvaluationValues, field::AbstractField,
                                        point_index::Integer, mode_index::Integer)
@@ -2127,6 +2135,11 @@ end
 
 # Entity-specific compilation: cells, boundary faces, interfaces, and embedded surfaces.
 
+@inline function _compiled_cell_sizes(domain_data::AbstractDomain{D,T},
+                                      leaf::Int) where {D,T<:AbstractFloat}
+  return ntuple(axis -> T(cell_size(domain_data, leaf, axis)), Val(D))
+end
+
 # Compile one `CellValues` item per active leaf, optionally using user-supplied
 # cell quadrature overrides.
 function _compile_cells(layout::FieldLayout{D,T},
@@ -2171,7 +2184,8 @@ function _compile_cell(layout::FieldLayout{D,T}, leaf::Int, override) where {D,T
   terms = _compiled_item_terms(field_data)
   interior_local_dofs = _interior_local_dofs(field_data,
                                              _compiled_leaf(layout.slots[1].space, leaf).local_modes)
-  return CellValues(leaf, layout, points, weights, field_data, terms.term_offsets,
+  cell_sizes = _compiled_cell_sizes(domain_data, leaf)
+  return CellValues(leaf, layout, cell_sizes, points, weights, field_data, terms.term_offsets,
                     terms.term_indices, terms.term_coefficients, terms.single_term_indices,
                     terms.single_term_coefficients, interior_local_dofs, terms.local_dof_count)
 end
@@ -2234,8 +2248,9 @@ function _compile_boundary_face(layout::FieldLayout{D,T}, leaf::Int, face_axis::
   field_data, _ = _compile_item_fields(layout, leaf, reference_points, inverse_jacobian, 1, shape)
   terms = _compiled_item_terms(field_data)
   normal_data = ntuple(axis -> axis == face_axis ? (side == LOWER ? -one(T) : one(T)) : zero(T), D)
-  return FaceValues(leaf, layout, face_axis, side, normal_data, points, weights, field_data,
-                    terms.term_offsets, terms.term_indices, terms.term_coefficients,
+  cell_sizes = _compiled_cell_sizes(domain_data, leaf)
+  return FaceValues(leaf, layout, face_axis, side, normal_data, cell_sizes, points, weights,
+                    field_data, terms.term_offsets, terms.term_indices, terms.term_coefficients,
                     terms.single_term_indices, terms.single_term_coefficients,
                     terms.local_dof_count)
 end
@@ -2282,9 +2297,13 @@ function _compile_interface(layout::FieldLayout{D,T}, minus_leaf::Int, face_axis
   all_fields = (minus_fields..., plus_fields...)
   terms = _compiled_item_terms(all_fields)
   normal_data = ntuple(axis -> axis == face_axis ? one(T) : zero(T), D)
-  return InterfaceValues(minus_leaf, plus_leaf, layout, face_axis, normal_data, points, plus_points,
-                         weights, minus_fields, plus_fields, terms.term_offsets, terms.term_indices,
-                         terms.term_coefficients, terms.single_term_indices,
+  minus_cell_sizes = _compiled_cell_sizes(domain_data, minus_leaf)
+  plus_cell_sizes = _compiled_cell_sizes(domain_data, plus_leaf)
+  interface_cell_sizes = ntuple(axis -> min(minus_cell_sizes[axis], plus_cell_sizes[axis]), Val(D))
+  return InterfaceValues(minus_leaf, plus_leaf, layout, face_axis, normal_data,
+                         interface_cell_sizes, minus_cell_sizes, plus_cell_sizes, points,
+                         plus_points, weights, minus_fields, plus_fields, terms.term_offsets,
+                         terms.term_indices, terms.term_coefficients, terms.single_term_indices,
                          terms.single_term_coefficients, terms.local_dof_count)
 end
 
@@ -2341,7 +2360,8 @@ function _compile_surface_quadrature(layout::FieldLayout{D,T}, surface::SurfaceQ
   field_data, _ = _compile_item_fields(layout, surface.leaf, reference_points, inverse_jacobian, 1,
                                        tensor_shape)
   terms = _compiled_item_terms(field_data)
-  return SurfaceValues(surface.leaf, layout, tag, points, weights, normals, field_data,
+  cell_sizes = _compiled_cell_sizes(domain_data, surface.leaf)
+  return SurfaceValues(surface.leaf, layout, tag, cell_sizes, points, weights, normals, field_data,
                        terms.term_offsets, terms.term_indices, terms.term_coefficients,
                        terms.single_term_indices, terms.single_term_coefficients,
                        terms.local_dof_count)

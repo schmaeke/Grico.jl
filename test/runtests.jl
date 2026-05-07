@@ -21,6 +21,7 @@ using Grico
   end
 
   @testset verbose = true "Matrix-Free Problems" begin
+    include("accumulators.jl")
     include("matrix_free.jl")
     include("multigrid.jl")
   end

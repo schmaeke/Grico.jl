@@ -1,4 +1,21 @@
-# Source-to-target transition compilation and adapted field recreation.
+# This file compiles the geometric bridge between an existing source `HpSpace`
+# and a target `HpSpace` described by an `AdaptivityPlan`. The transition object
+# is not itself a state-transfer algorithm. Instead, it records the overlap
+# relation that transfer, adapted-field recreation, and mixed-space adaptation
+# need in order to interpret the same physical domain on two different active
+# leaf frontiers.
+#
+# The important invariant is geometric, not algebraic: every active target leaf
+# stores the contiguous slice of active source leaves whose physical cells
+# overlap it. Later transfer routines may integrate on that overlap, but this
+# file does not evaluate basis functions or solve projection systems.
+#
+# The implementation is intentionally compact:
+# - validate and expose the compressed source-leaf row table,
+# - collect source leaves by descending only overlapping parts of the source
+#   refinement tree,
+# - build derived adaptivity plans for companion spaces in mixed-field problems,
+# - compile the final `SpaceTransition` and recreate fields on the target space.
 
 """
     SpaceTransition
@@ -267,6 +284,9 @@ function derived_adaptivity_plan(driver_plan::AdaptivityPlan, field::AbstractFie
 end
 
 function _copied_transition_target_data(plan::AdaptivityPlan)
+  # By default the transition compiles on a non-mutating copy of the target
+  # domain. This keeps an already compiled transition independent from later
+  # interactive edits to the mutable adaptivity plan.
   copied_domain = copy(target_domain(plan))
   copied_snapshot = _snapshot(grid(copied_domain), target_snapshot(plan).active_leaves)
   return copied_domain, copied_snapshot, copy(plan.target_degrees)
@@ -274,6 +294,9 @@ end
 
 function _transition_target_data(plan::AdaptivityPlan, use_compact::Bool)
   use_compact || return _copied_transition_target_data(plan)
+  # Compacting is optional because it renumbers target cells. When requested,
+  # it removes dead grid storage while preserving the active target frontier and
+  # remapping the per-leaf degree table to the compacted cell ids.
   compact_domain, compact_snapshot, old_to_new = compact(target_domain(plan), target_snapshot(plan))
   compact_degrees = _remap_compacted_target_degrees(target_snapshot(plan), plan.target_degrees,
                                                     compact_snapshot, old_to_new)
@@ -339,6 +362,9 @@ function transition(plan::AdaptivityPlan{D,T}; compact::Bool=false) where {D,T<:
   source_data = Int[]
   source_leaves = Int[]
 
+  # The row table is built in active target-leaf order. Each row is a contiguous
+  # slice of `source_data`, which keeps `source_leaves(transition, leaf)` cheap
+  # and allocation-free.
   for target_index in eachindex(target_active)
     leaf = target_active[target_index]
     leaves = _transition_source_leaves!(source_leaves, source_snapshot, target_grid, leaf)

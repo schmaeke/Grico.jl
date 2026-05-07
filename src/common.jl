@@ -21,6 +21,23 @@ const _SHARED_MEMORY_CPU_BACKEND = _SharedMemoryCPUBackend()
   return !(Sys.KERNEL === :Darwin && Sys.ARCH === :aarch64)
 end
 
+function _threaded_loop_exception(error)
+  # Preserve user-facing validation errors when the shared-memory scheduler
+  # wraps a single failing item in task/container exception machinery.
+  if error isa CompositeException && length(error.exceptions) == 1
+    return _threaded_loop_exception(only(error.exceptions))
+  end
+
+  if error isa TaskFailedException
+    stack = current_exceptions(error.task)
+    isempty(stack) || return first(stack).exception
+  end
+
+  return error
+end
+
+@noinline _throw_threaded_loop_exception(error) = throw(_threaded_loop_exception(error))
+
 macro _threaded_loop(expr)
   # Polyester gives the low-overhead CPU path we want on Linux. On Apple
   # silicon, some user-kernel loops still hit Polyester's cfunction closure
@@ -42,7 +59,13 @@ macro _threaded_loop(expr)
     end
   end
 
-  return esc(threaded_expr)
+  return esc(quote
+               try
+                 $threaded_expr
+               catch error
+                 _throw_threaded_loop_exception(error)
+               end
+             end)
 end
 
 # The checked-value helpers below normalize common integer preconditions at the

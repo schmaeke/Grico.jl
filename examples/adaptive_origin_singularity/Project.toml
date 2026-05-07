@@ -3,9 +3,9 @@
 # root, which lets this script exercise the checkout under development.
 
 [deps]
-CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Grico = "1ea28d43-a4e3-46f0-9b23-78fc8e1c719b"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [sources]
 Grico = {path = "../.."}

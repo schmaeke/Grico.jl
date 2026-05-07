@@ -7,6 +7,8 @@ import Grico: IdentityPreconditioner, JacobiPreconditioner, KernelScratch, Point
               shape_value, tensor_degrees, tensor_gradient!, tensor_interpolate!, tensor_mode_count,
               tensor_point_count, tensor_project_gradient!, tensor_quadrature_shape, tensor_values
 
+_threaded_allocation_limit(serial_limit::Integer) = max(serial_limit, 1_000 * Threads.nthreads())
+
 struct _MatrixFreeIdentity end
 
 function Grico.cell_apply!(local_result, ::_MatrixFreeIdentity, values, local_coefficients)
@@ -69,6 +71,99 @@ end
 struct _MatrixFreeQuadraticReaction{F,T}
   field::F
   target::T
+end
+
+struct _CellAccumulatorFunction{F}
+  f::F
+end
+
+struct _CellRhsAccumulatorFunction{F}
+  f::F
+end
+
+struct _CellResidualAccumulatorFunction{R,T}
+  residual::R
+  tangent::T
+end
+
+struct _BoundaryAccumulatorFunction{F}
+  f::F
+end
+
+struct _InterfaceAccumulatorFunction{F}
+  f::F
+end
+
+struct _SurfaceAccumulatorFunction{F}
+  f::F
+end
+
+function Grico.cell_accumulate(operator::_CellAccumulatorFunction, q, trial, test_component)
+  return operator.f(q, trial, test_component)
+end
+
+function Grico.cell_rhs_accumulate(operator::_CellRhsAccumulatorFunction, q, test_component)
+  return operator.f(q, test_component)
+end
+
+function Grico.cell_residual_accumulate(operator::_CellResidualAccumulatorFunction, q, state,
+                                        test_component)
+  return operator.residual(q, state, test_component)
+end
+
+function Grico.cell_tangent_accumulate(operator::_CellResidualAccumulatorFunction, q, state,
+                                       increment, test_component)
+  return operator.tangent(q, state, increment, test_component)
+end
+
+function Grico.boundary_accumulate(operator::_BoundaryAccumulatorFunction, q, trial, test_component)
+  return operator.f(q, trial, test_component)
+end
+
+function Grico.interface_accumulate(operator::_InterfaceAccumulatorFunction, q, trial,
+                                    test_component)
+  return operator.f(q, trial, test_component)
+end
+
+function Grico.surface_accumulate(operator::_SurfaceAccumulatorFunction, q, trial, test_component)
+  return operator.f(q, trial, test_component)
+end
+
+@inline function _scale_tuple(scale, tuple::NTuple{D,T}) where {D,T}
+  return ntuple(axis -> scale * tuple[axis], Val(D))
+end
+
+@inline function _add_tuple(first::NTuple{D}, second::NTuple{D}) where {D}
+  return ntuple(axis -> first[axis] + second[axis], Val(D))
+end
+
+@inline function _with_axis_increment(gradient_value::NTuple{D,T}, scale,
+                                      axis_index::Int) where {D,T}
+  return ntuple(axis -> gradient_value[axis] + (axis == axis_index ? T(scale) : zero(T)), Val(D))
+end
+
+@inline _zero_tuple(tuple::NTuple{D,T}) where {D,T} = ntuple(_ -> zero(T), Val(D))
+
+function _vector_semilinear_operator(shift)
+  residual = (q, state, test_component) -> begin
+    state_value = value(state)
+    state_norm2 = inner(state_value, state_value)
+    return TestChannels((state_norm2 + shift) * value(state, test_component),
+                        gradient(state, test_component))
+  end
+  tangent = (q, state, increment, test_component) -> begin
+    increment_component = component(increment)
+    state_value = value(state)
+    state_norm2 = inner(state_value, state_value)
+    increment_value = value(increment)
+    reaction_scale = 2 * value(state, test_component) * value(state, increment_component) +
+                     (test_component == increment_component ? state_norm2 + shift :
+                      zero(state_norm2))
+    gradient_coefficient = test_component == increment_component ? gradient(increment) :
+                           _zero_tuple(gradient(increment))
+    return TestChannels(reaction_scale * increment_value, gradient_coefficient)
+  end
+  return _CellResidualAccumulatorFunction(residual, tangent)
 end
 
 function Grico.cell_apply!(local_result, operator::_MatrixFreeMassAction, values,
@@ -474,82 +569,17 @@ end
   @test mass_diagonal_selected
   @test mass_diagonal ≈ _reference_reduced_diagonal(mass_plan)
 
-  weak_mass_problem = AffineProblem(dg_field; operator_class=SPD())
-  add_cell_bilinear!(weak_mass_problem, dg_field, dg_field) do q, v, w
-    value(v) * value(w)
-  end
-  add_cell_linear!(weak_mass_problem, dg_field) do q, v
-    value(v)
-  end
-  weak_mass_plan = compile(weak_mass_problem)
-  @test apply(weak_mass_plan, [0.25, -0.5]) ≈ apply(mass_plan, [0.25, -0.5])
-  @test rhs(weak_mass_plan) ≈ [0.5, 0.5]
-  weak_mass_matrix = Grico._assemble_reduced_operator_matrix(weak_mass_plan,
-                                                             Grico._ReducedOperatorWorkspace(weak_mass_plan).scratch)
-  @test weak_mass_matrix * [0.25, -0.5] ≈ apply(weak_mass_plan, [0.25, -0.5])
-
-  nonlinear_test_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(nonlinear_test_problem, dg_field, dg_field) do q, v, w
-    value(v)^2 * value(w)
-  end
-  nonlinear_test_plan = compile(nonlinear_test_problem)
-  @test_throws ArgumentError apply(nonlinear_test_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(nonlinear_test_plan,
-                                                                     Grico._ReducedOperatorWorkspace(nonlinear_test_plan).scratch)
-
-  nonlinear_trial_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(nonlinear_trial_problem, dg_field, dg_field) do q, v, w
-    value(v) * value(w)^2
-  end
-  nonlinear_trial_plan = compile(nonlinear_trial_problem)
-  @test_throws ArgumentError apply(nonlinear_trial_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(nonlinear_trial_plan,
-                                                                     Grico._ReducedOperatorWorkspace(nonlinear_trial_plan).scratch)
-
-  test_only_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(test_only_problem, dg_field, dg_field) do q, v, w
-    value(v)
-  end
-  test_only_plan = compile(test_only_problem)
-  @test_throws ArgumentError apply(test_only_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(test_only_plan,
-                                                                     Grico._ReducedOperatorWorkspace(test_only_plan).scratch)
-
-  trial_only_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(trial_only_problem, dg_field, dg_field) do q, v, w
-    value(w)
-  end
-  trial_only_plan = compile(trial_only_problem)
-  @test_throws ArgumentError apply(trial_only_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(trial_only_plan,
-                                                                     Grico._ReducedOperatorWorkspace(trial_only_plan).scratch)
-
-  constant_bilinear_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(constant_bilinear_problem, dg_field, dg_field) do q, v, w
-    1.0
-  end
-  constant_bilinear_plan = compile(constant_bilinear_problem)
-  @test_throws ArgumentError apply(constant_bilinear_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(constant_bilinear_plan,
-                                                                     Grico._ReducedOperatorWorkspace(constant_bilinear_plan).scratch)
-
-  separate_terms_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(separate_terms_problem, dg_field, dg_field) do q, v, w
-    value(v) + value(w)
-  end
-  separate_terms_plan = compile(separate_terms_problem)
-  @test_throws ArgumentError apply(separate_terms_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(separate_terms_plan,
-                                                                     Grico._ReducedOperatorWorkspace(separate_terms_plan).scratch)
-
-  quotient_problem = AffineProblem(dg_field)
-  add_cell_bilinear!(quotient_problem, dg_field, dg_field) do q, v, w
-    value(v) / value(w)
-  end
-  quotient_plan = compile(quotient_problem)
-  @test_throws ArgumentError apply(quotient_plan, [0.25, -0.5])
-  @test_throws ArgumentError Grico._assemble_reduced_operator_matrix(quotient_plan,
-                                                                     Grico._ReducedOperatorWorkspace(quotient_plan).scratch)
+  accumulator_mass_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_cell_accumulator!(accumulator_mass_problem, dg_field, dg_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> value(trial)))
+  add_cell_accumulator!(accumulator_mass_problem, dg_field,
+                        _CellRhsAccumulatorFunction((q, test_component) -> 1.0))
+  accumulator_mass_plan = compile(accumulator_mass_problem)
+  @test apply(accumulator_mass_plan, [0.25, -0.5]) ≈ apply(mass_plan, [0.25, -0.5])
+  @test rhs(accumulator_mass_plan) ≈ [0.5, 0.5]
+  accumulator_mass_matrix = Grico._assemble_reduced_operator_matrix(accumulator_mass_plan,
+                                                                    Grico._ReducedOperatorWorkspace(accumulator_mass_plan).scratch)
+  @test accumulator_mass_matrix * [0.25, -0.5] ≈ apply(accumulator_mass_plan, [0.25, -0.5])
 
   diffusion_problem = AffineProblem(dg_field)
   add_cell!(diffusion_problem, _MatrixFreeDiffusion(dg_field, 2.0))
@@ -564,16 +594,17 @@ end
   @test diffusion_diagonal_selected
   @test diffusion_diagonal ≈ _reference_reduced_diagonal(diffusion_plan)
 
-  weak_diffusion_problem = AffineProblem(dg_field; operator_class=SPD())
-  add_cell_bilinear!(weak_diffusion_problem, dg_field, dg_field) do q, v, w
-    2.0 * (∇(v) ⋅ ∇(w))
-  end
-  weak_diffusion_plan = compile(weak_diffusion_problem)
-  @test apply(weak_diffusion_plan, diffusion_coefficients) ≈
+  accumulator_diffusion_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_cell_accumulator!(accumulator_diffusion_problem, dg_field, dg_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> TestChannels(zero(value(trial)),
+                                                                                            _scale_tuple(2.0,
+                                                                                                         gradient(trial)))))
+  accumulator_diffusion_plan = compile(accumulator_diffusion_problem)
+  @test apply(accumulator_diffusion_plan, diffusion_coefficients) ≈
         apply(diffusion_plan, diffusion_coefficients)
-  weak_diffusion_diagonal_selected, weak_diffusion_diagonal = _kernel_reduced_diagonal(weak_diffusion_plan)
-  @test weak_diffusion_diagonal_selected
-  @test weak_diffusion_diagonal ≈ _reference_reduced_diagonal(weak_diffusion_plan)
+  accumulator_diffusion_diagonal_selected, accumulator_diffusion_diagonal = _kernel_reduced_diagonal(accumulator_diffusion_plan)
+  @test accumulator_diffusion_diagonal_selected
+  @test accumulator_diffusion_diagonal ≈ _reference_reduced_diagonal(accumulator_diffusion_plan)
 
   tensor_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   tensor_space = HpSpace(tensor_domain,
@@ -589,12 +620,14 @@ end
                                (local_matrix, values) -> _local_reference_diffusion!(local_matrix,
                                                                                      tensor_field,
                                                                                      values, 1.75))
-  weak_tensor_problem = AffineProblem(tensor_field; operator_class=SPD())
-  add_cell_bilinear!(weak_tensor_problem, tensor_field, tensor_field) do q, v, w
-    1.75 * inner(grad(v), grad(w))
-  end
-  weak_tensor_plan = compile(weak_tensor_problem)
-  @test apply(weak_tensor_plan, tensor_coefficients) ≈ apply(tensor_plan, tensor_coefficients)
+  accumulator_tensor_problem = AffineProblem(tensor_field; operator_class=SPD())
+  add_cell_accumulator!(accumulator_tensor_problem, tensor_field, tensor_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> TestChannels(zero(value(trial)),
+                                                                                            _scale_tuple(1.75,
+                                                                                                         gradient(trial)))))
+  accumulator_tensor_plan = compile(accumulator_tensor_problem)
+  @test apply(accumulator_tensor_plan, tensor_coefficients) ≈
+        apply(tensor_plan, tensor_coefficients)
   tensor_item = tensor_plan.integration.cells[1]
   tensor_data = tensor_values(tensor_item, tensor_field)
   @test tensor_data !== nothing
@@ -608,41 +641,112 @@ end
   tensor_interpolate!(tensor_point_values, tensor_data, tensor_input, tensor_scratch, 2)
   @test tensor_point_values ≈ [value(tensor_item, tensor_coefficients, tensor_field, point_index)
                                for point_index in 1:point_count(tensor_item)]
+  tensor_points = tensor_point_count(tensor_data)
 
-  weak_tensor_mass_problem = AffineProblem(tensor_field; operator_class=SPD())
-  add_cell_bilinear!(weak_tensor_mass_problem, tensor_field, tensor_field) do q, v, w
-    value(v) * value(w)
-  end
-  weak_tensor_mass_plan = compile(weak_tensor_mass_problem)
-  weak_tensor_mass_scratch = KernelScratch(Float64)
-  weak_tensor_mass_output = zeros(field_dof_count(tensor_field))
-  cell_apply!(weak_tensor_mass_output, weak_tensor_mass_plan.cell_operators[1],
-              weak_tensor_mass_plan.integration.cells[1], tensor_coefficients,
-              weak_tensor_mass_scratch)
-  @test size(weak_tensor_mass_scratch.matrices[1]) == (2, 0)
+  accumulator_tensor_mass_problem = AffineProblem(tensor_field; operator_class=SPD())
+  add_cell_accumulator!(accumulator_tensor_mass_problem, tensor_field, tensor_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> value(trial)))
+  accumulator_tensor_mass_plan = compile(accumulator_tensor_mass_problem)
+  accumulator_tensor_mass_scratch = KernelScratch(Float64)
+  accumulator_tensor_mass_output = zeros(field_dof_count(tensor_field))
+  cell_apply!(accumulator_tensor_mass_output, accumulator_tensor_mass_plan.cell_operators[1],
+              accumulator_tensor_mass_plan.integration.cells[1], tensor_coefficients,
+              accumulator_tensor_mass_scratch)
+  @test size(accumulator_tensor_mass_scratch.matrices[1]) == (2, tensor_points)
 
-  weak_tensor_diffusion_scratch = KernelScratch(Float64)
-  weak_tensor_diffusion_output = zeros(field_dof_count(tensor_field))
-  cell_apply!(weak_tensor_diffusion_output, weak_tensor_plan.cell_operators[1],
-              weak_tensor_plan.integration.cells[1], tensor_coefficients,
-              weak_tensor_diffusion_scratch)
-  @test length(weak_tensor_diffusion_scratch.vectors[5]) == 0
+  accumulator_tensor_diffusion_scratch = KernelScratch(Float64)
+  accumulator_tensor_diffusion_output = zeros(field_dof_count(tensor_field))
+  cell_apply!(accumulator_tensor_diffusion_output, accumulator_tensor_plan.cell_operators[1],
+              accumulator_tensor_plan.integration.cells[1], tensor_coefficients,
+              accumulator_tensor_diffusion_scratch)
+  @test length(accumulator_tensor_diffusion_scratch.vectors[5]) == tensor_points
+
+  semilinear_problem = ResidualProblem(tensor_field; operator_class=SPD())
+  add_cell_accumulator!(semilinear_problem, tensor_field, tensor_field,
+                        _CellResidualAccumulatorFunction((q, state, test_component) -> TestChannels(value(state)^2 -
+                                                                                                    0.25,
+                                                                                                    gradient(state)),
+                                                         (q, state, increment, test_component) -> TestChannels(2 *
+                                                                                                               value(state) *
+                                                                                                               value(increment),
+                                                                                                               gradient(increment))))
+  semilinear_plan = compile(semilinear_problem)
+  semilinear_state = State(semilinear_plan, tensor_coefficients)
+  semilinear_increment = [cos(0.19 * index) for index in 1:field_dof_count(tensor_field)]
+  semilinear_residual = residual(semilinear_plan, semilinear_state)
+  semilinear_tangent = tangent_apply(semilinear_plan, semilinear_state, semilinear_increment)
+  finite_difference_step = 1.0e-7
+  perturbed_state = State(semilinear_plan,
+                          tensor_coefficients .+ finite_difference_step .* semilinear_increment)
+  finite_difference_tangent = (residual(semilinear_plan, perturbed_state) .- semilinear_residual) ./
+                              finite_difference_step
+  @test semilinear_tangent ≈ finite_difference_tangent rtol = 1.0e-6 atol = 1.0e-6
+
+  semilinear_residual_scratch = KernelScratch(Float64)
+  semilinear_local_residual = zeros(field_dof_count(tensor_field))
+  Grico.cell_residual!(semilinear_local_residual, semilinear_plan.cell_operators[1],
+                       semilinear_plan.integration.cells[1], semilinear_state,
+                       semilinear_residual_scratch)
+  @test size(semilinear_residual_scratch.matrices[2]) == (tensor_points, 1)
+  @test size(semilinear_residual_scratch.matrices[3]) == (tensor_points, 2)
+  @test size(semilinear_residual_scratch.matrices[4]) == (2, tensor_points)
+  @test size(semilinear_residual_scratch.matrices[5]) == (tensor_points, 1)
+  @test size(semilinear_residual_scratch.matrices[6]) == (tensor_points, 2)
+
+  semilinear_tangent_scratch = KernelScratch(Float64)
+  semilinear_local_tangent = zeros(field_dof_count(tensor_field))
+  Grico.cell_tangent_apply!(semilinear_local_tangent, semilinear_plan.cell_operators[1],
+                            semilinear_plan.integration.cells[1], semilinear_state,
+                            semilinear_increment, semilinear_tangent_scratch)
+  @test size(semilinear_tangent_scratch.matrices[2]) == (tensor_points, 1)
+  @test size(semilinear_tangent_scratch.matrices[3]) == (tensor_points, 2)
+  @test size(semilinear_tangent_scratch.matrices[4]) == (2, tensor_points)
+  @test size(semilinear_tangent_scratch.matrices[5]) == (tensor_points, 1)
+  @test size(semilinear_tangent_scratch.matrices[6]) == (tensor_points, 2)
+  @test size(semilinear_tangent_scratch.matrices[7]) == (2, tensor_points)
 
   vector_tensor_field = VectorField(tensor_space, 2; name=:velocity)
-  vector_tensor_problem = AffineProblem(vector_tensor_field; operator_class=NonsymmetricOperator())
-  add_cell_bilinear!(vector_tensor_problem, vector_tensor_field, vector_tensor_field) do q, v, w
-    test_component = component(v)
-    trial_component = component(w)
-    mass_scale = test_component == trial_component ? 2.0 : -0.25
-    diffusion_scale = test_component == trial_component ? 1.1 : 0.35
-    mass_scale * value(v) * value(w) +
-    diffusion_scale * inner(grad(v), grad(w)) +
-    0.05 * grad(v)[trial_component] * value(w) +
-    0.07 * value(v) * grad(w)[test_component]
-  end
-  vector_tensor_plan = compile(vector_tensor_problem)
   vector_tensor_coefficients = [sin(0.17 * index) + 0.1 * cos(0.31 * index)
                                 for index in 1:field_dof_count(vector_tensor_field)]
+
+  vector_semilinear_problem = ResidualProblem(vector_tensor_field)
+  add_cell_accumulator!(vector_semilinear_problem, vector_tensor_field, vector_tensor_field,
+                        _vector_semilinear_operator(-0.25))
+  vector_semilinear_plan = compile(vector_semilinear_problem)
+  vector_semilinear_state = State(vector_semilinear_plan, vector_tensor_coefficients)
+  vector_semilinear_increment = [cos(0.13 * index)
+                                 for index in 1:field_dof_count(vector_tensor_field)]
+  vector_semilinear_residual = residual(vector_semilinear_plan, vector_semilinear_state)
+  vector_semilinear_tangent = tangent_apply(vector_semilinear_plan, vector_semilinear_state,
+                                            vector_semilinear_increment)
+  vector_perturbed_state = State(vector_semilinear_plan,
+                                 vector_tensor_coefficients .+
+                                 finite_difference_step .* vector_semilinear_increment)
+  vector_finite_difference_tangent = (residual(vector_semilinear_plan, vector_perturbed_state) .-
+                                      vector_semilinear_residual) ./ finite_difference_step
+  @test vector_semilinear_tangent ≈ vector_finite_difference_tangent rtol = 2.0e-6 atol = 2.0e-6
+
+  vector_tensor_problem = AffineProblem(vector_tensor_field; operator_class=NonsymmetricOperator())
+  add_cell_accumulator!(vector_tensor_problem, vector_tensor_field, vector_tensor_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> begin
+                                                   trial_component = component(trial)
+                                                   mass_scale = test_component == trial_component ?
+                                                                2.0 : -0.25
+                                                   diffusion_scale = test_component ==
+                                                                     trial_component ? 1.1 : 0.35
+                                                   trial_gradient = gradient(trial)
+                                                   value_coefficient = mass_scale * value(trial) +
+                                                                       0.07 *
+                                                                       trial_gradient[test_component]
+                                                   gradient_coefficient = _with_axis_increment(_scale_tuple(diffusion_scale,
+                                                                                                            trial_gradient),
+                                                                                               0.05 *
+                                                                                               value(trial),
+                                                                                               trial_component)
+                                                   return TestChannels(value_coefficient,
+                                                                       gradient_coefficient)
+                                                 end))
+  vector_tensor_plan = compile(vector_tensor_problem)
   vector_tensor_matrix = Grico._assemble_reduced_operator_matrix(vector_tensor_plan,
                                                                  Grico._ReducedOperatorWorkspace(vector_tensor_plan).scratch)
   @test apply(vector_tensor_plan, vector_tensor_coefficients) ≈
@@ -653,13 +757,44 @@ end
 
   trunk_vector_space = HpSpace(tensor_domain, SpaceOptions(degree=UniformDegree(2), continuity=:dg))
   trunk_vector_field = VectorField(trunk_vector_space, 2; name=:trunk_velocity)
-  trunk_vector_problem = AffineProblem(trunk_vector_field; operator_class=NonsymmetricOperator())
-  add_cell_bilinear!(trunk_vector_problem, trunk_vector_field, trunk_vector_field) do q, v, w
-    component(v) == component(w) ? inner(grad(v), grad(w)) + value(v) * value(w) :
-    0.2 * value(v) * grad(w)[component(v)]
-  end
-  trunk_vector_plan = compile(trunk_vector_problem)
   trunk_vector_coefficients = [cos(0.19 * index) for index in 1:field_dof_count(trunk_vector_field)]
+
+  trunk_vector_semilinear_problem = ResidualProblem(trunk_vector_field)
+  add_cell_accumulator!(trunk_vector_semilinear_problem, trunk_vector_field, trunk_vector_field,
+                        _vector_semilinear_operator(0.5))
+  trunk_vector_semilinear_plan = compile(trunk_vector_semilinear_problem)
+  @test !is_full_tensor(tensor_values(trunk_vector_semilinear_plan.integration.cells[1],
+                                      trunk_vector_field))
+  trunk_vector_semilinear_state = State(trunk_vector_semilinear_plan, trunk_vector_coefficients)
+  trunk_vector_semilinear_increment = [sin(0.23 * index)
+                                       for index in 1:field_dof_count(trunk_vector_field)]
+  trunk_vector_semilinear_residual = residual(trunk_vector_semilinear_plan,
+                                              trunk_vector_semilinear_state)
+  trunk_vector_semilinear_tangent = tangent_apply(trunk_vector_semilinear_plan,
+                                                  trunk_vector_semilinear_state,
+                                                  trunk_vector_semilinear_increment)
+  trunk_vector_perturbed_state = State(trunk_vector_semilinear_plan,
+                                       trunk_vector_coefficients .+
+                                       finite_difference_step .* trunk_vector_semilinear_increment)
+  trunk_vector_finite_difference_tangent = (residual(trunk_vector_semilinear_plan,
+                                                     trunk_vector_perturbed_state) .-
+                                            trunk_vector_semilinear_residual) ./
+                                           finite_difference_step
+  @test trunk_vector_semilinear_tangent ≈ trunk_vector_finite_difference_tangent rtol = 3.0e-6 atol = 3.0e-6
+
+  trunk_vector_problem = AffineProblem(trunk_vector_field; operator_class=NonsymmetricOperator())
+  add_cell_accumulator!(trunk_vector_problem, trunk_vector_field, trunk_vector_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> begin
+                                                   trial_component = component(trial)
+                                                   if test_component == trial_component
+                                                     return TestChannels(value(trial),
+                                                                         gradient(trial))
+                                                   end
+                                                   return TestChannels(0.2 *
+                                                                       gradient(trial)[test_component],
+                                                                       _zero_tuple(gradient(trial)))
+                                                 end))
+  trunk_vector_plan = compile(trunk_vector_problem)
   trunk_vector_matrix = Grico._assemble_reduced_operator_matrix(trunk_vector_plan,
                                                                 Grico._ReducedOperatorWorkspace(trunk_vector_plan).scratch)
   @test apply(trunk_vector_plan, trunk_vector_coefficients) ≈
@@ -671,14 +806,22 @@ end
                                          continuity=:dg))
   vector_3d_field = VectorField(vector_3d_space, 3; name=:displacement)
   vector_3d_problem = AffineProblem(vector_3d_field; operator_class=NonsymmetricOperator())
-  add_cell_bilinear!(vector_3d_problem, vector_3d_field, vector_3d_field) do q, v, w
-    test_component = component(v)
-    trial_component = component(w)
-    coupling = test_component == trial_component ? 1.4 : 0.2
-    coupling * inner(grad(v), grad(w)) +
-    0.03 * grad(v)[trial_component] * value(w) +
-    0.04 * value(v) * grad(w)[test_component]
-  end
+  add_cell_accumulator!(vector_3d_problem, vector_3d_field, vector_3d_field,
+                        _CellAccumulatorFunction((q, trial, test_component) -> begin
+                                                   trial_component = component(trial)
+                                                   coupling = test_component == trial_component ?
+                                                              1.4 : 0.2
+                                                   trial_gradient = gradient(trial)
+                                                   value_coefficient = 0.04 *
+                                                                       trial_gradient[test_component]
+                                                   gradient_coefficient = _with_axis_increment(_scale_tuple(coupling,
+                                                                                                            trial_gradient),
+                                                                                               0.03 *
+                                                                                               value(trial),
+                                                                                               trial_component)
+                                                   return TestChannels(value_coefficient,
+                                                                       gradient_coefficient)
+                                                 end))
   vector_3d_plan = compile(vector_3d_problem)
   vector_3d_coefficients = [sin(0.07 * index) for index in 1:field_dof_count(vector_3d_field)]
   vector_3d_matrix = Grico._assemble_reduced_operator_matrix(vector_3d_plan,
@@ -693,13 +836,13 @@ end
   @test boundary_diagonal ≈ _reference_reduced_diagonal(boundary_plan)
   @test apply(boundary_plan, [0.25, -0.5]) ≈ [0.0, -1.5]
 
-  weak_boundary_problem = AffineProblem(dg_field; operator_class=SPD())
-  add_boundary_bilinear!(weak_boundary_problem, BoundaryFace(1, UPPER), dg_field,
-                         dg_field) do q, v, w
-    3.0 * value(v) * value(w)
-  end
-  weak_boundary_plan = compile(weak_boundary_problem)
-  @test apply(weak_boundary_plan, [0.25, -0.5]) ≈ apply(boundary_plan, [0.25, -0.5])
+  accumulator_boundary_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_boundary_accumulator!(accumulator_boundary_problem, BoundaryFace(1, UPPER), dg_field,
+                            dg_field,
+                            _BoundaryAccumulatorFunction((q, trial, test_component) -> 3.0 *
+                                                                                       value(trial)))
+  accumulator_boundary_plan = compile(accumulator_boundary_problem)
+  @test apply(accumulator_boundary_plan, [0.25, -0.5]) ≈ apply(boundary_plan, [0.25, -0.5])
 
   vector_boundary_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   vector_boundary_space = HpSpace(vector_boundary_domain,
@@ -708,16 +851,28 @@ end
   vector_boundary_field = VectorField(vector_boundary_space, 2; name=:velocity)
   vector_boundary_problem = AffineProblem(vector_boundary_field;
                                           operator_class=NonsymmetricOperator())
-  add_boundary_bilinear!(vector_boundary_problem, BoundaryFace(1, UPPER), vector_boundary_field,
-                         vector_boundary_field) do q, v, w
-    test_component = component(v)
-    trial_component = component(w)
-    coupling = test_component == trial_component ? 1.3 : -0.25
-    coupling * value(v) * value(w) +
-    0.2 * normal_gradient(v) * value(w) +
-    0.15 * value(v) * normal_gradient(w) +
-    0.03 * grad(v)[trial_component] * grad(w)[test_component]
-  end
+  add_boundary_accumulator!(vector_boundary_problem, BoundaryFace(1, UPPER), vector_boundary_field,
+                            vector_boundary_field,
+                            _BoundaryAccumulatorFunction((q, trial, test_component) -> begin
+                                                           trial_component = component(trial)
+                                                           coupling = test_component ==
+                                                                      trial_component ? 1.3 : -0.25
+                                                           normal_value = normal(q)
+                                                           trial_gradient = gradient(trial)
+                                                           trial_normal = normal_component(trial_gradient,
+                                                                                           normal_value)
+                                                           value_coefficient = coupling *
+                                                                               value(trial) +
+                                                                               0.15 * trial_normal
+                                                           gradient_coefficient = _with_axis_increment(_scale_tuple(0.2 *
+                                                                                                                    value(trial),
+                                                                                                                    normal_value),
+                                                                                                       0.03 *
+                                                                                                       trial_gradient[test_component],
+                                                                                                       trial_component)
+                                                           return TestChannels(value_coefficient,
+                                                                               gradient_coefficient)
+                                                         end))
   vector_boundary_plan = compile(vector_boundary_problem)
   vector_boundary_coefficients = [sin(0.13 * index)
                                   for index in 1:field_dof_count(vector_boundary_field)]
@@ -736,22 +891,36 @@ end
   @test interface_diagonal_selected
   @test interface_diagonal ≈ _reference_reduced_diagonal(interface_plan)
 
-  weak_interface_problem = AffineProblem(interface_field; operator_class=SPD())
-  add_interface_bilinear!(weak_interface_problem, interface_field, interface_field) do q, v, w
-    2.0 * jump(value(v)) * jump(value(w))
-  end
-  weak_interface_plan = compile(weak_interface_problem)
-  weak_interface_coefficients = [0.25, -0.5, 0.75, -0.125]
-  @test apply(weak_interface_plan, weak_interface_coefficients) ≈
-        apply(interface_plan, weak_interface_coefficients)
+  accumulator_interface_problem = AffineProblem(interface_field; operator_class=SPD())
+  add_interface_accumulator!(accumulator_interface_problem, interface_field, interface_field,
+                             _InterfaceAccumulatorFunction((q, trial, test_component) -> begin
+                                                             jump_value = jump(value(trial))
+                                                             return TraceTestChannels(TestChannels(-2.0 *
+                                                                                                   jump_value,
+                                                                                                   _zero_tuple(normal(q))),
+                                                                                      TestChannels(2.0 *
+                                                                                                   jump_value,
+                                                                                                   _zero_tuple(normal(q))))
+                                                           end))
+  accumulator_interface_plan = compile(accumulator_interface_problem)
+  accumulator_interface_coefficients = [0.25, -0.5, 0.75, -0.125]
+  @test apply(accumulator_interface_plan, accumulator_interface_coefficients) ≈
+        apply(interface_plan, accumulator_interface_coefficients)
 
-  weak_interface_penalty_problem = AffineProblem(interface_field; operator_class=SPD())
-  add_interface_bilinear!(weak_interface_penalty_problem, interface_field,
-                          interface_field) do q, v, w
-    minimum(cell_size(q, interface_field)) * jump(value(v)) * jump(value(w))
-  end
-  weak_interface_penalty_plan = compile(weak_interface_penalty_problem)
-  @test apply(weak_interface_penalty_plan, ones(field_dof_count(interface_field))) ≈
+  accumulator_interface_penalty_problem = AffineProblem(interface_field; operator_class=SPD())
+  add_interface_accumulator!(accumulator_interface_penalty_problem, interface_field,
+                             interface_field,
+                             _InterfaceAccumulatorFunction((q, trial, test_component) -> begin
+                                                             coefficient = minimum(cell_size(q,
+                                                                                             interface_field)) *
+                                                                           jump(value(trial))
+                                                             return TraceTestChannels(TestChannels(-coefficient,
+                                                                                                   _zero_tuple(normal(q))),
+                                                                                      TestChannels(coefficient,
+                                                                                                   _zero_tuple(normal(q))))
+                                                           end))
+  accumulator_interface_penalty_plan = compile(accumulator_interface_penalty_problem)
+  @test apply(accumulator_interface_penalty_plan, ones(field_dof_count(interface_field))) ≈
         zeros(field_dof_count(interface_field))
 
   vector_interface_domain = Domain((0.0, 0.0), (1.0, 1.0), (2, 1))
@@ -761,16 +930,34 @@ end
   vector_interface_field = VectorField(vector_interface_space, 2; name=:velocity)
   vector_interface_problem = AffineProblem(vector_interface_field;
                                            operator_class=NonsymmetricOperator())
-  add_interface_bilinear!(vector_interface_problem, vector_interface_field,
-                          vector_interface_field) do q, v, w
-    test_component = component(v)
-    trial_component = component(w)
-    coupling = test_component == trial_component ? 2.0 : 0.35
-    coupling * jump(value(v)) * jump(value(w)) +
-    0.3 * average(normal_gradient(v)) * jump(value(w)) +
-    0.2 * jump(value(v)) * average(normal_gradient(w)) +
-    0.04 * inner(jump(grad(v)), average(grad(w)))
-  end
+  add_interface_accumulator!(vector_interface_problem, vector_interface_field,
+                             vector_interface_field,
+                             _InterfaceAccumulatorFunction((q, trial, test_component) -> begin
+                                                             trial_component = component(trial)
+                                                             coupling = test_component ==
+                                                                        trial_component ? 2.0 : 0.35
+                                                             normal_value = normal(q)
+                                                             jump_value = jump(value(trial))
+                                                             trial_normal = average(normal_component(gradient(trial),
+                                                                                                     normal_value))
+                                                             value_coefficient = coupling *
+                                                                                 jump_value +
+                                                                                 0.2 * trial_normal
+                                                             shared_normal_gradient = _scale_tuple(0.15 *
+                                                                                                   jump_value,
+                                                                                                   normal_value)
+                                                             average_trial_gradient = average(gradient(trial))
+                                                             minus_gradient = _add_tuple(shared_normal_gradient,
+                                                                                         _scale_tuple(-0.04,
+                                                                                                      average_trial_gradient))
+                                                             plus_gradient = _add_tuple(shared_normal_gradient,
+                                                                                        _scale_tuple(0.04,
+                                                                                                     average_trial_gradient))
+                                                             return TraceTestChannels(TestChannels(-value_coefficient,
+                                                                                                   minus_gradient),
+                                                                                      TestChannels(value_coefficient,
+                                                                                                   plus_gradient))
+                                                           end))
   vector_interface_plan = compile(vector_interface_problem)
   vector_interface_coefficients = [cos(0.09 * index)
                                    for index in 1:field_dof_count(vector_interface_field)]
@@ -788,13 +975,14 @@ end
   @test surface_diagonal_selected
   @test surface_diagonal ≈ _reference_reduced_diagonal(surface_plan)
 
-  weak_surface_problem = AffineProblem(dg_field; operator_class=SPD())
-  add_surface_quadrature!(weak_surface_problem, SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
-  add_surface_bilinear!(weak_surface_problem, dg_field, dg_field) do q, v, w
-    5.0 * value(v) * value(w)
-  end
-  weak_surface_plan = compile(weak_surface_problem)
-  @test apply(weak_surface_plan, [0.25, -0.5]) ≈ apply(surface_plan, [0.25, -0.5])
+  accumulator_surface_problem = AffineProblem(dg_field; operator_class=SPD())
+  add_surface_quadrature!(accumulator_surface_problem,
+                          SurfaceQuadrature(1, surface_quadrature, [(1.0,)]))
+  add_surface_accumulator!(accumulator_surface_problem, dg_field, dg_field,
+                           _SurfaceAccumulatorFunction((q, trial, test_component) -> 5.0 *
+                                                                                     value(trial)))
+  accumulator_surface_plan = compile(accumulator_surface_problem)
+  @test apply(accumulator_surface_plan, [0.25, -0.5]) ≈ apply(surface_plan, [0.25, -0.5])
 
   vector_surface_domain = Domain((0.0, 0.0), (1.0, 1.0), (1, 1))
   vector_surface_space = HpSpace(vector_surface_domain,
@@ -807,16 +995,27 @@ end
   vector_surface_normals = fill((1.0, 0.0), point_count(vector_surface_quadrature))
   add_surface_quadrature!(vector_surface_problem,
                           SurfaceQuadrature(1, vector_surface_quadrature, vector_surface_normals))
-  add_surface_bilinear!(vector_surface_problem, vector_surface_field,
-                        vector_surface_field) do q, v, w
-    test_component = component(v)
-    trial_component = component(w)
-    coupling = test_component == trial_component ? 1.1 : -0.2
-    coupling * value(v) * value(w) +
-    0.15 * normal_gradient(v) * value(w) +
-    0.17 * value(v) * normal_gradient(w) +
-    0.02 * grad(v)[trial_component] * grad(w)[test_component]
-  end
+  add_surface_accumulator!(vector_surface_problem, vector_surface_field, vector_surface_field,
+                           _SurfaceAccumulatorFunction((q, trial, test_component) -> begin
+                                                         trial_component = component(trial)
+                                                         coupling = test_component ==
+                                                                    trial_component ? 1.1 : -0.2
+                                                         normal_value = normal(q)
+                                                         trial_gradient = gradient(trial)
+                                                         trial_normal = normal_component(trial_gradient,
+                                                                                         normal_value)
+                                                         value_coefficient = coupling *
+                                                                             value(trial) +
+                                                                             0.17 * trial_normal
+                                                         gradient_coefficient = _with_axis_increment(_scale_tuple(0.15 *
+                                                                                                                  value(trial),
+                                                                                                                  normal_value),
+                                                                                                     0.02 *
+                                                                                                     trial_gradient[test_component],
+                                                                                                     trial_component)
+                                                         return TestChannels(value_coefficient,
+                                                                             gradient_coefficient)
+                                                       end))
   vector_surface_plan = compile(vector_surface_problem)
   vector_surface_coefficients = [sin(0.11 * index)
                                  for index in 1:field_dof_count(vector_surface_field)]
@@ -827,7 +1026,7 @@ end
   surface_diagnostics = Grico.operator_diagnostics(vector_surface_plan; repetitions=1)
   @test surface_diagnostics.embedded_surfaces == 1
   @test surface_diagnostics.apply_seconds_per_call >= 0
-  @test surface_diagnostics.apply_bytes_per_call <= 1_000
+  @test surface_diagnostics.apply_bytes_per_call <= _threaded_allocation_limit(1_000)
   @test surface_diagnostics.reduced_apply_seconds_per_call >= 0
   @test eltype(Grico._diagnostic_sample_vector(Float32, 3)) === Float32
 

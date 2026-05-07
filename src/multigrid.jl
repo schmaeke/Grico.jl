@@ -2,10 +2,19 @@
 #
 # The production hierarchy is a single hp path: first remove excess polynomial
 # order on the fixed fine mesh, then coarsen the dyadic tree one admissible
-# frontier at a time. Each level is rediscretized from the original weak form on
+# frontier at a time. Each level is rediscretized from the original problem on
 # adapted fields that preserve field identity. Transfers are compiled once as
 # sparse reduced-space prolongations and restriction is their algebraic
 # transpose, so constraints remain part of the reduced operator contract.
+#
+# The file is organized around the pieces of one V-cycle: public policy
+# validation, level and transfer construction, local modal transfer kernels,
+# smoothers, coarse solvers, and finally the recursive application routine. The
+# important architectural rule is that the hierarchy never approximates coarse
+# operators by algebraic `RAP` products of the fine operator. Every level is a
+# rediscretization of the same problem description on its own adapted space,
+# which keeps geometric information and operator callbacks available at coarse
+# levels.
 
 const _DEFAULT_COARSE_DIRECT_DOF_LIMIT = 512
 
@@ -15,7 +24,7 @@ const _DEFAULT_COARSE_DIRECT_DOF_LIMIT = 512
 Matrix-free geometric multigrid preconditioner policy for affine problems.
 
 The hierarchy is compiled from an `AffineProblem`, not from an already compiled
-`AssemblyPlan`, so every level can rediscretize the same weak form on adapted
+`AssemblyPlan`, so every level can rediscretize the same operators on adapted
 fields. Use it as the preconditioner of [`CGSolver`](@ref) for SPD systems or
 [`FGMRESSolver`](@ref) for nonsymmetric, indefinite, or otherwise general
 systems.
@@ -843,7 +852,7 @@ function _accumulate_transfer_entry!(entries::Dict{Tuple{Int,Int},T}, coarse_dof
 end
 
 function _compile_preconditioner(::GeometricMultigridPreconditioner, ::_ReducedAffineOperator)
-  throw(ArgumentError("GeometricMultigridPreconditioner requires the original AffineProblem so every level can rediscretize the weak form; call solve(problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner())) for SPD systems or solve(problem; solver=FGMRESSolver(preconditioner=GeometricMultigridPreconditioner())) for general systems"))
+  throw(ArgumentError("GeometricMultigridPreconditioner requires the original AffineProblem so every level can rediscretize the operators; call solve(problem; solver=CGSolver(preconditioner=GeometricMultigridPreconditioner())) for SPD systems or solve(problem; solver=FGMRESSolver(preconditioner=GeometricMultigridPreconditioner())) for general systems"))
 end
 
 function _apply_preconditioner!(result::AbstractVector{T},
